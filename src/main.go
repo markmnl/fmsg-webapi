@@ -51,6 +51,7 @@ func main() {
 	v1 := router.Group("/api/v1")
 	v1.Use(jwtMiddleware.MiddlewareFunc())
 	{
+		v1.GET("/messages", msgHandler.List)
 		v1.POST("/messages", msgHandler.Create)
 		v1.GET("/messages/:id", msgHandler.Get)
 		v1.PUT("/messages/:id", msgHandler.Update)

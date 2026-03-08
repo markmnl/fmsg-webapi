@@ -34,6 +34,135 @@ func NewMessageHandler(database *db.DB, dataDir string) *MessageHandler {
 return &MessageHandler{DB: database, DataDir: dataDir}
 }
 
+// messageListItem is the JSON shape for each message in the list response.
+// It mirrors the single-message response (including an id) but data is never populated.
+type messageListItem struct {
+	ID          int64              `json:"id"`
+	Version     int                `json:"version"`
+	Flags       int                `json:"flags"`
+	PID         *int64             `json:"pid"`
+	From        string             `json:"from"`
+	To          []string           `json:"to"`
+	Time        *float64           `json:"time"`
+	Topic       string             `json:"topic"`
+	Type        string             `json:"type"`
+	Size        int                `json:"size"`
+	Data        string             `json:"data"`
+	Attachments []models.Attachment `json:"attachments"`
+}
+
+// List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
+func (h *MessageHandler) List(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	if identity == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	// Parse limit query parameter (default 20, max 100).
+	limit := 20
+	if l := c.Query("limit"); l != "" {
+		parsed, err := strconv.Atoi(l)
+		if err != nil || parsed < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+			return
+		}
+		if parsed > 100 {
+			parsed = 100
+		}
+		limit = parsed
+	}
+
+	// Parse offset query parameter (default 0).
+	offset := 0
+	if o := c.Query("offset"); o != "" {
+		parsed, err := strconv.Atoi(o)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid offset"})
+			return
+		}
+		offset = parsed
+	}
+
+	ctx := c.Request.Context()
+
+	rows, err := h.DB.Pool.Query(ctx,
+		`SELECT m.id, m.version, m.pid, m.flags, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		 FROM msg m
+		 INNER JOIN msg_to mt ON mt.msg_id = m.id
+		 WHERE mt.addr = $1
+		 ORDER BY m.id DESC
+		 LIMIT $2 OFFSET $3`,
+		identity, limit, offset,
+	)
+	if err != nil {
+		log.Printf("list messages: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
+		return
+	}
+	defer rows.Close()
+
+	var messages []messageListItem
+	var msgIDs []int64
+	for rows.Next() {
+		var m messageListItem
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.Flags, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+			log.Printf("list messages scan: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
+			return
+		}
+		messages = append(messages, m)
+		msgIDs = append(msgIDs, m.ID)
+	}
+
+	if len(messages) == 0 {
+		c.JSON(http.StatusOK, []messageListItem{})
+		return
+	}
+
+	// Batch-load recipients.
+	toRows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, addr FROM msg_to WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err == nil {
+		toMap := make(map[int64][]string)
+		for toRows.Next() {
+			var id int64
+			var addr string
+			if scanErr := toRows.Scan(&id, &addr); scanErr == nil {
+				toMap[id] = append(toMap[id], addr)
+			}
+		}
+		toRows.Close()
+		for i := range messages {
+			messages[i].To = toMap[messages[i].ID]
+		}
+	}
+
+	// Batch-load attachments.
+	attRows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, filename, filesize FROM msg_attachment WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err == nil {
+		attMap := make(map[int64][]models.Attachment)
+		for attRows.Next() {
+			var id int64
+			var a models.Attachment
+			if scanErr := attRows.Scan(&id, &a.Filename, &a.Size); scanErr == nil {
+				attMap[id] = append(attMap[id], a)
+			}
+		}
+		attRows.Close()
+		for i := range messages {
+			messages[i].Attachments = attMap[messages[i].ID]
+		}
+	}
+
+	c.JSON(http.StatusOK, messages)
+}
+
 // Create handles POST /api/v1/messages — creates a draft message.
 func (h *MessageHandler) Create(c *gin.Context) {
 identity := middleware.GetIdentity(c)
