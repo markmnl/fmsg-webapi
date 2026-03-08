@@ -51,6 +51,7 @@ All routes are prefixed with `/api/v1` and require a valid `Authorization: Beare
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
+| `GET`    | `/api/v1/messages`                          | List messages for user   |
 | `POST`   | `/api/v1/messages`                          | Create a draft message   |
 | `GET`    | `/api/v1/messages/:id`                      | Retrieve a message       |
 | `PUT`    | `/api/v1/messages/:id`                      | Update a draft message   |
@@ -59,3 +60,16 @@ All routes are prefixed with `/api/v1` and require a valid `Authorization: Beare
 | `POST`   | `/api/v1/messages/:id/attachments`          | Upload an attachment     |
 | `GET`    | `/api/v1/messages/:id/attachments/:filename`| Download an attachment   |
 | `DELETE` | `/api/v1/messages/:id/attachments/:filename`| Delete an attachment     |
+
+### GET `/api/v1/messages`
+
+Returns messages where the authenticated user is a recipient (i.e. listed in `msg_to`), ordered by message ID descending.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+| --------- | ------- | ----------- |
+| `limit`   | `20`    | Max messages to return (1–100) |
+| `offset`  | `0`     | Number of messages to skip for pagination |
+
+**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /api/v1/messages/:id` (with an additional `id` field), except that the `data` field is always empty.
