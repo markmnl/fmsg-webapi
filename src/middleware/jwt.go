@@ -1,0 +1,138 @@
+// Package middleware configures the JWT authentication middleware.
+package middleware
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	jwt "github.com/appleboy/gin-jwt/v2"
+	"github.com/gin-gonic/gin"
+)
+
+const IdentityKey = "addr"
+
+// identityClaims is the payload stored in the JWT.
+type identityClaims struct {
+	Addr string
+}
+
+// SetupJWT creates and returns a configured GinJWTMiddleware.
+// secret is the HMAC secret used to validate tokens.
+// idURL is the base URL of the fmsgid service used to validate user addresses.
+func SetupJWT(secret string, idURL string) (*jwt.GinJWTMiddleware, error) {
+	mw, err := jwt.New(&jwt.GinJWTMiddleware{
+		Realm:       "fmsg",
+		Key:         []byte(secret),
+		Timeout:     24 * time.Hour,
+		MaxRefresh:  24 * time.Hour,
+		IdentityKey: IdentityKey,
+
+		// PayloadFunc stores the user address from the login credentials into JWT claims.
+		PayloadFunc: func(data interface{}) jwt.MapClaims {
+			if v, ok := data.(*identityClaims); ok {
+				return jwt.MapClaims{IdentityKey: v.Addr}
+			}
+			return jwt.MapClaims{}
+		},
+
+		// IdentityHandler extracts the address from JWT claims and puts it in Gin context.
+		IdentityHandler: func(c *gin.Context) interface{} {
+			claims := jwt.ExtractClaims(c)
+			addr, _ := claims[IdentityKey].(string)
+			return &identityClaims{Addr: addr}
+		},
+
+		// Authorizator validates the extracted identity and checks with fmsgid.
+		Authorizator: func(data interface{}, c *gin.Context) bool {
+			v, ok := data.(*identityClaims)
+			if !ok || v == nil {
+				return false
+			}
+			addr := v.Addr
+			if !isValidAddr(addr) {
+				return false
+			}
+			// Store the validated identity in context for downstream handlers.
+			c.Set(IdentityKey, addr)
+
+			// Validate with fmsgid service.
+			code, accepting, err := checkFmsgID(idURL, addr)
+			if err != nil {
+				log.Printf("fmsgid check error for %s: %v", addr, err)
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
+				return false
+			}
+			if code == http.StatusNotFound {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("User %s not found", addr)})
+				return false
+			}
+			if code == http.StatusOK && !accepting {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("User %s not authorised to send new messages", addr)})
+				return false
+			}
+			return true
+		},
+
+		// Unauthorized responds with 401 when JWT validation fails.
+		Unauthorized: func(c *gin.Context, code int, message string) {
+			c.JSON(code, gin.H{"error": message})
+		},
+
+		TokenLookup:   "header: Authorization",
+		TokenHeadName: "Bearer",
+		TimeFunc:      time.Now,
+	})
+	return mw, err
+}
+
+// GetIdentity retrieves the authenticated user address from the Gin context.
+func GetIdentity(c *gin.Context) string {
+	v, exists := c.Get(IdentityKey)
+	if !exists {
+		return ""
+	}
+	addr, _ := v.(string)
+	return addr
+}
+
+// isValidAddr checks that the address has the form "@user@domain".
+func isValidAddr(addr string) bool {
+	if len(addr) < 3 {
+		return false
+	}
+	if addr[0] != '@' {
+		return false
+	}
+	rest := addr[1:]
+	return strings.Contains(rest, "@")
+}
+
+// checkFmsgID queries the fmsgid service for a user address.
+// Returns (statusCode, acceptingNew, error).
+func checkFmsgID(idURL, addr string) (int, bool, error) {
+	url := strings.TrimRight(idURL, "/") + "/addr/" + addr
+	resp, err := http.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return http.StatusNotFound, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, false, nil
+	}
+
+	// Parse acceptingNew from the JSON response.
+	var result struct {
+		AcceptingNew bool `json:"acceptingNew"`
+	}
+	if err := decodeJSON(resp.Body, &result); err != nil {
+		return http.StatusOK, true, nil // assume accepting if parse fails
+	}
+	return http.StatusOK, result.AcceptingNew, nil
+}
