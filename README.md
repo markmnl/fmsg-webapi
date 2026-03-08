@@ -1,2 +1,61 @@
 # fmsg-webapi
-HTTP API providing user/client message handling for fmsgd host 
+
+HTTP API providing user/client message handling for an fmsg host. Exposes CRUD
+operations for a messaging datastore backed by PostgreSQL. Authentication is
+delegated to an external system — this service validates JWT tokens and enforces
+fine-grained authorisation rules based on the user identity they contain.
+
+## Environment Variables
+
+| Variable            | Default                  | Description                                             |
+| ------------------- | ------------------------ | ------------------------------------------------------- |
+| `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/opt/fmsg/data` |
+| `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens                 |
+| `FMSG_API_PORT`     | `8000`                   | TCP port the HTTP server listens on                     |
+| `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
+
+Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
+`PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
+
+A `.env` file placed in the working directory is loaded automatically at startup
+(values in the environment take precedence).
+
+## Building
+
+Requires **Go 1.25** or newer.
+
+```bash
+cd src
+go build ./...
+```
+
+## Running
+
+```bash
+export FMSG_DATA_DIR=/opt/fmsg/data
+export FMSG_API_JWT_SECRET=changeme
+export PGHOST=localhost
+export PGUSER=fmsg
+export PGPASSWORD=secret
+export PGDATABASE=fmsg
+
+cd src
+go run .
+```
+
+The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
+
+## API Routes
+
+All routes are prefixed with `/api/v1` and require a valid `Authorization: Bearer <token>` header.
+
+| Method   | Path                                        | Description              |
+| -------- | ------------------------------------------- | ------------------------ |
+| `POST`   | `/api/v1/messages`                          | Create a draft message   |
+| `GET`    | `/api/v1/messages/:id`                      | Retrieve a message       |
+| `PUT`    | `/api/v1/messages/:id`                      | Update a draft message   |
+| `DELETE` | `/api/v1/messages/:id`                      | Delete a draft message   |
+| `POST`   | `/api/v1/messages/:id/send`                 | Send a message           |
+| `POST`   | `/api/v1/messages/:id/attachments`          | Upload an attachment     |
+| `GET`    | `/api/v1/messages/:id/attachments/:filename`| Download an attachment   |
+| `DELETE` | `/api/v1/messages/:id/attachments/:filename`| Delete an attachment     |
