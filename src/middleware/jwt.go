@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const IdentityKey = "addr"
+const IdentityKey = "sub"
 
 // identityClaims is the payload stored in the JWT.
 type identityClaims struct {
