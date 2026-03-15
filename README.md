@@ -57,6 +57,7 @@ All routes are prefixed with `/api/v1` and require a valid `Authorization: Beare
 | `PUT`    | `/api/v1/messages/:id`                      | Update a draft message   |
 | `DELETE` | `/api/v1/messages/:id`                      | Delete a draft message   |
 | `POST`   | `/api/v1/messages/:id/send`                 | Send a message           |
+| `GET`    | `/api/v1/messages/:id/data`                 | Download message data    |
 | `POST`   | `/api/v1/messages/:id/attachments`          | Upload an attachment     |
 | `GET`    | `/api/v1/messages/:id/attachments/:filename`| Download an attachment   |
 | `DELETE` | `/api/v1/messages/:id/attachments/:filename`| Delete an attachment     |
@@ -73,3 +74,16 @@ Returns messages where the authenticated user is a recipient (i.e. listed in `ms
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
 **Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /api/v1/messages/:id` (with an additional `id` field), except that the `data` field is always empty.
+
+### GET `/api/v1/messages/:id/data`
+
+Downloads the binary body of a message. The authenticated user must be the sender (`from_addr`) or a recipient (listed in `msg_to`).
+
+**Response:** The raw message body file with `Content-Disposition: attachment` header. The `Content-Type` is inferred from the stored file extension.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `404`  | Message not found or data file not available |
+| `403`  | Authenticated user is neither sender nor recipient |

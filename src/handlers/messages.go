@@ -267,6 +267,60 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, msg)
 }
 
+// DownloadData handles GET /api/v1/messages/:id/data — downloads the message body as a file.
+func (h *MessageHandler) DownloadData(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	msgID, ok := parseID(c)
+	if !ok {
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Fetch message metadata for auth check and file path.
+	var fromAddr string
+	var dataPath string
+	err := h.DB.Pool.QueryRow(ctx,
+		"SELECT from_addr, filepath FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &dataPath)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		} else {
+			log.Printf("download data: fetch msg %d: %v", msgID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		}
+		return
+	}
+
+	// Authorize: must be owner or recipient.
+	if fromAddr != identity {
+		var recipientCount int
+		if err = h.DB.Pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND addr = $2", msgID, identity,
+		).Scan(&recipientCount); err != nil || recipientCount == 0 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+			return
+		}
+	}
+
+	if dataPath == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message data not available"})
+		return
+	}
+
+	// Path traversal protection: ensure the path is within DataDir.
+	cleanPath := filepath.Clean(dataPath)
+	cleanDataDir := filepath.Clean(h.DataDir)
+	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+		log.Printf("download data: path traversal attempt: %s", dataPath)
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		return
+	}
+
+	c.FileAttachment(cleanPath, filepath.Base(cleanPath))
+}
+
 // Update handles PUT /api/v1/messages/:id — updates a draft message.
 func (h *MessageHandler) Update(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
