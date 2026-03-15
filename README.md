@@ -73,7 +73,7 @@ Returns messages where the authenticated user is a recipient (i.e. listed in `ms
 | `limit`   | `20`    | Max messages to return (1–100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
-**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /api/v1/messages/:id` (with an additional `id` field), except that the `data` field is always empty.
+**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /api/v1/messages/:id` (with an additional `id` field). Message body data and attachment contents are not included — use the dedicated download endpoints instead.
 
 ### GET `/api/v1/messages/:id/data`
 

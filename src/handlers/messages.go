@@ -35,7 +35,7 @@ func NewMessageHandler(database *db.DB, dataDir string) *MessageHandler {
 }
 
 // messageListItem is the JSON shape for each message in the list response.
-// It mirrors the single-message response (including an id) but data is never populated.
+// It mirrors the single-message response (including an id).
 type messageListItem struct {
 	ID          int64               `json:"id"`
 	Version     int                 `json:"version"`
@@ -47,8 +47,13 @@ type messageListItem struct {
 	Topic       string              `json:"topic"`
 	Type        string              `json:"type"`
 	Size        int                 `json:"size"`
-	Data        string              `json:"data"`
 	Attachments []models.Attachment `json:"attachments"`
+}
+
+// messageInput is used for JSON binding on Create/Update — includes Data for the message body.
+type messageInput struct {
+	models.Message
+	Data string `json:"data"`
 }
 
 // List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
@@ -171,7 +176,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
-	var msg models.Message
+	var msg messageInput
 	if err := c.ShouldBindJSON(&msg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -350,7 +355,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	var msg models.Message
+	var msg messageInput
 	if err := c.ShouldBindJSON(&msg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

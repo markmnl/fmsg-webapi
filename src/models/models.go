@@ -17,6 +17,5 @@ type Message struct {
 	Topic       string       `json:"topic"`
 	Type        string       `json:"type"`
 	Size        int          `json:"size"`
-	Data        string       `json:"data"`
 	Attachments []Attachment `json:"attachments"`
 }
