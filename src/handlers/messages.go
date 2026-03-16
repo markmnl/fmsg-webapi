@@ -193,13 +193,28 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
+	ctx := c.Request.Context()
+
+	// Validate PID references an existing message.
+	if msg.PID != nil {
+		var exists bool
+		err := h.DB.Pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM msg WHERE id = $1)", *msg.PID).Scan(&exists)
+		if err != nil {
+			log.Printf("create message: validate pid: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate pid"})
+			return
+		}
+		if !exists {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("PID %d not found", *msg.PID)})
+			return
+		}
+	}
+
 	// Compute SHA-256 of the data payload.
 	hash := sha256.Sum256([]byte(msg.Data))
 
 	// Parse extension from MIME type.
 	ext := mimeToExt(msg.Type)
-
-	ctx := c.Request.Context()
 
 	// Insert message row with empty filepath; update after we know the ID.
 	var msgID int64
