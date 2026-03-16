@@ -37,17 +37,21 @@ func NewMessageHandler(database *db.DB, dataDir string) *MessageHandler {
 // messageListItem is the JSON shape for each message in the list response.
 // It mirrors the single-message response (including an id).
 type messageListItem struct {
-	ID          int64               `json:"id"`
-	Version     int                 `json:"version"`
-	Flags       int                 `json:"flags"`
-	PID         *int64              `json:"pid"`
-	From        string              `json:"from"`
-	To          []string            `json:"to"`
-	Time        *float64            `json:"time"`
-	Topic       string              `json:"topic"`
-	Type        string              `json:"type"`
-	Size        int                 `json:"size"`
-	Attachments []models.Attachment `json:"attachments"`
+	ID            int64               `json:"id"`
+	Version       int                 `json:"version"`
+	HasPid        bool                `json:"has_pid"`
+	Important     bool                `json:"important"`
+	NoReply       bool                `json:"no_reply"`
+	SkipChallenge bool                `json:"skip_challenge"`
+	Deflate       bool                `json:"deflate"`
+	PID           *int64              `json:"pid"`
+	From          string              `json:"from"`
+	To            []string            `json:"to"`
+	Time          *float64            `json:"time"`
+	Topic         string              `json:"topic"`
+	Type          string              `json:"type"`
+	Size          int                 `json:"size"`
+	Attachments   []models.Attachment `json:"attachments"`
 }
 
 // messageInput is used for JSON binding on Create/Update — includes Data for the message body.
@@ -111,11 +115,17 @@ func (h *MessageHandler) List(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.Flags, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		var flags uint8
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &flags, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
 		}
+		m.HasPid = flags&models.FlagHasPid != 0
+		m.Important = flags&models.FlagImportant != 0
+		m.NoReply = flags&models.FlagNoReply != 0
+		m.SkipChallenge = flags&models.FlagSkipChallenge != 0
+		m.Deflate = flags&models.FlagDeflate != 0
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
 	}
@@ -213,6 +223,9 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	// Compute SHA-256 of the data payload.
 	hash := sha256.Sum256([]byte(msg.Data))
 
+	// Detect zip (deflate) content by checking for the zip magic bytes.
+	msg.Deflate = isZip([]byte(msg.Data))
+
 	// Parse extension from MIME type.
 	ext := mimeToExt(msg.Type)
 
@@ -222,7 +235,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		`INSERT INTO msg (version, pid, flags, from_addr, topic, type, sha256, size, filepath, time_sent)
  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.Flags, msg.From, msg.Topic, msg.Type, hash[:], msg.Size,
+		msg.Version, msg.PID, msg.EncodeFlags(), msg.From, msg.Topic, msg.Type, hash[:], msg.Size,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -381,6 +394,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 
 	hash := sha256.Sum256([]byte(msg.Data))
+	msg.Deflate = isZip([]byte(msg.Data))
 	ext := mimeToExt(msg.Type)
 
 	dataPath, err := h.saveMessageData(msg.From, msgID, ext, msg.Data)
@@ -392,7 +406,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 
 	_, err = h.DB.Pool.Exec(ctx,
 		`UPDATE msg SET version=$1, pid=$2, flags=$3, topic=$4, type=$5, sha256=$6, size=$7, filepath=$8 WHERE id=$9`,
-		msg.Version, msg.PID, msg.Flags, msg.Topic, msg.Type, hash[:], msg.Size, dataPath, msgID,
+		msg.Version, msg.PID, msg.EncodeFlags(), msg.Topic, msg.Type, hash[:], msg.Size, dataPath, msgID,
 	)
 	if err != nil {
 		log.Printf("update message %d: %v", msgID, err)
@@ -534,11 +548,13 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	msg := &models.Message{}
 	var pid *int64
 	var timeSent *float64
-	if err := row.Scan(&msg.Version, &pid, &msg.Flags, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
+	var flags uint8
+	if err := row.Scan(&msg.Version, &pid, &flags, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
 		return nil, err
 	}
 	msg.PID = pid
 	msg.Time = timeSent
+	msg.DecodeFlags(flags)
 
 	// Load recipients.
 	rows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_to WHERE msg_id = $1", msgID)
@@ -643,4 +659,9 @@ func isRecipient(to []string, addr string) bool {
 		}
 	}
 	return false
+}
+
+// isZip reports whether data starts with the zip local file header signature.
+func isZip(data []byte) bool {
+	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
 }
