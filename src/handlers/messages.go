@@ -204,8 +204,8 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	// Insert message row with empty filepath; update after we know the ID.
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, flags, from_addr, topic, type, sha256, size, filepath)
- VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '')
+		`INSERT INTO msg (version, pid, flags, from_addr, topic, type, sha256, size, filepath, time_sent)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', NULL)
  RETURNING id`,
 		msg.Version, msg.PID, msg.Flags, msg.From, msg.Topic, msg.Type, hash[:], msg.Size,
 	).Scan(&msgID)
