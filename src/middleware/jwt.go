@@ -83,7 +83,9 @@ func SetupJWT(secret string, idURL string) (*jwt.GinJWTMiddleware, error) {
 
 		TokenLookup:   "header: Authorization",
 		TokenHeadName: "Bearer",
-		TimeFunc:      time.Now,
+		// Allow up to 10 seconds of clock skew so tokens issued slightly in the
+		// future (e.g. between Docker containers) are still accepted.
+		TimeFunc: func() time.Time { return time.Now().Add(10 * time.Second) },
 	})
 	return mw, err
 }
