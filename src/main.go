@@ -47,22 +47,22 @@ func main() {
 	msgHandler := handlers.NewMessageHandler(database, dataDir)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir)
 
-	// Register routes under /api/v1, all protected by JWT.
-	v1 := router.Group("/api/v1")
-	v1.Use(jwtMiddleware.MiddlewareFunc())
+	// Register routes under /fmsg, all protected by JWT.
+	fmsg := router.Group("/fmsg")
+	fmsg.Use(jwtMiddleware.MiddlewareFunc())
 	{
-		v1.GET("/messages", msgHandler.List)
-		v1.POST("/messages", msgHandler.Create)
-		v1.GET("/messages/:id", msgHandler.Get)
-		v1.PUT("/messages/:id", msgHandler.Update)
-		v1.DELETE("/messages/:id", msgHandler.Delete)
-		v1.POST("/messages/:id/send", msgHandler.Send)
-		v1.POST("/messages/:id/add-to", msgHandler.AddRecipients)
-		v1.GET("/messages/:id/data", msgHandler.DownloadData)
+		fmsg.GET("", msgHandler.List)
+		fmsg.POST("", msgHandler.Create)
+		fmsg.GET("/:id", msgHandler.Get)
+		fmsg.PUT("/:id", msgHandler.Update)
+		fmsg.DELETE("/:id", msgHandler.Delete)
+		fmsg.POST("/:id/send", msgHandler.Send)
+		fmsg.POST("/:id/add-to", msgHandler.AddRecipients)
+		fmsg.GET("/:id/data", msgHandler.DownloadData)
 
-		v1.POST("/messages/:id/attachments", attHandler.Upload)
-		v1.GET("/messages/:id/attachments/:filename", attHandler.Download)
-		v1.DELETE("/messages/:id/attachments/:filename", attHandler.DeleteAttachment)
+		fmsg.POST("/:id/attach", attHandler.Upload)
+		fmsg.GET("/:id/attach/:filename", attHandler.Download)
+		fmsg.DELETE("/:id/attach/:filename", attHandler.DeleteAttachment)
 	}
 
 	log.Printf("fmsg-webapi starting on :%s", port)

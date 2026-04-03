@@ -47,23 +47,23 @@ The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
 
 ## API Routes
 
-All routes are prefixed with `/api/v1` and require a valid `Authorization: Bearer <token>` header.
+All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header.
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
-| `GET`    | `/api/v1/messages`                          | List messages for user   |
-| `POST`   | `/api/v1/messages`                          | Create a draft message   |
-| `GET`    | `/api/v1/messages/:id`                      | Retrieve a message       |
-| `PUT`    | `/api/v1/messages/:id`                      | Update a draft message   |
-| `DELETE` | `/api/v1/messages/:id`                      | Delete a draft message   |
-| `POST`   | `/api/v1/messages/:id/send`                 | Send a message           |
-| `POST`   | `/api/v1/messages/:id/add-to`               | Add recipients           |
-| `GET`    | `/api/v1/messages/:id/data`                 | Download message data    |
-| `POST`   | `/api/v1/messages/:id/attachments`          | Upload an attachment     |
-| `GET`    | `/api/v1/messages/:id/attachments/:filename`| Download an attachment   |
-| `DELETE` | `/api/v1/messages/:id/attachments/:filename`| Delete an attachment     |
+| `GET`    | `/fmsg`                          | List messages for user   |
+| `POST`   | `/fmsg`                          | Create a draft message   |
+| `GET`    | `/fmsg/:id`                      | Retrieve a message       |
+| `PUT`    | `/fmsg/:id`                      | Update a draft message   |
+| `DELETE` | `/fmsg/:id`                      | Delete a draft message   |
+| `POST`   | `/fmsg/:id/send`                 | Send a message           |
+| `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
+| `GET`    | `/fmsg/:id/data`                 | Download message data    |
+| `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
+| `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
+| `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
 
-### GET `/api/v1/messages`
+### GET `/fmsg`
 
 Returns messages where the authenticated user is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
 
@@ -74,9 +74,9 @@ Returns messages where the authenticated user is a recipient (listed in `msg_to`
 | `limit`   | `20`    | Max messages to return (1–100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
-**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /api/v1/messages/:id` (with an additional `id` field). Message body data and attachment contents are not included — use the dedicated download endpoints instead.
+**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /fmsg/:id` (with an additional `id` field). Message body data and attachment contents are not included — use the dedicated download endpoints instead.
 
-### POST `/api/v1/messages`
+### POST `/fmsg`
 
 Creates a draft message. The `from` address must match the authenticated user. The message is stored with `time_sent = NULL` (draft status) until explicitly sent.
 
@@ -104,7 +104,7 @@ Creates a draft message. The `from` address must match the authenticated user. T
 | `400`  | Missing/invalid fields or empty `to` |
 | `403`  | `from` does not match authenticated user |
 
-### GET `/api/v1/messages/:id`
+### GET `/fmsg/:id`
 
 Retrieves a single message by ID. The authenticated user must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
 
@@ -138,9 +138,9 @@ Retrieves a single message by ID. The authenticated user must be a participant �
 | `404`  | Message not found |
 | `403`  | Authenticated user is not a participant |
 
-### PUT `/api/v1/messages/:id`
+### PUT `/fmsg/:id`
 
-Updates a draft message. Only the owner (`from`) may update, and the message must not have been sent yet. Accepts the same body as `POST /api/v1/messages`. Recipients in `to` are fully replaced.
+Updates a draft message. Only the owner (`from`) may update, and the message must not have been sent yet. Accepts the same body as `POST /fmsg`. Recipients in `to` are fully replaced.
 
 **Errors:**
 
@@ -150,7 +150,7 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 
-### DELETE `/api/v1/messages/:id`
+### DELETE `/fmsg/:id`
 
 Deletes a draft message and all its attachments from the database and disk. Only the owner may delete, and the message must not have been sent.
 
@@ -163,7 +163,7 @@ Deletes a draft message and all its attachments from the database and disk. Only
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 
-### POST `/api/v1/messages/:id/send`
+### POST `/fmsg/:id/send`
 
 Marks a draft message as sent by setting `time_sent` to the current timestamp. Only the owner may send.
 
@@ -177,7 +177,7 @@ Marks a draft message as sent by setting `time_sent` to the current timestamp. O
 | `404`  | Message not found |
 | `409`  | Message already sent |
 
-### POST `/api/v1/messages/:id/add-to`
+### POST `/fmsg/:id/add-to`
 
 Adds additional recipients to an existing message. The authenticated user must be an existing participant — the sender (`from`) or a primary recipient (listed in `to`).
 
@@ -199,7 +199,7 @@ New addresses must be distinct among themselves (case-insensitive).
 | `403`  | Authenticated user is not an existing participant (sender or `to` recipient) |
 | `404`  | Message not found |
 
-### GET `/api/v1/messages/:id/data`
+### GET `/fmsg/:id/data`
 
 Downloads the binary body of a message. The authenticated user must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
 
@@ -212,7 +212,7 @@ Downloads the binary body of a message. The authenticated user must be a partici
 | `404`  | Message not found or data file not available |
 | `403`  | Authenticated user is not a participant |
 
-### POST `/api/v1/messages/:id/attachments`
+### POST `/fmsg/:id/attach`
 
 Uploads a file attachment for a draft message. Only the owner may upload, and the message must not have been sent.
 
@@ -228,7 +228,7 @@ Uploads a file attachment for a draft message. Only the owner may upload, and th
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 
-### GET `/api/v1/messages/:id/attachments/:filename`
+### GET `/fmsg/:id/attach/:filename`
 
 Downloads an attachment by filename. The authenticated user must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
 
@@ -242,7 +242,7 @@ Downloads an attachment by filename. The authenticated user must be a participan
 | `403`  | Authenticated user is not a participant |
 | `404`  | Message or attachment not found |
 
-### DELETE `/api/v1/messages/:id/attachments/:filename`
+### DELETE `/fmsg/:id/attach/:filename`
 
 Deletes an attachment from a draft message. Only the owner may delete, and the message must not have been sent.
 

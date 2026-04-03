@@ -3,7 +3,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -41,7 +40,6 @@ type messageListItem struct {
 	Version     int                 `json:"version"`
 	HasPid      bool                `json:"has_pid"`
 	HasAddTo    bool                `json:"has_add_to"`
-	CommonType  bool                `json:"common_type"`
 	Important   bool                `json:"important"`
 	NoReply     bool                `json:"no_reply"`
 	Deflate     bool                `json:"deflate"`
@@ -98,7 +96,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.flags, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
 		 FROM msg m
 		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
 		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
@@ -117,18 +115,12 @@ func (h *MessageHandler) List(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		var flags uint8
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &flags, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
 		}
-		m.HasPid = flags&models.FlagHasPid != 0
-		m.HasAddTo = flags&models.FlagHasAddTo != 0
-		m.CommonType = flags&models.FlagCommonType != 0
-		m.Important = flags&models.FlagImportant != 0
-		m.NoReply = flags&models.FlagNoReply != 0
-		m.Deflate = flags&models.FlagDeflate != 0
+		m.HasPid = m.PID != nil
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
 	}
@@ -175,6 +167,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 		addToRows.Close()
 		for i := range messages {
 			messages[i].AddTo = addToMap[messages[i].ID]
+			messages[i].HasAddTo = len(messages[i].AddTo) > 0
 		}
 	}
 
@@ -243,9 +236,6 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		}
 	}
 
-	// Compute SHA-256 of the data payload.
-	hash := sha256.Sum256([]byte(msg.Data))
-
 	// Detect zip (deflate) content by checking for the zip magic bytes.
 	msg.Deflate = isZip([]byte(msg.Data))
 
@@ -255,10 +245,10 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	// Insert message row with empty filepath; update after we know the ID.
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, flags, from_addr, topic, type, sha256, size, filepath, time_sent)
- VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', NULL)
+		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, topic, type, size, filepath, time_sent)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.EncodeFlags(), msg.From, msg.Topic, msg.Type, hash[:], msg.Size,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, msg.Size,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -420,7 +410,6 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	hash := sha256.Sum256([]byte(msg.Data))
 	msg.Deflate = isZip([]byte(msg.Data))
 	ext := mimeToExt(msg.Type)
 
@@ -432,8 +421,8 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 
 	_, err = h.DB.Pool.Exec(ctx,
-		`UPDATE msg SET version=$1, pid=$2, flags=$3, topic=$4, type=$5, sha256=$6, size=$7, filepath=$8 WHERE id=$9`,
-		msg.Version, msg.PID, msg.EncodeFlags(), msg.Topic, msg.Type, hash[:], msg.Size, dataPath, msgID,
+		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, topic=$6, type=$7, size=$8, filepath=$9 WHERE id=$10`,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Topic, msg.Type, msg.Size, dataPath, msgID,
 	)
 	if err != nil {
 		log.Printf("update message %d: %v", msgID, err)
@@ -596,10 +585,9 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 
 	// Load the message to verify it exists.
 	var fromAddr string
-	var flags uint8
 	err := h.DB.Pool.QueryRow(ctx,
-		"SELECT from_addr, flags FROM msg WHERE id = $1", msgID,
-	).Scan(&fromAddr, &flags)
+		"SELECT from_addr FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -637,34 +625,25 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		}
 	}
 
-	// Set the HasAddTo flag if not already set.
-	if flags&models.FlagHasAddTo == 0 {
-		flags |= models.FlagHasAddTo
-		if _, err = h.DB.Pool.Exec(ctx, "UPDATE msg SET flags = $1 WHERE id = $2", flags, msgID); err != nil {
-			log.Printf("add recipients: update flags: %v", err)
-		}
-	}
-
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
 }
 
 // fetchMessage loads a message with its recipients and attachments from the DB.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, flags, time_sent, from_addr, topic, type, size FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size FROM msg WHERE id = $1`,
 		msgID,
 	)
 
 	msg := &models.Message{}
 	var pid *int64
 	var timeSent *float64
-	var flags uint8
-	if err := row.Scan(&msg.Version, &pid, &flags, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
 		return nil, err
 	}
 	msg.PID = pid
 	msg.Time = timeSent
-	msg.DecodeFlags(flags)
+	msg.HasPid = pid != nil
 
 	// Load recipients.
 	rows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_to WHERE msg_id = $1", msgID)
@@ -689,6 +668,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 		}
 		addToRows.Close()
 	}
+	msg.HasAddTo = len(msg.AddTo) > 0
 
 	// Load attachments.
 	attRows, err := h.DB.Pool.Query(ctx, "SELECT filename, filesize FROM msg_attachment WHERE msg_id = $1", msgID)

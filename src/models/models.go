@@ -6,66 +6,21 @@ type Attachment struct {
 	Filename string `json:"filename"`
 }
 
-// Flag bitmask constants for the msg.flags column.
-const (
-	FlagHasPid     uint8 = 1
-	FlagHasAddTo   uint8 = 1 << 1
-	FlagCommonType uint8 = 1 << 2
-	FlagImportant  uint8 = 1 << 3
-	FlagNoReply    uint8 = 1 << 4
-	FlagDeflate    uint8 = 1 << 5
-)
-
 // Message represents a fmsg message as exchanged over the HTTP API.
 type Message struct {
-	Version    int          `json:"version"`
-	HasPid     bool         `json:"has_pid"`
-	HasAddTo   bool         `json:"has_add_to"`
-	CommonType bool         `json:"common_type"`
-	Important  bool         `json:"important"`
-	NoReply    bool         `json:"no_reply"`
-	Deflate    bool         `json:"deflate"`
-	PID        *int64       `json:"pid"`
-	From       string       `json:"from"`
-	To         []string     `json:"to"`
-	AddTo      []string     `json:"add_to"`
-	Time       *float64     `json:"time"`
-	Topic      string       `json:"topic"`
-	Type       string       `json:"type"`
-	Size       int          `json:"size"`
+	Version     int          `json:"version"`
+	HasPid      bool         `json:"has_pid"`
+	HasAddTo    bool         `json:"has_add_to"`
+	Important   bool         `json:"important"`
+	NoReply     bool         `json:"no_reply"`
+	Deflate     bool         `json:"deflate"`
+	PID         *int64       `json:"pid"`
+	From        string       `json:"from"`
+	To          []string     `json:"to"`
+	AddTo       []string     `json:"add_to"`
+	Time        *float64     `json:"time"`
+	Topic       string       `json:"topic"`
+	Type        string       `json:"type"`
+	Size        int          `json:"size"`
 	Attachments []Attachment `json:"attachments"`
-}
-
-// EncodeFlags packs the boolean flag fields into a uint8 bitmask.
-func (m *Message) EncodeFlags() uint8 {
-	var f uint8
-	if m.HasPid {
-		f |= FlagHasPid
-	}
-	if m.HasAddTo {
-		f |= FlagHasAddTo
-	}
-	if m.CommonType {
-		f |= FlagCommonType
-	}
-	if m.Important {
-		f |= FlagImportant
-	}
-	if m.NoReply {
-		f |= FlagNoReply
-	}
-	if m.Deflate {
-		f |= FlagDeflate
-	}
-	return f
-}
-
-// DecodeFlags unpacks a uint8 bitmask into the boolean flag fields.
-func (m *Message) DecodeFlags(f uint8) {
-	m.HasPid = f&FlagHasPid != 0
-	m.HasAddTo = f&FlagHasAddTo != 0
-	m.CommonType = f&FlagCommonType != 0
-	m.Important = f&FlagImportant != 0
-	m.NoReply = f&FlagNoReply != 0
-	m.Deflate = f&FlagDeflate != 0
 }
