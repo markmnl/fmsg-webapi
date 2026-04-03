@@ -1,5 +1,7 @@
 # fmsg-webapi
 
+[![Build & Test](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml/badge.svg)](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml)
+
 HTTP API providing user/client message handling for an fmsg host. Exposes CRUD
 operations for a messaging datastore backed by PostgreSQL. Authentication is
 delegated to an external system — this service validates JWT tokens and enforces
@@ -27,6 +29,13 @@ Requires **Go 1.25** or newer.
 ```bash
 cd src
 go build ./...
+```
+
+## Testing
+
+```bash
+cd src
+go test ./...
 ```
 
 ## Running

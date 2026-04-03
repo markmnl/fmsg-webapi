@@ -753,10 +753,10 @@ func parseID(c *gin.Context) (int64, bool) {
 	return id, true
 }
 
-// isRecipient checks whether addr appears in the to list.
+// isRecipient checks whether addr appears in the to list (case-insensitive).
 func isRecipient(to []string, addr string) bool {
 	for _, a := range to {
-		if a == addr {
+		if strings.EqualFold(a, addr) {
 			return true
 		}
 	}
