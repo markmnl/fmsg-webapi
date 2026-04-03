@@ -152,11 +152,15 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 		return
 	}
 
-	// Check recipients if not owner.
+	// Check recipients (to or add_to) if not owner.
 	if fromAddr != identity {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
-			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND addr = $2", msgID, identity,
+			`SELECT COUNT(*) FROM (
+				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = $2
+				UNION ALL
+				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = $2
+			) r`, msgID, identity,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 			return

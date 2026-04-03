@@ -37,21 +37,23 @@ func NewMessageHandler(database *db.DB, dataDir string) *MessageHandler {
 // messageListItem is the JSON shape for each message in the list response.
 // It mirrors the single-message response (including an id).
 type messageListItem struct {
-	ID            int64               `json:"id"`
-	Version       int                 `json:"version"`
-	HasPid        bool                `json:"has_pid"`
-	Important     bool                `json:"important"`
-	NoReply       bool                `json:"no_reply"`
-	SkipChallenge bool                `json:"skip_challenge"`
-	Deflate       bool                `json:"deflate"`
-	PID           *int64              `json:"pid"`
-	From          string              `json:"from"`
-	To            []string            `json:"to"`
-	Time          *float64            `json:"time"`
-	Topic         string              `json:"topic"`
-	Type          string              `json:"type"`
-	Size          int                 `json:"size"`
-	Attachments   []models.Attachment `json:"attachments"`
+	ID          int64               `json:"id"`
+	Version     int                 `json:"version"`
+	HasPid      bool                `json:"has_pid"`
+	HasAddTo    bool                `json:"has_add_to"`
+	CommonType  bool                `json:"common_type"`
+	Important   bool                `json:"important"`
+	NoReply     bool                `json:"no_reply"`
+	Deflate     bool                `json:"deflate"`
+	PID         *int64              `json:"pid"`
+	From        string              `json:"from"`
+	To          []string            `json:"to"`
+	AddTo       []string            `json:"add_to"`
+	Time        *float64            `json:"time"`
+	Topic       string              `json:"topic"`
+	Type        string              `json:"type"`
+	Size        int                 `json:"size"`
+	Attachments []models.Attachment `json:"attachments"`
 }
 
 // messageInput is used for JSON binding on Create/Update — includes Data for the message body.
@@ -98,8 +100,8 @@ func (h *MessageHandler) List(c *gin.Context) {
 	rows, err := h.DB.Pool.Query(ctx,
 		`SELECT m.id, m.version, m.pid, m.flags, m.time_sent, m.from_addr, m.topic, m.type, m.size
 		 FROM msg m
-		 INNER JOIN msg_to mt ON mt.msg_id = m.id
-		 WHERE mt.addr = $1
+		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
+		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
 		identity, limit, offset,
@@ -122,9 +124,10 @@ func (h *MessageHandler) List(c *gin.Context) {
 			return
 		}
 		m.HasPid = flags&models.FlagHasPid != 0
+		m.HasAddTo = flags&models.FlagHasAddTo != 0
+		m.CommonType = flags&models.FlagCommonType != 0
 		m.Important = flags&models.FlagImportant != 0
 		m.NoReply = flags&models.FlagNoReply != 0
-		m.SkipChallenge = flags&models.FlagSkipChallenge != 0
 		m.Deflate = flags&models.FlagDeflate != 0
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
@@ -152,6 +155,26 @@ func (h *MessageHandler) List(c *gin.Context) {
 		toRows.Close()
 		for i := range messages {
 			messages[i].To = toMap[messages[i].ID]
+		}
+	}
+
+	// Batch-load add_to recipients.
+	addToRows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, addr FROM msg_add_to WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err == nil {
+		addToMap := make(map[int64][]string)
+		for addToRows.Next() {
+			var id int64
+			var addr string
+			if scanErr := addToRows.Scan(&id, &addr); scanErr == nil {
+				addToMap[id] = append(addToMap[id], addr)
+			}
+		}
+		addToRows.Close()
+		for i := range messages {
+			messages[i].AddTo = addToMap[messages[i].ID]
 		}
 	}
 
@@ -202,6 +225,21 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "to list must not be empty"})
 		return
 	}
+
+	// add_to requires a PID (SPEC: "add to exists but pid does not → code 1").
+	if len(msg.AddTo) > 0 && msg.PID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to requires pid"})
+		return
+	}
+
+	// All recipients (to + add_to) must be distinct case-insensitive.
+	if err := checkDistinctRecipients(msg.To, msg.AddTo); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Set HasAddTo flag based on input.
+	msg.HasAddTo = len(msg.AddTo) > 0
 
 	ctx := c.Request.Context()
 
@@ -268,6 +306,16 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		}
 	}
 
+	// Insert add_to recipients.
+	for _, addr := range msg.AddTo {
+		if _, err = h.DB.Pool.Exec(ctx,
+			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			msgID, addr,
+		); err != nil {
+			log.Printf("create message: insert add_to recipient %s: %v", addr, err)
+		}
+	}
+
 	c.JSON(http.StatusCreated, gin.H{"id": msgID})
 }
 
@@ -291,8 +339,8 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		return
 	}
 
-	// Authorization: owner or recipient.
-	if msg.From != identity && !isRecipient(msg.To, identity) {
+	// Authorization: owner or recipient (to or add_to).
+	if msg.From != identity && !isRecipient(msg.To, identity) && !isRecipient(msg.AddTo, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
@@ -330,7 +378,11 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	if fromAddr != identity {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
-			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND addr = $2", msgID, identity,
+			`SELECT COUNT(*) FROM (
+				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = $2
+				UNION ALL
+				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = $2
+			) r`, msgID, identity,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 			return
@@ -393,6 +445,20 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// add_to requires a PID.
+	if len(msg.AddTo) > 0 && msg.PID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to requires pid"})
+		return
+	}
+
+	// All recipients (to + add_to) must be distinct case-insensitive.
+	if err := checkDistinctRecipients(msg.To, msg.AddTo); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	msg.HasAddTo = len(msg.AddTo) > 0
+
 	hash := sha256.Sum256([]byte(msg.Data))
 	msg.Deflate = isZip([]byte(msg.Data))
 	ext := mimeToExt(msg.Type)
@@ -424,6 +490,19 @@ func (h *MessageHandler) Update(c *gin.Context) {
 			msgID, addr,
 		); err != nil {
 			log.Printf("update message %d insert recipient %s: %v", msgID, addr, err)
+		}
+	}
+
+	// Replace add_to recipients.
+	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_add_to WHERE msg_id = $1", msgID); err != nil {
+		log.Printf("update message %d delete add_to recipients: %v", msgID, err)
+	}
+	for _, addr := range msg.AddTo {
+		if _, err = h.DB.Pool.Exec(ctx,
+			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			msgID, addr,
+		); err != nil {
+			log.Printf("update message %d insert add_to recipient %s: %v", msgID, addr, err)
 		}
 	}
 
@@ -480,6 +559,9 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 	}
 	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_to WHERE msg_id = $1", msgID); err != nil {
 		log.Printf("delete message %d: delete recipients: %v", msgID, err)
+	}
+	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_add_to WHERE msg_id = $1", msgID); err != nil {
+		log.Printf("delete message %d: delete add_to recipients: %v", msgID, err)
 	}
 
 	// Get data filepath before deleting.
@@ -566,6 +648,18 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 			}
 		}
 		rows.Close()
+	}
+
+	// Load add_to recipients.
+	addToRows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_add_to WHERE msg_id = $1", msgID)
+	if err == nil {
+		for addToRows.Next() {
+			var addr string
+			if scanErr := addToRows.Scan(&addr); scanErr == nil {
+				msg.AddTo = append(msg.AddTo, addr)
+			}
+		}
+		addToRows.Close()
 	}
 
 	// Load attachments.
@@ -664,4 +758,25 @@ func isRecipient(to []string, addr string) bool {
 // isZip reports whether data starts with the zip local file header signature.
 func isZip(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
+}
+
+// checkDistinctRecipients returns an error if any address in to or addTo
+// appears more than once (case-insensitive).
+func checkDistinctRecipients(to, addTo []string) error {
+	seen := make(map[string]struct{}, len(to)+len(addTo))
+	for _, addr := range to {
+		key := strings.ToLower(addr)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("duplicate recipient: %s", addr)
+		}
+		seen[key] = struct{}{}
+	}
+	for _, addr := range addTo {
+		key := strings.ToLower(addr)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("duplicate recipient: %s", addr)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
 }
