@@ -57,6 +57,7 @@ func main() {
 		v1.PUT("/messages/:id", msgHandler.Update)
 		v1.DELETE("/messages/:id", msgHandler.Delete)
 		v1.POST("/messages/:id/send", msgHandler.Send)
+		v1.POST("/messages/:id/add-to", msgHandler.AddRecipients)
 		v1.GET("/messages/:id/data", msgHandler.DownloadData)
 
 		v1.POST("/messages/:id/attachments", attHandler.Upload)

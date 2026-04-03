@@ -226,21 +226,6 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// add_to requires a PID (SPEC: "add to exists but pid does not → code 1").
-	if len(msg.AddTo) > 0 && msg.PID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to requires pid"})
-		return
-	}
-
-	// All recipients (to + add_to) must be distinct case-insensitive.
-	if err := checkDistinctRecipients(msg.To, msg.AddTo); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Set HasAddTo flag based on input.
-	msg.HasAddTo = len(msg.AddTo) > 0
-
 	ctx := c.Request.Context()
 
 	// Validate PID references an existing message.
@@ -303,16 +288,6 @@ func (h *MessageHandler) Create(c *gin.Context) {
 			msgID, addr,
 		); err != nil {
 			log.Printf("create message: insert recipient %s: %v", addr, err)
-		}
-	}
-
-	// Insert add_to recipients.
-	for _, addr := range msg.AddTo {
-		if _, err = h.DB.Pool.Exec(ctx,
-			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-			msgID, addr,
-		); err != nil {
-			log.Printf("create message: insert add_to recipient %s: %v", addr, err)
 		}
 	}
 
@@ -445,20 +420,6 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	// add_to requires a PID.
-	if len(msg.AddTo) > 0 && msg.PID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to requires pid"})
-		return
-	}
-
-	// All recipients (to + add_to) must be distinct case-insensitive.
-	if err := checkDistinctRecipients(msg.To, msg.AddTo); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	msg.HasAddTo = len(msg.AddTo) > 0
-
 	hash := sha256.Sum256([]byte(msg.Data))
 	msg.Deflate = isZip([]byte(msg.Data))
 	ext := mimeToExt(msg.Type)
@@ -490,19 +451,6 @@ func (h *MessageHandler) Update(c *gin.Context) {
 			msgID, addr,
 		); err != nil {
 			log.Printf("update message %d insert recipient %s: %v", msgID, addr, err)
-		}
-	}
-
-	// Replace add_to recipients.
-	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_add_to WHERE msg_id = $1", msgID); err != nil {
-		log.Printf("update message %d delete add_to recipients: %v", msgID, err)
-	}
-	for _, addr := range msg.AddTo {
-		if _, err = h.DB.Pool.Exec(ctx,
-			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-			msgID, addr,
-		); err != nil {
-			log.Printf("update message %d insert add_to recipient %s: %v", msgID, addr, err)
 		}
 	}
 
@@ -618,6 +566,86 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "time": now})
+}
+
+// addToInput is the JSON shape for the add-to request body.
+type addToInput struct {
+	AddTo []string `json:"add_to"`
+}
+
+// AddRecipients handles POST /api/v1/messages/:id/add-to — adds additional recipients to a message.
+func (h *MessageHandler) AddRecipients(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	msgID, ok := parseID(c)
+	if !ok {
+		return
+	}
+
+	var input addToInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if len(input.AddTo) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to list must not be empty"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load the message to verify it exists.
+	var fromAddr string
+	var flags uint8
+	err := h.DB.Pool.QueryRow(ctx,
+		"SELECT from_addr, flags FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &flags)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		} else {
+			log.Printf("add recipients: fetch msg %d: %v", msgID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		}
+		return
+	}
+
+	// Verify the requester is an existing participant (from or msg_to).
+	if fromAddr != identity {
+		var recipientCount int
+		if err = h.DB.Pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND addr = $2", msgID, identity,
+		).Scan(&recipientCount); err != nil || recipientCount == 0 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "only existing participants may add recipients"})
+			return
+		}
+	}
+
+	// New add_to addresses must be distinct among themselves (case-insensitive).
+	if err := checkDistinctRecipients(input.AddTo, nil); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Insert the new add_to recipients.
+	for _, addr := range input.AddTo {
+		if _, err = h.DB.Pool.Exec(ctx,
+			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			msgID, addr,
+		); err != nil {
+			log.Printf("add recipients: insert %s: %v", addr, err)
+		}
+	}
+
+	// Set the HasAddTo flag if not already set.
+	if flags&models.FlagHasAddTo == 0 {
+		flags |= models.FlagHasAddTo
+		if _, err = h.DB.Pool.Exec(ctx, "UPDATE msg SET flags = $1 WHERE id = $2", flags, msgID); err != nil {
+			log.Printf("add recipients: update flags: %v", err)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
 }
 
 // fetchMessage loads a message with its recipients and attachments from the DB.
