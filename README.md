@@ -64,7 +64,7 @@ All routes are prefixed with `/api/v1` and require a valid `Authorization: Beare
 
 ### GET `/api/v1/messages`
 
-Returns messages where the authenticated user is a recipient (i.e. listed in `msg_to`), ordered by message ID descending.
+Returns messages where the authenticated user is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
 
 **Query parameters:**
 
@@ -77,7 +77,7 @@ Returns messages where the authenticated user is a recipient (i.e. listed in `ms
 
 ### GET `/api/v1/messages/:id/data`
 
-Downloads the binary body of a message. The authenticated user must be the sender (`from_addr`) or a recipient (listed in `msg_to`).
+Downloads the binary body of a message. The authenticated user must be a participant — the sender (`from_addr`) or a recipient (listed in `msg_to` or `msg_add_to`).
 
 **Response:** The raw message body file with `Content-Disposition: attachment` header. The `Content-Type` is inferred from the stored file extension.
 
@@ -86,4 +86,4 @@ Downloads the binary body of a message. The authenticated user must be the sende
 | Status | Condition |
 | ------ | --------- |
 | `404`  | Message not found or data file not available |
-| `403`  | Authenticated user is neither sender nor recipient |
+| `403`  | Authenticated user is not a participant (sender, to, or add to) |
