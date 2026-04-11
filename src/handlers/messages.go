@@ -929,10 +929,11 @@ func isZip(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
 }
 
-// checkDistinctRecipients returns an error if any address in to or addTo
-// appears more than once (case-insensitive).
+// checkDistinctRecipients returns an error if any address appears more than
+// once within to, or more than once within addTo. Overlap between the two
+// lists is allowed.
 func checkDistinctRecipients(to, addTo []string) error {
-	seen := make(map[string]struct{}, len(to)+len(addTo))
+	seen := make(map[string]struct{}, len(to))
 	for _, addr := range to {
 		key := strings.ToLower(addr)
 		if _, dup := seen[key]; dup {
@@ -940,12 +941,13 @@ func checkDistinctRecipients(to, addTo []string) error {
 		}
 		seen[key] = struct{}{}
 	}
+	addToSeen := make(map[string]struct{}, len(addTo))
 	for _, addr := range addTo {
 		key := strings.ToLower(addr)
-		if _, dup := seen[key]; dup {
-			return fmt.Errorf("duplicate recipient: %s", addr)
+		if _, dup := addToSeen[key]; dup {
+			return fmt.Errorf("duplicate add_to recipient: %s", addr)
 		}
-		seen[key] = struct{}{}
+		addToSeen[key] = struct{}{}
 	}
 	return nil
 }
