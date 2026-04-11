@@ -128,6 +128,8 @@ Returns messages where the authenticated user is a recipient (listed in `msg_to`
 
 Creates a draft message. The `from` address must match the authenticated user. The message is stored with `time_sent = NULL` (draft status) until explicitly sent.
 
+When `add_to` recipients are provided, `add_to_from` is automatically populated from the authenticated identity.
+
 **Request body (JSON):**
 
 | Field       | Type       | Required | Description |
@@ -141,6 +143,7 @@ Creates a draft message. The `from` address must match the authenticated user. T
 | `size`      | `int`      | yes      | Data size in bytes |
 | `important` | `bool`     | no       | Mark message as important |
 | `no_reply`  | `bool`     | no       | Indicate replies will be discarded |
+| `add_to`    | `string[]` | no       | Additional recipients for add-to semantics |
 | `data`      | `string`   | no       | Message body content |
 
 **Response:** `201 Created` with `{"id": <int>}`.
@@ -171,6 +174,7 @@ Retrieves a single message by ID. The authenticated user must be a participant â
   "from": "@alice@example.com",
   "to": ["@bob@example.com"],
   "add_to": [],
+  "add_to_from": null,
   "time": null,
   "topic": "Hello",
   "type": "text/plain",
@@ -228,6 +232,8 @@ Marks a draft message as sent by setting `time_sent` to the current timestamp. O
 ### POST `/fmsg/:id/add-to`
 
 Adds additional recipients to an existing message. The authenticated user must be an existing participant â€” the sender (`from`) or a primary recipient (listed in `to`).
+
+This endpoint updates the message `add_to_from` field to the authenticated identity in the same transaction as the `msg_add_to` inserts.
 
 **Request body (JSON):**
 
