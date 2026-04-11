@@ -47,6 +47,7 @@ type messageListItem struct {
 	From        string              `json:"from"`
 	To          []string            `json:"to"`
 	AddTo       []string            `json:"add_to"`
+	AddToFrom   *string             `json:"add_to_from"`
 	Time        *float64            `json:"time"`
 	Topic       string              `json:"topic"`
 	Type        string              `json:"type"`
@@ -231,7 +232,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.add_to_from, m.topic, m.type, m.size
 		 FROM msg m
 		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
 		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
@@ -250,7 +251,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.AddToFrom, &m.Topic, &m.Type, &m.Size); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
@@ -377,13 +378,19 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	// Parse extension from MIME type.
 	ext := mimeToExt(msg.Type)
 
+	// add_to_from is the authenticated identity when add_to recipients are present.
+	var addToFrom interface{}
+	if len(msg.AddTo) > 0 {
+		addToFrom = identity
+	}
+
 	// Insert message row with empty filepath; update after we know the ID.
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, topic, type, size, filepath, time_sent)
- VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NULL)
+		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, add_to_from, topic, type, size, filepath, time_sent)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, msg.Size,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, addToFrom, msg.Topic, msg.Type, msg.Size,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -413,6 +420,16 @@ func (h *MessageHandler) Create(c *gin.Context) {
 			msgID, addr,
 		); err != nil {
 			log.Printf("create message: insert recipient %s: %v", addr, err)
+		}
+	}
+
+	// Insert add_to recipients.
+	for _, addr := range msg.AddTo {
+		if _, err = h.DB.Pool.Exec(ctx,
+			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			msgID, addr,
+		); err != nil {
+			log.Printf("create message: insert add_to recipient %s: %v", addr, err)
 		}
 	}
 
@@ -792,14 +809,14 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 // fetchMessage loads a message with its recipients and attachments from the DB.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, add_to_from, topic, type, size FROM msg WHERE id = $1`,
 		msgID,
 	)
 
 	msg := &models.Message{}
 	var pid *int64
 	var timeSent *float64
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.AddToFrom, &msg.Topic, &msg.Type, &msg.Size); err != nil {
 		return nil, err
 	}
 	msg.PID = pid
