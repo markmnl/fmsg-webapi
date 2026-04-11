@@ -100,9 +100,9 @@ func TestCheckDistinctRecipients(t *testing.T) {
 		t.Error("expected duplicate error for case-insensitive match in to")
 	}
 
-	// Duplicate across to and addTo.
-	if err := checkDistinctRecipients([]string{"@a@b.com"}, []string{"@A@B.COM"}); err == nil {
-		t.Error("expected duplicate error across to and addTo")
+	// Same address in both to and addTo is allowed.
+	if err := checkDistinctRecipients([]string{"@a@b.com"}, []string{"@A@B.COM"}); err != nil {
+		t.Errorf("expected no error for address in both to and addTo, got %v", err)
 	}
 
 	// Duplicate within addTo only.
