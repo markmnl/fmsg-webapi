@@ -51,6 +51,7 @@ func main() {
 	fmsg := router.Group("/fmsg")
 	fmsg.Use(jwtMiddleware.MiddlewareFunc())
 	{
+		fmsg.GET("/wait", msgHandler.Wait)
 		fmsg.GET("", msgHandler.List)
 		fmsg.POST("", msgHandler.Create)
 		fmsg.GET("/:id", msgHandler.Get)

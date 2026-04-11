@@ -61,6 +61,7 @@ All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
 | `GET`    | `/fmsg`                          | List messages for user   |
+| `GET`    | `/fmsg/wait`                     | Long-poll for new messages |
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
 | `PUT`    | `/fmsg/:id`                      | Update a draft message   |
@@ -71,6 +72,44 @@ All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer 
 | `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
 | `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
 | `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
+
+### GET `/fmsg/wait`
+
+Long-polls until a new message arrives for the authenticated user, then returns immediately. Intended for CLI and daemon clients that want near-instant delivery notification without polling.
+
+Uses PostgreSQL `LISTEN` on the `new_msg_to` channel — woken directly by the database trigger on new recipient rows.
+
+**Query parameters:**
+
+| Parameter  | Default | Description |
+| ---------- | ------- | ----------- |
+| `since_id` | `0`     | Only messages with `id` greater than this value are considered new |
+| `timeout`  | `25`    | Maximum seconds to wait before returning (1–60) |
+
+**Response:**
+
+| Status | Meaning |
+| ------ | ------- |
+| `200`  | New message available. Body: `{"has_new": true, "latest_id": <id>}`. Use `latest_id` with `GET /fmsg/<id>` to fetch the message. |
+| `204`  | Timeout elapsed — no new messages. Client should immediately re-issue the request. |
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `400`  | Invalid `since_id` or `timeout` |
+| `401`  | Missing or invalid JWT |
+
+**Client loop example:**
+```
+latestID = 0
+loop:
+  response = GET /fmsg/wait?since_id=<latestID>
+  if response.status == 200:
+    latestID = response.body.latest_id
+    fetch and display GET /fmsg/<latestID>
+  # on 204 or transient error: loop immediately (with brief back-off on error)
+```
 
 ### GET `/fmsg`
 

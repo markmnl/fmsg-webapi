@@ -60,6 +60,141 @@ type messageInput struct {
 	Data string `json:"data"`
 }
 
+// Wait handles GET /fmsg/wait — blocks until new messages are available for the authenticated user.
+// Query parameters:
+//   - since_id (default 0): only messages with id > since_id are considered new.
+//   - timeout (default 25, max 60): long-poll wait timeout in seconds.
+func (h *MessageHandler) Wait(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	if identity == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	sinceID := int64(0)
+	if s := c.Query("since_id"); s != "" {
+		parsed, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since_id"})
+			return
+		}
+		sinceID = parsed
+	}
+
+	timeoutSec := 25
+	if t := c.Query("timeout"); t != "" {
+		parsed, err := strconv.Atoi(t)
+		if err != nil || parsed < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timeout"})
+			return
+		}
+		if parsed > 60 {
+			parsed = 60
+		}
+		timeoutSec = parsed
+	}
+
+	ctx := c.Request.Context()
+
+	// Fast path: return immediately when messages already exist.
+	hasNew, latestID, err := h.hasNewMessages(ctx, identity, sinceID)
+	if err != nil {
+		log.Printf("wait messages: initial check: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check messages"})
+		return
+	}
+	if hasNew {
+		c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": latestID})
+		return
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	conn, err := h.DB.Pool.Acquire(waitCtx)
+	if err != nil {
+		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+			c.Status(http.StatusNoContent)
+			return
+		}
+		if errors.Is(waitCtx.Err(), context.Canceled) {
+			return
+		}
+		log.Printf("wait messages: acquire conn: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+		return
+	}
+	defer conn.Release()
+
+	if _, err = conn.Exec(waitCtx, "LISTEN new_msg_to"); err != nil {
+		log.Printf("wait messages: listen: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+		return
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), "UNLISTEN new_msg_to")
+	}()
+
+	for {
+		notif, err := conn.Conn().WaitForNotification(waitCtx)
+		if err != nil {
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				c.Status(http.StatusNoContent)
+				return
+			}
+			if errors.Is(waitCtx.Err(), context.Canceled) {
+				return
+			}
+			log.Printf("wait messages: notification wait: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed while waiting for messages"})
+			return
+		}
+
+		// Payload is "<msg_id>,<addr>" — check whether this notification is
+		// for the authenticated user and that the msg_id exceeds since_id.
+		msgID, addr, ok := parseNotifyPayload(notif.Payload)
+		if ok && strings.EqualFold(addr, identity) && msgID > sinceID {
+			c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": msgID})
+			return
+		}
+	}
+}
+
+// parseNotifyPayload splits the "msg_id,addr" payload emitted by the
+// notify_msg_to_insert trigger. Returns ok=false if the format is unexpected.
+func parseNotifyPayload(payload string) (msgID int64, addr string, ok bool) {
+	idx := strings.Index(payload, ",")
+	if idx < 1 {
+		return 0, "", false
+	}
+	id, err := strconv.ParseInt(payload[:idx], 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return id, payload[idx+1:], true
+}
+
+func (h *MessageHandler) hasNewMessages(ctx context.Context, identity string, sinceID int64) (bool, int64, error) {
+	var latestID *int64
+	err := h.DB.Pool.QueryRow(ctx,
+		`SELECT MAX(m.id)
+		 FROM msg m
+		 WHERE m.id > $2
+		   AND (
+				EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = lower($1))
+				OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = lower($1))
+		   )`,
+		identity, sinceID,
+	).Scan(&latestID)
+	if err != nil {
+		return false, 0, err
+	}
+	if latestID == nil {
+		return false, 0, nil
+	}
+	return true, *latestID, nil
+}
+
 // List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
 func (h *MessageHandler) List(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
@@ -615,14 +750,40 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		return
 	}
 
+	// Keep add_to_from aligned with spec: this participant initiated the add_to batch.
+	tx, err := h.DB.Pool.Begin(ctx)
+	if err != nil {
+		log.Printf("add recipients: begin tx: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err = tx.Exec(ctx,
+		"UPDATE msg SET add_to_from = $1 WHERE id = $2",
+		identity, msgID,
+	); err != nil {
+		log.Printf("add recipients: update add_to_from: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+		return
+	}
+
 	// Insert the new add_to recipients.
 	for _, addr := range input.AddTo {
-		if _, err = h.DB.Pool.Exec(ctx,
+		if _, err = tx.Exec(ctx,
 			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
 			msgID, addr,
 		); err != nil {
 			log.Printf("add recipients: insert %s: %v", addr, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+			return
 		}
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		log.Printf("add recipients: commit tx: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
