@@ -18,6 +18,7 @@ type Message struct {
 	From        string       `json:"from"`
 	To          []string     `json:"to"`
 	AddTo       []string     `json:"add_to"`
+	AddToFrom   *string      `json:"add_to_from"`
 	Time        *float64     `json:"time"`
 	Topic       string       `json:"topic"`
 	Type        string       `json:"type"`
