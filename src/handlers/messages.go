@@ -47,7 +47,6 @@ type messageListItem struct {
 	From        string              `json:"from"`
 	To          []string            `json:"to"`
 	AddTo       []string            `json:"add_to"`
-	AddToFrom   *string             `json:"add_to_from"`
 	Time        *float64            `json:"time"`
 	Topic       string              `json:"topic"`
 	Type        string              `json:"type"`
@@ -59,141 +58,6 @@ type messageListItem struct {
 type messageInput struct {
 	models.Message
 	Data string `json:"data"`
-}
-
-// Wait handles GET /fmsg/wait — blocks until new messages are available for the authenticated user.
-// Query parameters:
-//   - since_id (default 0): only messages with id > since_id are considered new.
-//   - timeout (default 25, max 60): long-poll wait timeout in seconds.
-func (h *MessageHandler) Wait(c *gin.Context) {
-	identity := middleware.GetIdentity(c)
-	if identity == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		return
-	}
-
-	sinceID := int64(0)
-	if s := c.Query("since_id"); s != "" {
-		parsed, err := strconv.ParseInt(s, 10, 64)
-		if err != nil || parsed < 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since_id"})
-			return
-		}
-		sinceID = parsed
-	}
-
-	timeoutSec := 25
-	if t := c.Query("timeout"); t != "" {
-		parsed, err := strconv.Atoi(t)
-		if err != nil || parsed < 1 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timeout"})
-			return
-		}
-		if parsed > 60 {
-			parsed = 60
-		}
-		timeoutSec = parsed
-	}
-
-	ctx := c.Request.Context()
-
-	// Fast path: return immediately when messages already exist.
-	hasNew, latestID, err := h.hasNewMessages(ctx, identity, sinceID)
-	if err != nil {
-		log.Printf("wait messages: initial check: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check messages"})
-		return
-	}
-	if hasNew {
-		c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": latestID})
-		return
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	conn, err := h.DB.Pool.Acquire(waitCtx)
-	if err != nil {
-		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-			c.Status(http.StatusNoContent)
-			return
-		}
-		if errors.Is(waitCtx.Err(), context.Canceled) {
-			return
-		}
-		log.Printf("wait messages: acquire conn: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
-		return
-	}
-	defer conn.Release()
-
-	if _, err = conn.Exec(waitCtx, "LISTEN new_msg_to"); err != nil {
-		log.Printf("wait messages: listen: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
-		return
-	}
-	defer func() {
-		_, _ = conn.Exec(context.Background(), "UNLISTEN new_msg_to")
-	}()
-
-	for {
-		notif, err := conn.Conn().WaitForNotification(waitCtx)
-		if err != nil {
-			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-				c.Status(http.StatusNoContent)
-				return
-			}
-			if errors.Is(waitCtx.Err(), context.Canceled) {
-				return
-			}
-			log.Printf("wait messages: notification wait: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed while waiting for messages"})
-			return
-		}
-
-		// Payload is "<msg_id>,<addr>" — check whether this notification is
-		// for the authenticated user and that the msg_id exceeds since_id.
-		msgID, addr, ok := parseNotifyPayload(notif.Payload)
-		if ok && strings.EqualFold(addr, identity) && msgID > sinceID {
-			c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": msgID})
-			return
-		}
-	}
-}
-
-// parseNotifyPayload splits the "msg_id,addr" payload emitted by the
-// notify_msg_to_insert trigger. Returns ok=false if the format is unexpected.
-func parseNotifyPayload(payload string) (msgID int64, addr string, ok bool) {
-	idx := strings.Index(payload, ",")
-	if idx < 1 {
-		return 0, "", false
-	}
-	id, err := strconv.ParseInt(payload[:idx], 10, 64)
-	if err != nil {
-		return 0, "", false
-	}
-	return id, payload[idx+1:], true
-}
-
-func (h *MessageHandler) hasNewMessages(ctx context.Context, identity string, sinceID int64) (bool, int64, error) {
-	var latestID *int64
-	err := h.DB.Pool.QueryRow(ctx,
-		`SELECT MAX(m.id)
-		 FROM msg m
-		 WHERE m.id > $2
-		   AND (
-				EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = lower($1))
-				OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = lower($1))
-		   )`,
-		identity, sinceID,
-	).Scan(&latestID)
-	if err != nil {
-		return false, 0, err
-	}
-	if latestID == nil {
-		return false, 0, nil
-	}
-	return true, *latestID, nil
 }
 
 // List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
@@ -232,7 +96,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.add_to_from, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
 		 FROM msg m
 		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
 		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
@@ -251,7 +115,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.AddToFrom, &m.Topic, &m.Type, &m.Size); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
@@ -378,19 +242,13 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	// Parse extension from MIME type.
 	ext := mimeToExt(msg.Type)
 
-	// add_to_from is the authenticated identity when add_to recipients are present.
-	var addToFrom interface{}
-	if len(msg.AddTo) > 0 {
-		addToFrom = identity
-	}
-
 	// Insert message row with empty filepath; update after we know the ID.
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, add_to_from, topic, type, size, filepath, time_sent)
- VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', NULL)
+		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, topic, type, size, filepath, time_sent)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, addToFrom, msg.Topic, msg.Type, msg.Size,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, msg.Size,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -420,16 +278,6 @@ func (h *MessageHandler) Create(c *gin.Context) {
 			msgID, addr,
 		); err != nil {
 			log.Printf("create message: insert recipient %s: %v", addr, err)
-		}
-	}
-
-	// Insert add_to recipients.
-	for _, addr := range msg.AddTo {
-		if _, err = h.DB.Pool.Exec(ctx,
-			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-			msgID, addr,
-		); err != nil {
-			log.Printf("create message: insert add_to recipient %s: %v", addr, err)
 		}
 	}
 
@@ -767,40 +615,14 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		return
 	}
 
-	// Keep add_to_from aligned with spec: this participant initiated the add_to batch.
-	tx, err := h.DB.Pool.Begin(ctx)
-	if err != nil {
-		log.Printf("add recipients: begin tx: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
-		return
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err = tx.Exec(ctx,
-		"UPDATE msg SET add_to_from = $1 WHERE id = $2",
-		identity, msgID,
-	); err != nil {
-		log.Printf("add recipients: update add_to_from: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
-		return
-	}
-
 	// Insert the new add_to recipients.
 	for _, addr := range input.AddTo {
-		if _, err = tx.Exec(ctx,
+		if _, err = h.DB.Pool.Exec(ctx,
 			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
 			msgID, addr,
 		); err != nil {
 			log.Printf("add recipients: insert %s: %v", addr, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
-			return
 		}
-	}
-
-	if err = tx.Commit(ctx); err != nil {
-		log.Printf("add recipients: commit tx: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
-		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
@@ -809,14 +631,14 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 // fetchMessage loads a message with its recipients and attachments from the DB.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, add_to_from, topic, type, size FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size FROM msg WHERE id = $1`,
 		msgID,
 	)
 
 	msg := &models.Message{}
 	var pid *int64
 	var timeSent *float64
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.AddToFrom, &msg.Topic, &msg.Type, &msg.Size); err != nil {
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
 		return nil, err
 	}
 	msg.PID = pid
@@ -946,11 +768,10 @@ func isZip(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
 }
 
-// checkDistinctRecipients returns an error if any address appears more than
-// once within to, or more than once within addTo. Overlap between the two
-// lists is allowed.
+// checkDistinctRecipients returns an error if any address in to or addTo
+// appears more than once (case-insensitive).
 func checkDistinctRecipients(to, addTo []string) error {
-	seen := make(map[string]struct{}, len(to))
+	seen := make(map[string]struct{}, len(to)+len(addTo))
 	for _, addr := range to {
 		key := strings.ToLower(addr)
 		if _, dup := seen[key]; dup {
@@ -958,13 +779,12 @@ func checkDistinctRecipients(to, addTo []string) error {
 		}
 		seen[key] = struct{}{}
 	}
-	addToSeen := make(map[string]struct{}, len(addTo))
 	for _, addr := range addTo {
 		key := strings.ToLower(addr)
-		if _, dup := addToSeen[key]; dup {
-			return fmt.Errorf("duplicate add_to recipient: %s", addr)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("duplicate recipient: %s", addr)
 		}
-		addToSeen[key] = struct{}{}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

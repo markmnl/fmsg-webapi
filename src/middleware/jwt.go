@@ -9,10 +9,15 @@ import (
 	"time"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
+	jwtv4 "github.com/golang-jwt/jwt/v4"
 	"github.com/gin-gonic/gin"
 )
 
 const IdentityKey = "sub"
+
+// clockSkew is the leeway applied to iat/nbf/exp validation to tolerate minor
+// clock differences between services (e.g. containers on the same host).
+const clockSkew = 10 * time.Second
 
 // identityClaims is the payload stored in the JWT.
 type identityClaims struct {
@@ -23,6 +28,11 @@ type identityClaims struct {
 // secret is the HMAC secret used to validate tokens.
 // idURL is the base URL of the fmsgid service used to validate user addresses.
 func SetupJWT(secret string, idURL string) (*jwt.GinJWTMiddleware, error) {
+	// Set the global TimeFunc used by golang-jwt/v4 when validating iat/nbf/exp
+	// inside MapClaims.Valid(). gin-jwt's own TimeFunc field does not affect this
+	// path; only the package-level variable does.
+	jwtv4.TimeFunc = func() time.Time { return time.Now().Add(clockSkew) }
+
 	mw, err := jwt.New(&jwt.GinJWTMiddleware{
 		Realm:       "fmsg",
 		Key:         []byte(secret),
@@ -83,9 +93,9 @@ func SetupJWT(secret string, idURL string) (*jwt.GinJWTMiddleware, error) {
 
 		TokenLookup:   "header: Authorization",
 		TokenHeadName: "Bearer",
-		// Allow up to 10 seconds of clock skew so tokens issued slightly in the
-		// future (e.g. between Docker containers) are still accepted.
-		TimeFunc: func() time.Time { return time.Now().Add(10 * time.Second) },
+		// TimeFunc is used by gin-jwt for orig_iat and expiry arithmetic.
+		// Must be kept consistent with the jwtv4.TimeFunc set above.
+		TimeFunc: func() time.Time { return time.Now().Add(clockSkew) },
 	})
 	return mw, err
 }
