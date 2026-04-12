@@ -60,6 +60,121 @@ type messageInput struct {
 	Data string `json:"data"`
 }
 
+// Wait handles GET /fmsg/wait — long-polls for new messages for the
+// authenticated user using PostgreSQL LISTEN/NOTIFY on new_msg_to.
+func (h *MessageHandler) Wait(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	if identity == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	sinceID := int64(0)
+	if v := c.Query("since_id"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since_id"})
+			return
+		}
+		sinceID = parsed
+	}
+
+	timeoutSeconds := 25
+	if v := c.Query("timeout"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 1 || parsed > 60 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timeout"})
+			return
+		}
+		timeoutSeconds = parsed
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	latestID, err := h.latestMessageIDForRecipient(ctx, identity, sinceID)
+	if err != nil {
+		log.Printf("wait messages: initial check: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+		return
+	}
+	if latestID > sinceID {
+		c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": latestID})
+		return
+	}
+
+	conn, err := h.DB.Pool.Acquire(ctx)
+	if err != nil {
+		log.Printf("wait messages: acquire conn: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+		return
+	}
+	defer conn.Release()
+
+	if _, err = conn.Exec(ctx, "LISTEN new_msg_to"); err != nil {
+		log.Printf("wait messages: LISTEN new_msg_to: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+		return
+	}
+
+	// Re-check after LISTEN to avoid missing notifications between the initial
+	// query and channel subscription.
+	latestID, err = h.latestMessageIDForRecipient(ctx, identity, sinceID)
+	if err != nil {
+		log.Printf("wait messages: post-listen check: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+		return
+	}
+	if latestID > sinceID {
+		c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": latestID})
+		return
+	}
+
+	for {
+		if _, err = conn.Conn().WaitForNotification(ctx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				c.Status(http.StatusNoContent)
+				return
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				return
+			}
+			log.Printf("wait messages: notification: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+			return
+		}
+
+		latestID, err = h.latestMessageIDForRecipient(ctx, identity, sinceID)
+		if err != nil {
+			log.Printf("wait messages: check after notification: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to wait for messages"})
+			return
+		}
+		if latestID > sinceID {
+			c.JSON(http.StatusOK, gin.H{"has_new": true, "latest_id": latestID})
+			return
+		}
+	}
+}
+
+func (h *MessageHandler) latestMessageIDForRecipient(ctx context.Context, identity string, sinceID int64) (int64, error) {
+	var latestID int64
+	err := h.DB.Pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(m.id), 0)
+		 FROM msg m
+		 WHERE m.id > $2
+		   AND (
+			   EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
+			   OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
+		   )`,
+		identity, sinceID,
+	).Scan(&latestID)
+	if err != nil {
+		return 0, err
+	}
+	return latestID, nil
+}
+
 // List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
 func (h *MessageHandler) List(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
