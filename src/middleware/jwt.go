@@ -9,8 +9,8 @@ import (
 	"time"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
-	jwtv4 "github.com/golang-jwt/jwt/v4"
 	"github.com/gin-gonic/gin"
+	jwtv4 "github.com/golang-jwt/jwt/v4"
 )
 
 const IdentityKey = "sub"
@@ -125,7 +125,7 @@ func isValidAddr(addr string) bool {
 // checkFmsgID queries the fmsgid service for a user address.
 // Returns (statusCode, acceptingNew, error).
 func checkFmsgID(idURL, addr string) (int, bool, error) {
-	url := strings.TrimRight(idURL, "/") + "/addr/" + addr
+	url := strings.TrimRight(idURL, "/") + "/fmsgid/" + addr
 	resp, err := http.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
 	if err != nil {
 		return 0, false, err
