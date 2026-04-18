@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -27,6 +30,8 @@ func main() {
 	// Optional configuration with defaults.
 	port := envOrDefault("FMSG_API_PORT", "8000")
 	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
+	rateLimit := envOrDefaultInt("FMSG_API_RATE_LIMIT", 10)
+	rateBurst := envOrDefaultInt("FMSG_API_RATE_BURST", 20)
 
 	// Connect to PostgreSQL (uses standard PG* environment variables).
 	ctx := context.Background()
@@ -45,6 +50,9 @@ func main() {
 
 	// Create Gin router.
 	router := gin.Default()
+
+	// Global rate limiter.
+	router.Use(middleware.NewRateLimiter(float64(rateLimit), rateBurst))
 
 	// Instantiate handlers.
 	msgHandler := handlers.NewMessageHandler(database, dataDir)
@@ -70,7 +78,15 @@ func main() {
 	}
 
 	log.Printf("fmsg-webapi starting on :%s", port)
-	if err = router.Run(":" + port); err != nil {
+	srv := &http.Server{
+		Addr:           ":" + port,
+		Handler:        router,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   65 * time.Second, // must exceed /wait max timeout (60s)
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB
+	}
+	if err = srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -88,6 +104,18 @@ func mustEnv(key string) string {
 func envOrDefault(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return defaultValue
+}
+
+// envOrDefaultInt returns the environment variable as an int or defaultValue when unset/invalid.
+func envOrDefaultInt(key string, defaultValue int) int {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("environment variable %s must be an integer: %v", key, err)
+		}
+		return n
 	}
 	return defaultValue
 }

@@ -15,6 +15,8 @@ fine-grained authorisation rules based on the user identity they contain.
 | `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens. Prefix with `base64:` to supply a base64-encoded key (e.g. `base64:c2VjcmV0`); otherwise the raw string is used. |
 | `FMSG_API_PORT`     | `8000`                   | TCP port the HTTP server listens on                     |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
+| `FMSG_API_RATE_LIMIT`| `10`                    | Max sustained requests per second per IP                |
+| `FMSG_API_RATE_BURST`| `20`                    | Max burst size for the per-IP rate limiter              |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -54,9 +56,20 @@ go run .
 
 The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
 
+The HTTP server is configured with `ReadTimeout: 10s`, `WriteTimeout: 65s`,
+and `IdleTimeout: 120s`. The write timeout exceeds the `/wait` endpoint's
+maximum long-poll duration (60 s) so connections are not dropped prematurely.
+
 ## API Routes
 
 All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header.
+
+All routes are subject to per-IP rate limiting. When the limit is exceeded, the
+server responds with `429 Too Many Requests`:
+
+```json
+{"error": "rate limit exceeded"}
+```
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
