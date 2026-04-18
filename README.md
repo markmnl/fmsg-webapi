@@ -13,10 +13,11 @@ fine-grained authorisation rules based on the user identity they contain.
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/opt/fmsg/data` |
 | `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens. Prefix with `base64:` to supply a base64-encoded key (e.g. `base64:c2VjcmV0`); otherwise the raw string is used. |
-| `FMSG_TLS_CERT`     | *(required)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`) |
-| `FMSG_TLS_KEY`      | *(required)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`) |
+| `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS on port 443. |
+| `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
+| `FMSG_API_PORT`     | `8000`                   | TCP port for plain HTTP mode (ignored when TLS is enabled) |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
-| `FMSG_ACME_DIR`     | `/var/www/letsencrypt`   | Directory containing `.well-known/acme-challenge` for Let's Encrypt certificate renewal |
+| `FMSG_ACME_DIR`     | `/var/www/letsencrypt`   | Directory containing `.well-known/acme-challenge` for Let's Encrypt certificate renewal (TLS mode only) |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -42,6 +43,12 @@ go test ./...
 
 ## Running
 
+### TLS mode (production)
+
+Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS on port `443`. A plain
+HTTP server on port `80` serves Let's Encrypt ACME challenges from `FMSG_ACME_DIR`
+(default `/var/www/letsencrypt`) and redirects all other requests to HTTPS.
+
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
 export FMSG_API_JWT_SECRET=changeme
@@ -56,9 +63,22 @@ cd src
 go run .
 ```
 
-The HTTPS server listens on port `443`. A plain HTTP server on port `80` serves
-Let's Encrypt ACME challenges from `FMSG_ACME_DIR` (default `/var/www/letsencrypt`)
-and redirects all other requests to HTTPS.
+### Plain HTTP mode (development / reverse proxy)
+
+Omit the TLS variables to run a plain HTTP server. Override the port with
+`FMSG_API_PORT` (default `8000`).
+
+```bash
+export FMSG_DATA_DIR=/opt/fmsg/data
+export FMSG_API_JWT_SECRET=changeme
+export PGHOST=localhost
+export PGUSER=fmsg
+export PGPASSWORD=secret
+export PGDATABASE=fmsg
+
+cd src
+go run .
+```
 
 ## API Routes
 
