@@ -25,9 +25,9 @@ type identityClaims struct {
 }
 
 // SetupJWT creates and returns a configured GinJWTMiddleware.
-// secret is the HMAC secret used to validate tokens.
+// key is the HMAC secret bytes used to validate tokens.
 // idURL is the base URL of the fmsgid service used to validate user addresses.
-func SetupJWT(secret string, idURL string) (*jwt.GinJWTMiddleware, error) {
+func SetupJWT(key []byte, idURL string) (*jwt.GinJWTMiddleware, error) {
 	// Set the global TimeFunc used by golang-jwt/v4 when validating iat/nbf/exp
 	// inside MapClaims.Valid(). gin-jwt's own TimeFunc field does not affect this
 	// path; only the package-level variable does.
@@ -35,7 +35,7 @@ func SetupJWT(secret string, idURL string) (*jwt.GinJWTMiddleware, error) {
 
 	mw, err := jwt.New(&jwt.GinJWTMiddleware{
 		Realm:       "fmsg",
-		Key:         []byte(secret),
+		Key:         key,
 		Timeout:     24 * time.Hour,
 		MaxRefresh:  24 * time.Hour,
 		IdentityKey: IdentityKey,

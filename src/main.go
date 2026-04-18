@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -20,6 +22,7 @@ func main() {
 	// Required configuration.
 	dataDir := mustEnv("FMSG_DATA_DIR")
 	jwtSecret := mustEnv("FMSG_API_JWT_SECRET")
+	jwtKey := parseSecret(jwtSecret)
 
 	// Optional configuration with defaults.
 	port := envOrDefault("FMSG_API_PORT", "8000")
@@ -35,7 +38,7 @@ func main() {
 	log.Println("connected to PostgreSQL")
 
 	// Initialise JWT middleware.
-	jwtMiddleware, err := middleware.SetupJWT(jwtSecret, idURL)
+	jwtMiddleware, err := middleware.SetupJWT(jwtKey, idURL)
 	if err != nil {
 		log.Fatalf("failed to initialise JWT middleware: %v", err)
 	}
@@ -87,4 +90,19 @@ func envOrDefault(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+// parseSecret returns the HMAC key bytes for the given secret string.
+// If s begins with "base64:" the remainder is base64-decoded; otherwise the
+// raw string bytes are used.
+func parseSecret(s string) []byte {
+	const prefix = "base64:"
+	if strings.HasPrefix(s, prefix) {
+		b, err := base64.StdEncoding.DecodeString(s[len(prefix):])
+		if err != nil {
+			log.Fatalf("FMSG_API_JWT_SECRET has base64: prefix but is not valid base64: %v", err)
+		}
+		return b
+	}
+	return []byte(s)
 }

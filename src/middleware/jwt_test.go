@@ -44,7 +44,7 @@ func TestIATClockSkew(t *testing.T) {
 	const secret = "test-secret-for-iat-skew"
 
 	// SetupJWT sets jwtv4.TimeFunc as a side-effect.
-	if _, err := SetupJWT(secret, "http://127.0.0.1:0"); err != nil {
+	if _, err := SetupJWT([]byte(secret), "http://127.0.0.1:0"); err != nil {
 		t.Fatalf("SetupJWT: %v", err)
 	}
 

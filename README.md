@@ -12,7 +12,7 @@ fine-grained authorisation rules based on the user identity they contain.
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/opt/fmsg/data` |
-| `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens                 |
+| `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens. Prefix with `base64:` to supply a base64-encoded key (e.g. `base64:c2VjcmV0`); otherwise the raw string is used. |
 | `FMSG_API_PORT`     | `8000`                   | TCP port the HTTP server listens on                     |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
 
