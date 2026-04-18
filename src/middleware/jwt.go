@@ -63,6 +63,7 @@ func SetupJWT(key []byte, idURL string) (*jwt.GinJWTMiddleware, error) {
 			}
 			addr := v.Addr
 			if !isValidAddr(addr) {
+				log.Printf("auth rejected: ip=%s reason=invalid_addr", c.ClientIP())
 				return false
 			}
 			// Store the validated identity in context for downstream handlers.
@@ -76,10 +77,12 @@ func SetupJWT(key []byte, idURL string) (*jwt.GinJWTMiddleware, error) {
 				return false
 			}
 			if code == http.StatusNotFound {
+				log.Printf("auth rejected: ip=%s addr=%s reason=not_found", c.ClientIP(), addr)
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("User %s not found", addr)})
 				return false
 			}
 			if code == http.StatusOK && !accepting {
+				log.Printf("auth rejected: ip=%s addr=%s reason=not_accepting", c.ClientIP(), addr)
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("User %s not authorised to send new messages", addr)})
 				return false
 			}
@@ -88,6 +91,7 @@ func SetupJWT(key []byte, idURL string) (*jwt.GinJWTMiddleware, error) {
 
 		// Unauthorized responds with 401 when JWT validation fails.
 		Unauthorized: func(c *gin.Context, code int, message string) {
+			log.Printf("auth failure: ip=%s code=%d message=%s", c.ClientIP(), code, message)
 			c.JSON(code, gin.H{"error": message})
 		},
 

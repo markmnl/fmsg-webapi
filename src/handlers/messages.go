@@ -24,13 +24,15 @@ import (
 
 // MessageHandler holds dependencies for message routes.
 type MessageHandler struct {
-	DB      *db.DB
-	DataDir string
+	DB          *db.DB
+	DataDir     string
+	MaxDataSize int64
+	MaxMsgSize  int64
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize}
 }
 
 // messageListItem is the JSON shape for each message in the list response.
@@ -334,6 +336,11 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
+	if int64(len(msg.Data)) > h.MaxDataSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
+		return
+	}
+
 	ctx := c.Request.Context()
 
 	// Validate PID references an existing message.
@@ -358,12 +365,13 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	ext := mimeToExt(msg.Type)
 
 	// Insert message row with empty filepath; update after we know the ID.
+	dataSize := len(msg.Data)
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
 		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, topic, type, size, filepath, time_sent)
  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, msg.Size,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, dataSize,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -525,6 +533,26 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if int64(len(msg.Data)) > h.MaxDataSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
+		return
+	}
+
+	// Check total message size (data + existing attachments).
+	var attachTotal int64
+	if err := h.DB.Pool.QueryRow(ctx,
+		"SELECT COALESCE(SUM(filesize), 0) FROM msg_attachment WHERE msg_id = $1",
+		msgID,
+	).Scan(&attachTotal); err != nil {
+		log.Printf("update message %d: total size check: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check message size"})
+		return
+	}
+	if int64(len(msg.Data))+attachTotal > h.MaxMsgSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "total message size exceeds limit"})
+		return
+	}
+
 	msg.Deflate = isZip([]byte(msg.Data))
 	ext := mimeToExt(msg.Type)
 
@@ -537,7 +565,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 
 	_, err = h.DB.Pool.Exec(ctx,
 		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, topic=$6, type=$7, size=$8, filepath=$9 WHERE id=$10`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Topic, msg.Type, msg.Size, dataPath, msgID,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Topic, msg.Type, len(msg.Data), dataPath, msgID,
 	)
 	if err != nil {
 		log.Printf("update message %d: %v", msgID, err)

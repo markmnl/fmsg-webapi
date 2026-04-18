@@ -8,12 +8,17 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
-| `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/opt/fmsg/data` |
+| `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
 | `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens. Prefix with `base64:` to supply a base64-encoded key (e.g. `base64:c2VjcmV0`); otherwise the raw string is used. |
 | `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS on port 443. |
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
 | `FMSG_API_PORT`     | `8000`                   | TCP port for plain HTTP mode (ignored when TLS is enabled) |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
+| `FMSG_API_RATE_LIMIT`| `10`                    | Max sustained requests per second per IP                |
+| `FMSG_API_RATE_BURST`| `20`                    | Max burst size for the per-IP rate limiter              |
+| `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
+| `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
+| `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -63,7 +68,7 @@ Omit the TLS variables to run a plain HTTP server. Override the port with
 `FMSG_API_PORT` (default `8000`).
 
 ```bash
-export FMSG_DATA_DIR=/opt/fmsg/data
+export FMSG_DATA_DIR=/var/lib/fmsgd/
 export FMSG_API_JWT_SECRET=changeme
 export PGHOST=localhost
 export PGUSER=fmsg
@@ -74,9 +79,22 @@ cd src
 go run .
 ```
 
+The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
+
+The HTTP server is configured with `ReadHeaderTimeout: 10s`, `WriteTimeout: 65s`,
+and `IdleTimeout: 120s`. The write timeout exceeds the `/wait` endpoint's
+maximum long-poll duration (60 s) so connections are not dropped prematurely.
+
 ## API Routes
 
 All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header.
+
+All routes are subject to per-IP rate limiting. When the limit is exceeded, the
+server responds with `429 Too Many Requests`:
+
+```json
+{"error": "rate limit exceeded"}
+```
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |

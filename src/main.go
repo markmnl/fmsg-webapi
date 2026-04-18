@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -34,6 +39,11 @@ func main() {
 
 	// Optional configuration with defaults.
 	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
+	rateLimit := envOrDefaultInt("FMSG_API_RATE_LIMIT", 10)
+	rateBurst := envOrDefaultInt("FMSG_API_RATE_BURST", 20)
+	maxDataSize := int64(envOrDefaultInt("FMSG_API_MAX_DATA_SIZE", 10)) * 1024 * 1024
+	maxAttachSize := int64(envOrDefaultInt("FMSG_API_MAX_ATTACH_SIZE", 10)) * 1024 * 1024
+	maxMsgSize := int64(envOrDefaultInt("FMSG_API_MAX_MSG_SIZE", 20)) * 1024 * 1024
 
 	// Connect to PostgreSQL (uses standard PG* environment variables).
 	ctx := context.Background()
@@ -53,9 +63,12 @@ func main() {
 	// Create Gin router.
 	router := gin.Default()
 
+	// Global rate limiter.
+	router.Use(middleware.NewRateLimiter(ctx, float64(rateLimit), rateBurst))
+
 	// Instantiate handlers.
-	msgHandler := handlers.NewMessageHandler(database, dataDir)
-	attHandler := handlers.NewAttachmentHandler(database, dataDir)
+	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize)
+	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Register routes under /fmsg, all protected by JWT.
 	fmsg := router.Group("/fmsg")
@@ -76,15 +89,26 @@ func main() {
 		fmsg.DELETE("/:id/attach/:filename", attHandler.DeleteAttachment)
 	}
 
+	srv := &http.Server{
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      65 * time.Second, // must exceed /wait max timeout (60s)
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
+	}
+
 	if tlsEnabled {
+		srv.Addr = ":443"
 		log.Println("fmsg-webapi starting on :443")
-		if err = router.RunTLS(":443", tlsCert, tlsKey); err != nil {
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		if err = srv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
 	} else {
 		port := envOrDefault("FMSG_API_PORT", "8000")
+		srv.Addr = ":" + port
 		log.Printf("fmsg-webapi starting on :%s (plain HTTP)", port)
-		if err = router.Run(":" + port); err != nil {
+		if err = srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
 	}
@@ -103,6 +127,19 @@ func mustEnv(key string) string {
 func envOrDefault(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return defaultValue
+}
+
+// envOrDefaultInt returns the environment variable as an int or defaultValue when unset.
+// Fatally exits if the value is set but not a valid integer.
+func envOrDefaultInt(key string, defaultValue int) int {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("environment variable %s must be an integer: %v", key, err)
+		}
+		return n
 	}
 	return defaultValue
 }
