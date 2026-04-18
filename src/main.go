@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"log"
-	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -79,22 +77,6 @@ func main() {
 	}
 
 	if tlsEnabled {
-		// Start HTTP server on port 80 for ACME challenges and HTTPS redirect.
-		acmeDir := envOrDefault("FMSG_ACME_DIR", "/var/www/letsencrypt")
-		httpRouter := gin.New()
-		httpRouter.Use(gin.Recovery())
-		httpRouter.Static("/.well-known/acme-challenge", filepath.Join(acmeDir, ".well-known", "acme-challenge"))
-		httpRouter.NoRoute(func(c *gin.Context) {
-			target := "https://" + c.Request.Host + c.Request.RequestURI
-			c.Redirect(http.StatusMovedPermanently, target)
-		})
-		go func() {
-			if err := http.ListenAndServe(":80", httpRouter); err != nil {
-				log.Fatalf("HTTP :80 server error: %v", err)
-			}
-		}()
-		log.Println("listening on :80 (ACME + HTTPS redirect)")
-
 		log.Println("fmsg-webapi starting on :443")
 		if err = router.RunTLS(":443", tlsCert, tlsKey); err != nil {
 			log.Fatalf("server error: %v", err)
