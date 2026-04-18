@@ -37,9 +37,13 @@ func NewRateLimiter(ctx context.Context, rps float64, burst int) gin.HandlerFunc
 
 func (rl *rateLimiter) getVisitor(ip string) *rate.Limiter {
 	now := time.Now().UnixNano()
+	if val, ok := rl.visitors.Load(ip); ok {
+		v := val.(*visitor)
+		v.lastSeen.Store(now)
+		return v.limiter
+	}
 	v := &visitor{limiter: rate.NewLimiter(rl.rps, rl.burst)}
 	v.lastSeen.Store(now)
-
 	if actual, loaded := rl.visitors.LoadOrStore(ip, v); loaded {
 		v = actual.(*visitor)
 		v.lastSeen.Store(now)

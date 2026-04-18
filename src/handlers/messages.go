@@ -365,12 +365,13 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	ext := mimeToExt(msg.Type)
 
 	// Insert message row with empty filepath; update after we know the ID.
+	dataSize := len(msg.Data)
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
 		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, topic, type, size, filepath, time_sent)
  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, msg.Size,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, dataSize,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -564,7 +565,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 
 	_, err = h.DB.Pool.Exec(ctx,
 		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, topic=$6, type=$7, size=$8, filepath=$9 WHERE id=$10`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Topic, msg.Type, msg.Size, dataPath, msgID,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Topic, msg.Type, len(msg.Data), dataPath, msgID,
 	)
 	if err != nil {
 		log.Printf("update message %d: %v", msgID, err)

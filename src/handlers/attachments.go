@@ -113,11 +113,22 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
-	// Check total message size (data + all attachments including this one).
+	// Check total message size and persist attachment in a transaction to
+	// prevent concurrent uploads from exceeding MaxMsgSize.
+	tx, err := h.DB.Pool.Begin(ctx)
+	if err != nil {
+		_ = os.Remove(finalPath)
+		log.Printf("upload attachment: begin tx: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record attachment"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the message row and compute current total size.
 	var currentTotal int64
-	if err = h.DB.Pool.QueryRow(ctx,
+	if err = tx.QueryRow(ctx,
 		`SELECT m.size + COALESCE((SELECT SUM(filesize) FROM msg_attachment WHERE msg_id = m.id), 0)
-		 FROM msg m WHERE m.id = $1`,
+		 FROM msg m WHERE m.id = $1 FOR UPDATE`,
 		msgID,
 	).Scan(&currentTotal); err != nil {
 		_ = os.Remove(finalPath)
@@ -131,8 +142,8 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
-	// Persist to DB.
-	_, err = h.DB.Pool.Exec(ctx,
+	// Persist attachment to DB.
+	_, err = tx.Exec(ctx,
 		`INSERT INTO msg_attachment (msg_id, filename, filesize, filepath)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (msg_id, filename) DO UPDATE SET filesize=$3, filepath=$4`,
@@ -141,6 +152,13 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 	if err != nil {
 		_ = os.Remove(finalPath)
 		log.Printf("upload attachment: insert: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record attachment"})
+		return
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		_ = os.Remove(finalPath)
+		log.Printf("upload attachment: commit: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record attachment"})
 		return
 	}
