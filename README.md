@@ -1,11 +1,8 @@
-# fmsg-webapi
-
 [![Build & Test](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml/badge.svg)](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml)
 
-HTTP API providing user/client message handling for an fmsg host. Exposes CRUD
-operations for a messaging datastore backed by PostgreSQL. Authentication is
-delegated to an external system — this service validates JWT tokens and enforces
-fine-grained authorisation rules based on the user identity they contain.
+# fmsg-webapi
+
+HTTP API providing user/client message handling for an fmsg host. Exposes CRUD operations for a messaging datastore backed by PostgreSQL. Authentication is delegated to an external system — this service validates JWT tokens and enforces fine-grained authorisation rules based on the user identity they contain.
 
 ## Environment Variables
 
@@ -17,7 +14,6 @@ fine-grained authorisation rules based on the user identity they contain.
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
 | `FMSG_API_PORT`     | `8000`                   | TCP port for plain HTTP mode (ignored when TLS is enabled) |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
-| `FMSG_ACME_DIR`     | `/var/www/letsencrypt`   | Directory containing `.well-known/acme-challenge` for Let's Encrypt certificate renewal (TLS mode only) |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -45,9 +41,7 @@ go test ./...
 
 ### TLS mode (production)
 
-Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS on port `443`. A plain
-HTTP server on port `80` serves Let's Encrypt ACME challenges from `FMSG_ACME_DIR`
-(default `/var/www/letsencrypt`) and redirects all other requests to HTTPS.
+Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS on port `443`.
 
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
