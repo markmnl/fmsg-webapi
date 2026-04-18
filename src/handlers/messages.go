@@ -24,13 +24,15 @@ import (
 
 // MessageHandler holds dependencies for message routes.
 type MessageHandler struct {
-	DB      *db.DB
-	DataDir string
+	DB          *db.DB
+	DataDir     string
+	MaxDataSize int64
+	MaxMsgSize  int64
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize}
 }
 
 // messageListItem is the JSON shape for each message in the list response.
@@ -334,6 +336,11 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
+	if int64(len(msg.Data)) > h.MaxDataSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
+		return
+	}
+
 	ctx := c.Request.Context()
 
 	// Validate PID references an existing message.
@@ -522,6 +529,26 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 	if msg.From != identity {
 		c.JSON(http.StatusForbidden, gin.H{"error": "from address must match authenticated user"})
+		return
+	}
+
+	if int64(len(msg.Data)) > h.MaxDataSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
+		return
+	}
+
+	// Check total message size (data + existing attachments).
+	var attachTotal int64
+	if err := h.DB.Pool.QueryRow(ctx,
+		"SELECT COALESCE(SUM(filesize), 0) FROM msg_attachment WHERE msg_id = $1",
+		msgID,
+	).Scan(&attachTotal); err != nil {
+		log.Printf("update message %d: total size check: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check message size"})
+		return
+	}
+	if int64(len(msg.Data))+attachTotal > h.MaxMsgSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "total message size exceeds limit"})
 		return
 	}
 

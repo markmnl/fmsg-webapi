@@ -19,13 +19,15 @@ import (
 
 // AttachmentHandler holds dependencies for attachment routes.
 type AttachmentHandler struct {
-	DB      *db.DB
-	DataDir string
+	DB            *db.DB
+	DataDir       string
+	MaxAttachSize int64
+	MaxMsgSize    int64
 }
 
 // NewAttachmentHandler creates an AttachmentHandler.
-func NewAttachmentHandler(database *db.DB, dataDir string) *AttachmentHandler {
-	return &AttachmentHandler{DB: database, DataDir: dataDir}
+func NewAttachmentHandler(database *db.DB, dataDir string, maxAttachSize, maxMsgSize int64) *AttachmentHandler {
+	return &AttachmentHandler{DB: database, DataDir: dataDir, MaxAttachSize: maxAttachSize, MaxMsgSize: maxMsgSize}
 }
 
 // Upload handles POST /api/v1/messages/:id/attachments.
@@ -89,19 +91,43 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 	// Resolve collision-safe filepath.
 	finalPath := resolveFilePath(dir, intendedFilename)
 
-	// Write file to disk.
+	// Write file to disk (limit read to MaxAttachSize + 1 to detect oversized uploads).
 	dst, err := os.OpenFile(finalPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0640)
 	if err != nil {
 		log.Printf("upload attachment: open file: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save attachment"})
 		return
 	}
-	written, err := io.Copy(dst, file)
+	written, err := io.Copy(dst, io.LimitReader(file, h.MaxAttachSize+1))
 	closeErr := dst.Close()
 	if err != nil || closeErr != nil {
 		_ = os.Remove(finalPath)
 		log.Printf("upload attachment: write: %v / %v", err, closeErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write attachment"})
+		return
+	}
+
+	if written > h.MaxAttachSize {
+		_ = os.Remove(finalPath)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "attachment exceeds maximum size"})
+		return
+	}
+
+	// Check total message size (data + all attachments including this one).
+	var currentTotal int64
+	if err = h.DB.Pool.QueryRow(ctx,
+		`SELECT m.size + COALESCE((SELECT SUM(filesize) FROM msg_attachment WHERE msg_id = m.id), 0)
+		 FROM msg m WHERE m.id = $1`,
+		msgID,
+	).Scan(&currentTotal); err != nil {
+		_ = os.Remove(finalPath)
+		log.Printf("upload attachment: total size check: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check message size"})
+		return
+	}
+	if currentTotal+written > h.MaxMsgSize {
+		_ = os.Remove(finalPath)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "total message size exceeds limit"})
 		return
 	}
 

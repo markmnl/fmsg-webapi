@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +16,7 @@ func init() {
 
 func setupRateLimitRouter(rps float64, burst int) *gin.Engine {
 	r := gin.New()
-	r.Use(NewRateLimiter(rps, burst))
+	r.Use(NewRateLimiter(context.Background(), rps, burst))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})

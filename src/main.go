@@ -32,6 +32,9 @@ func main() {
 	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
 	rateLimit := envOrDefaultInt("FMSG_API_RATE_LIMIT", 10)
 	rateBurst := envOrDefaultInt("FMSG_API_RATE_BURST", 20)
+	maxDataSize := int64(envOrDefaultInt("FMSG_API_MAX_DATA_SIZE", 10)) * 1024 * 1024
+	maxAttachSize := int64(envOrDefaultInt("FMSG_API_MAX_ATTACH_SIZE", 10)) * 1024 * 1024
+	maxMsgSize := int64(envOrDefaultInt("FMSG_API_MAX_MSG_SIZE", 20)) * 1024 * 1024
 
 	// Connect to PostgreSQL (uses standard PG* environment variables).
 	ctx := context.Background()
@@ -52,11 +55,11 @@ func main() {
 	router := gin.Default()
 
 	// Global rate limiter.
-	router.Use(middleware.NewRateLimiter(float64(rateLimit), rateBurst))
+	router.Use(middleware.NewRateLimiter(ctx, float64(rateLimit), rateBurst))
 
 	// Instantiate handlers.
-	msgHandler := handlers.NewMessageHandler(database, dataDir)
-	attHandler := handlers.NewAttachmentHandler(database, dataDir)
+	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize)
+	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Register routes under /fmsg, all protected by JWT.
 	fmsg := router.Group("/fmsg")
@@ -79,12 +82,12 @@ func main() {
 
 	log.Printf("fmsg-webapi starting on :%s", port)
 	srv := &http.Server{
-		Addr:           ":" + port,
-		Handler:        router,
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   65 * time.Second, // must exceed /wait max timeout (60s)
-		IdleTimeout:    120 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1 MB
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      65 * time.Second, // must exceed /wait max timeout (60s)
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 	if err = srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
@@ -108,7 +111,8 @@ func envOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-// envOrDefaultInt returns the environment variable as an int or defaultValue when unset/invalid.
+// envOrDefaultInt returns the environment variable as an int or defaultValue when unset.
+// Fatally exits if the value is set but not a valid integer.
 func envOrDefaultInt(key string, defaultValue int) int {
 	if v := os.Getenv(key); v != "" {
 		n, err := strconv.Atoi(v)

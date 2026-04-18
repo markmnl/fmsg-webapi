@@ -17,6 +17,9 @@ fine-grained authorisation rules based on the user identity they contain.
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
 | `FMSG_API_RATE_LIMIT`| `10`                    | Max sustained requests per second per IP                |
 | `FMSG_API_RATE_BURST`| `20`                    | Max burst size for the per-IP rate limiter              |
+| `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
+| `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
+| `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -56,7 +59,7 @@ go run .
 
 The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
 
-The HTTP server is configured with `ReadTimeout: 10s`, `WriteTimeout: 65s`,
+The HTTP server is configured with `ReadHeaderTimeout: 10s`, `WriteTimeout: 65s`,
 and `IdleTimeout: 120s`. The write timeout exceeds the `/wait` endpoint's
 maximum long-poll duration (60 s) so connections are not dropped prematurely.
 

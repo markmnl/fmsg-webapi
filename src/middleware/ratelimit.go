@@ -1,9 +1,11 @@
 package middleware
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,7 +14,7 @@ import (
 
 type visitor struct {
 	limiter  *rate.Limiter
-	lastSeen time.Time
+	lastSeen atomic.Int64 // UnixNano
 }
 
 type rateLimiter struct {
@@ -23,26 +25,26 @@ type rateLimiter struct {
 
 // NewRateLimiter returns Gin middleware that enforces a per-IP token-bucket
 // rate limit. rps is the sustained requests-per-second rate and burst is the
-// maximum burst size allowed.
-func NewRateLimiter(rps float64, burst int) gin.HandlerFunc {
+// maximum burst size allowed. The cleanup goroutine runs until ctx is cancelled.
+func NewRateLimiter(ctx context.Context, rps float64, burst int) gin.HandlerFunc {
 	rl := &rateLimiter{
 		rps:   rate.Limit(rps),
 		burst: burst,
 	}
-	go rl.cleanup()
+	go rl.cleanup(ctx)
 	return rl.handler
 }
 
 func (rl *rateLimiter) getVisitor(ip string) *rate.Limiter {
-	val, ok := rl.visitors.Load(ip)
-	if ok {
-		v := val.(*visitor)
-		v.lastSeen = time.Now()
-		return v.limiter
+	now := time.Now().UnixNano()
+	v := &visitor{limiter: rate.NewLimiter(rl.rps, rl.burst)}
+	v.lastSeen.Store(now)
+
+	if actual, loaded := rl.visitors.LoadOrStore(ip, v); loaded {
+		v = actual.(*visitor)
+		v.lastSeen.Store(now)
 	}
-	limiter := rate.NewLimiter(rl.rps, rl.burst)
-	rl.visitors.Store(ip, &visitor{limiter: limiter, lastSeen: time.Now()})
-	return limiter
+	return v.limiter
 }
 
 func (rl *rateLimiter) handler(c *gin.Context) {
@@ -57,15 +59,22 @@ func (rl *rateLimiter) handler(c *gin.Context) {
 }
 
 // cleanup removes visitors that have not been seen for 5 minutes.
-func (rl *rateLimiter) cleanup() {
+func (rl *rateLimiter) cleanup(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
 	for {
-		time.Sleep(1 * time.Minute)
-		rl.visitors.Range(func(key, value any) bool {
-			v := value.(*visitor)
-			if time.Since(v.lastSeen) > 5*time.Minute {
-				rl.visitors.Delete(key)
-			}
-			return true
-		})
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now().UnixNano()
+			rl.visitors.Range(func(key, value any) bool {
+				v := value.(*visitor)
+				if now-v.lastSeen.Load() > int64(5*time.Minute) {
+					rl.visitors.Delete(key)
+				}
+				return true
+			})
+		}
 	}
 }
