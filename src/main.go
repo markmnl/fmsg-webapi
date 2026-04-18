@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"os"
 
@@ -20,6 +21,7 @@ func main() {
 	// Required configuration.
 	dataDir := mustEnv("FMSG_DATA_DIR")
 	jwtSecret := mustEnv("FMSG_API_JWT_SECRET")
+	jwtKey := parseSecret(jwtSecret)
 
 	// Optional configuration with defaults.
 	port := envOrDefault("FMSG_API_PORT", "8000")
@@ -35,7 +37,7 @@ func main() {
 	log.Println("connected to PostgreSQL")
 
 	// Initialise JWT middleware.
-	jwtMiddleware, err := middleware.SetupJWT(jwtSecret, idURL)
+	jwtMiddleware, err := middleware.SetupJWT(jwtKey, idURL)
 	if err != nil {
 		log.Fatalf("failed to initialise JWT middleware: %v", err)
 	}
@@ -87,4 +89,14 @@ func envOrDefault(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+// parseSecret tries to base64-decode s. If s is valid base64 the decoded bytes
+// are returned; otherwise the raw string bytes are used.
+func parseSecret(s string) []byte {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err == nil {
+		return b
+	}
+	return []byte(s)
 }
