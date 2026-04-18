@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"log"
@@ -28,8 +29,15 @@ func main() {
 	jwtSecret := mustEnv("FMSG_API_JWT_SECRET")
 	jwtKey := parseSecret(jwtSecret)
 
+	// TLS configuration (optional — omit both to run plain HTTP).
+	tlsCert := os.Getenv("FMSG_TLS_CERT")
+	tlsKey := os.Getenv("FMSG_TLS_KEY")
+	tlsEnabled := tlsCert != "" && tlsKey != ""
+	if (tlsCert != "") != (tlsKey != "") {
+		log.Fatal("FMSG_TLS_CERT and FMSG_TLS_KEY must both be set or both be empty")
+	}
+
 	// Optional configuration with defaults.
-	port := envOrDefault("FMSG_API_PORT", "8000")
 	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
 	rateLimit := envOrDefaultInt("FMSG_API_RATE_LIMIT", 10)
 	rateBurst := envOrDefaultInt("FMSG_API_RATE_BURST", 20)
@@ -81,17 +89,28 @@ func main() {
 		fmsg.DELETE("/:id/attach/:filename", attHandler.DeleteAttachment)
 	}
 
-	log.Printf("fmsg-webapi starting on :%s", port)
 	srv := &http.Server{
-		Addr:              ":" + port,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      65 * time.Second, // must exceed /wait max timeout (60s)
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
-	if err = srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+
+	if tlsEnabled {
+		srv.Addr = ":443"
+		log.Println("fmsg-webapi starting on :443")
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		if err = srv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	} else {
+		port := envOrDefault("FMSG_API_PORT", "8000")
+		srv.Addr = ":" + port
+		log.Printf("fmsg-webapi starting on :%s (plain HTTP)", port)
+		if err = srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
 	}
 }
 

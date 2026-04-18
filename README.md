@@ -1,11 +1,8 @@
-# fmsg-webapi
-
 [![Build & Test](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml/badge.svg)](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml)
 
-HTTP API providing user/client message handling for an fmsg host. Exposes CRUD
-operations for a messaging datastore backed by PostgreSQL. Authentication is
-delegated to an external system — this service validates JWT tokens and enforces
-fine-grained authorisation rules based on the user identity they contain.
+# fmsg-webapi
+
+HTTP API providing user/client message handling for an fmsg host. Exposes CRUD operations for a messaging datastore backed by PostgreSQL. Authentication is delegated to an external system — this service validates JWT tokens and enforces fine-grained authorisation rules based on the user identity they contain.
 
 ## Environment Variables
 
@@ -13,7 +10,9 @@ fine-grained authorisation rules based on the user identity they contain.
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
 | `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens. Prefix with `base64:` to supply a base64-encoded key (e.g. `base64:c2VjcmV0`); otherwise the raw string is used. |
-| `FMSG_API_PORT`     | `8000`                   | TCP port the HTTP server listens on                     |
+| `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS on port 443. |
+| `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
+| `FMSG_API_PORT`     | `8000`                   | TCP port for plain HTTP mode (ignored when TLS is enabled) |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
 | `FMSG_API_RATE_LIMIT`| `10`                    | Max sustained requests per second per IP                |
 | `FMSG_API_RATE_BURST`| `20`                    | Max burst size for the per-IP rate limiter              |
@@ -44,6 +43,29 @@ go test ./...
 ```
 
 ## Running
+
+### TLS mode (production)
+
+Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS on port `443`.
+
+```bash
+export FMSG_DATA_DIR=/opt/fmsg/data
+export FMSG_API_JWT_SECRET=changeme
+export FMSG_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
+export FMSG_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem
+export PGHOST=localhost
+export PGUSER=fmsg
+export PGPASSWORD=secret
+export PGDATABASE=fmsg
+
+cd src
+go run .
+```
+
+### Plain HTTP mode (development / reverse proxy)
+
+Omit the TLS variables to run a plain HTTP server. Override the port with
+`FMSG_API_PORT` (default `8000`).
 
 ```bash
 export FMSG_DATA_DIR=/var/lib/fmsgd/
