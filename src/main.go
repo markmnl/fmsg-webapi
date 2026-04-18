@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -91,11 +92,16 @@ func envOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-// parseSecret tries to base64-decode s. If s is valid base64 the decoded bytes
-// are returned; otherwise the raw string bytes are used.
+// parseSecret returns the HMAC key bytes for the given secret string.
+// If s begins with "base64:" the remainder is base64-decoded; otherwise the
+// raw string bytes are used.
 func parseSecret(s string) []byte {
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err == nil {
+	const prefix = "base64:"
+	if strings.HasPrefix(s, prefix) {
+		b, err := base64.StdEncoding.DecodeString(s[len(prefix):])
+		if err != nil {
+			log.Fatalf("FMSG_API_JWT_SECRET has base64: prefix but is not valid base64: %v", err)
+		}
 		return b
 	}
 	return []byte(s)
