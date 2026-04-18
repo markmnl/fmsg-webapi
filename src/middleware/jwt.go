@@ -73,24 +73,33 @@ func SetupJWT(key []byte, idURL string) (*jwt.GinJWTMiddleware, error) {
 			code, accepting, err := checkFmsgID(idURL, addr)
 			if err != nil {
 				log.Printf("fmsgid check error for %s: %v", addr, err)
-				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
+				c.Set("auth_error_code", http.StatusServiceUnavailable)
+				c.Set("auth_error_msg", "identity service unavailable")
 				return false
 			}
 			if code == http.StatusNotFound {
 				log.Printf("auth rejected: ip=%s addr=%s reason=not_found", c.ClientIP(), addr)
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("User %s not found", addr)})
+				c.Set("auth_error_code", http.StatusBadRequest)
+				c.Set("auth_error_msg", fmt.Sprintf("User %s not found", addr))
 				return false
 			}
 			if code == http.StatusOK && !accepting {
 				log.Printf("auth rejected: ip=%s addr=%s reason=not_accepting", c.ClientIP(), addr)
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("User %s not authorised to send new messages", addr)})
+				c.Set("auth_error_code", http.StatusForbidden)
+				c.Set("auth_error_msg", fmt.Sprintf("User %s not authorised to send new messages", addr))
 				return false
 			}
 			return true
 		},
 
-		// Unauthorized responds with 401 when JWT validation fails.
+		// Unauthorized responds when JWT validation or authorization fails.
 		Unauthorized: func(c *gin.Context, code int, message string) {
+			if errCode, exists := c.Get("auth_error_code"); exists {
+				code = errCode.(int)
+			}
+			if errMsg, exists := c.Get("auth_error_msg"); exists {
+				message = errMsg.(string)
+			}
 			log.Printf("auth failure: ip=%s code=%d message=%s", c.ClientIP(), code, message)
 			c.JSON(code, gin.H{"error": message})
 		},
