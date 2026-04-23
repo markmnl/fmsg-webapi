@@ -99,6 +99,7 @@ server responds with `429 Too Many Requests`:
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
 | `GET`    | `/fmsg`                          | List messages for user   |
+| `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/wait`                     | Long-poll for new messages |
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
@@ -161,6 +162,21 @@ Returns messages where the authenticated user is a recipient (listed in `msg_to`
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
 **Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /fmsg/:id` (with an additional `id` field). Message body data and attachment contents are not included — use the dedicated download endpoints instead.
+
+### GET `/fmsg/sent`
+
+Returns messages authored by the authenticated user (`msg.from_addr = <identity>`), ordered by message ID descending.
+
+This includes both sent messages and drafts (`time_sent` may be `NULL`).
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+| --------- | ------- | ----------- |
+| `limit`   | `20`    | Max messages to return (1–100) |
+| `offset`  | `0`     | Number of messages to skip for pagination |
+
+**Response:** JSON array of message objects with the same shape as `GET /fmsg`.
 
 ### POST `/fmsg`
 

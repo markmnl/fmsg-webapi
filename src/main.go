@@ -76,6 +76,7 @@ func main() {
 	{
 		fmsg.GET("/wait", msgHandler.Wait)
 		fmsg.GET("", msgHandler.List)
+		fmsg.GET("/sent", msgHandler.Sent)
 		fmsg.POST("", msgHandler.Create)
 		fmsg.GET("/:id", msgHandler.Get)
 		fmsg.PUT("/:id", msgHandler.Update)

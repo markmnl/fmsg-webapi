@@ -185,29 +185,9 @@ func (h *MessageHandler) List(c *gin.Context) {
 		return
 	}
 
-	// Parse limit query parameter (default 20, max 100).
-	limit := 20
-	if l := c.Query("limit"); l != "" {
-		parsed, err := strconv.Atoi(l)
-		if err != nil || parsed < 1 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
-			return
-		}
-		if parsed > 100 {
-			parsed = 100
-		}
-		limit = parsed
-	}
-
-	// Parse offset query parameter (default 0).
-	offset := 0
-	if o := c.Query("offset"); o != "" {
-		parsed, err := strconv.Atoi(o)
-		if err != nil || parsed < 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid offset"})
-			return
-		}
-		offset = parsed
+	limit, offset, ok := parseLimitOffset(c)
+	if !ok {
+		return
 	}
 
 	ctx := c.Request.Context()
@@ -235,6 +215,120 @@ func (h *MessageHandler) List(c *gin.Context) {
 		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
+			return
+		}
+		m.HasPid = m.PID != nil
+		messages = append(messages, m)
+		msgIDs = append(msgIDs, m.ID)
+	}
+
+	if len(messages) == 0 {
+		c.JSON(http.StatusOK, []messageListItem{})
+		return
+	}
+
+	// Batch-load recipients.
+	toRows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, addr FROM msg_to WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err == nil {
+		toMap := make(map[int64][]string)
+		for toRows.Next() {
+			var id int64
+			var addr string
+			if scanErr := toRows.Scan(&id, &addr); scanErr == nil {
+				toMap[id] = append(toMap[id], addr)
+			}
+		}
+		toRows.Close()
+		for i := range messages {
+			messages[i].To = toMap[messages[i].ID]
+		}
+	}
+
+	// Batch-load add_to recipients.
+	addToRows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, addr FROM msg_add_to WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err == nil {
+		addToMap := make(map[int64][]string)
+		for addToRows.Next() {
+			var id int64
+			var addr string
+			if scanErr := addToRows.Scan(&id, &addr); scanErr == nil {
+				addToMap[id] = append(addToMap[id], addr)
+			}
+		}
+		addToRows.Close()
+		for i := range messages {
+			messages[i].AddTo = addToMap[messages[i].ID]
+			messages[i].HasAddTo = len(messages[i].AddTo) > 0
+		}
+	}
+
+	// Batch-load attachments.
+	attRows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, filename, filesize FROM msg_attachment WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err == nil {
+		attMap := make(map[int64][]models.Attachment)
+		for attRows.Next() {
+			var id int64
+			var a models.Attachment
+			if scanErr := attRows.Scan(&id, &a.Filename, &a.Size); scanErr == nil {
+				attMap[id] = append(attMap[id], a)
+			}
+		}
+		attRows.Close()
+		for i := range messages {
+			messages[i].Attachments = attMap[messages[i].ID]
+		}
+	}
+
+	c.JSON(http.StatusOK, messages)
+}
+
+// Sent handles GET /fmsg/sent — lists messages authored by the authenticated user.
+// Includes both sent messages and drafts (time_sent may be NULL).
+func (h *MessageHandler) Sent(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	if identity == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	limit, offset, ok := parseLimitOffset(c)
+	if !ok {
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	rows, err := h.DB.Pool.Query(ctx,
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		 FROM msg m
+		 WHERE m.from_addr = $1
+		 ORDER BY m.id DESC
+		 LIMIT $2 OFFSET $3`,
+		identity, limit, offset,
+	)
+	if err != nil {
+		log.Printf("list sent messages: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
+		return
+	}
+	defer rows.Close()
+
+	var messages []messageListItem
+	var msgIDs []int64
+	for rows.Next() {
+		var m messageListItem
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+			log.Printf("list sent messages scan: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
@@ -894,6 +988,34 @@ func parseID(c *gin.Context) (int64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// parseLimitOffset parses and validates list pagination query parameters.
+func parseLimitOffset(c *gin.Context) (int, int, bool) {
+	limit := 20
+	if l := c.Query("limit"); l != "" {
+		parsed, err := strconv.Atoi(l)
+		if err != nil || parsed < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+			return 0, 0, false
+		}
+		if parsed > 100 {
+			parsed = 100
+		}
+		limit = parsed
+	}
+
+	offset := 0
+	if o := c.Query("offset"); o != "" {
+		parsed, err := strconv.Atoi(o)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid offset"})
+			return 0, 0, false
+		}
+		offset = parsed
+	}
+
+	return limit, offset, true
 }
 
 // isRecipient checks whether addr appears in the to list (case-insensitive).
