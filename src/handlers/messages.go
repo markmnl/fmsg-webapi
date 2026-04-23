@@ -66,10 +66,6 @@ type messageInput struct {
 // authenticated user using PostgreSQL LISTEN/NOTIFY on new_msg_to.
 func (h *MessageHandler) Wait(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	if identity == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		return
-	}
 
 	sinceID := int64(0)
 	if v := c.Query("since_id"); v != "" {
@@ -180,10 +176,6 @@ func (h *MessageHandler) latestMessageIDForRecipient(ctx context.Context, identi
 // List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
 func (h *MessageHandler) List(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	if identity == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		return
-	}
 
 	limit, offset, ok := parseLimitOffset(c)
 	if !ok {
@@ -408,10 +400,6 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 // Create handles POST /api/v1/messages — creates a draft message.
 func (h *MessageHandler) Create(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	if identity == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-		return
-	}
 
 	var msg messageInput
 	if err := c.ShouldBindJSON(&msg); err != nil {
