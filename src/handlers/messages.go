@@ -426,6 +426,11 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
+	if err := validateAddresses(msg.From, msg.To, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -630,6 +635,11 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if err := validateAddresses(msg.From, msg.To, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -824,6 +834,13 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	if len(input.AddTo) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to list must not be empty"})
 		return
+	}
+
+	for _, addr := range input.AddTo {
+		if !middleware.IsValidAddr(addr) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid add_to address: %q", addr)})
+			return
+		}
 	}
 
 	ctx := c.Request.Context()
@@ -1134,6 +1151,28 @@ func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
 		return ""
 	}
 	return string(buf)
+}
+
+// validateAddresses returns an error if any of the provided fmsg address
+// fields is not a valid "@user@domain" address. addToFrom is optional.
+func validateAddresses(from string, to, addTo []string, addToFrom *string) error {
+	if !middleware.IsValidAddr(from) {
+		return fmt.Errorf("invalid from address: %q", from)
+	}
+	for _, addr := range to {
+		if !middleware.IsValidAddr(addr) {
+			return fmt.Errorf("invalid to address: %q", addr)
+		}
+	}
+	for _, addr := range addTo {
+		if !middleware.IsValidAddr(addr) {
+			return fmt.Errorf("invalid add_to address: %q", addr)
+		}
+	}
+	if addToFrom != nil && *addToFrom != "" && !middleware.IsValidAddr(*addToFrom) {
+		return fmt.Errorf("invalid add_to_from address: %q", *addToFrom)
+	}
+	return nil
 }
 
 // validatePidRelations enforces:

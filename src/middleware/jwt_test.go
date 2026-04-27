@@ -33,7 +33,7 @@ func TestIsValidAddr(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.addr, func(t *testing.T) {
-			if got := isValidAddr(tt.addr); got != tt.want {
+			if got := IsValidAddr(tt.addr); got != tt.want {
 				t.Errorf("isValidAddr(%q) = %v, want %v", tt.addr, got, tt.want)
 			}
 		})
