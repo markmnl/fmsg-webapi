@@ -72,7 +72,7 @@ type Config struct {
 //   - calls fmsgid to confirm the user is known and accepting messages,
 //   - on success stores the address in the Gin context under IdentityKey.
 //
-// On failure the response is 401/403/503 with a JSON `{"error": "..."}` body.
+// On failure the response is 400/401/403/503 with a JSON `{"error": "..."}` body.
 func New(cfg Config) (gin.HandlerFunc, error) {
 	if cfg.ClockSkew == 0 {
 		cfg.ClockSkew = DefaultClockSkew
