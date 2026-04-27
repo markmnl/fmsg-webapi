@@ -55,11 +55,21 @@ func NewCORS(cfg CORSConfig) gin.HandlerFunc {
 		return func(c *gin.Context) { c.Next() }
 	}
 
-	allowAny := len(cfg.AllowedOrigins) == 1 && cfg.AllowedOrigins[0] == "*"
+	trimmedOrigins := make([]string, 0, len(cfg.AllowedOrigins))
 	allowed := make(map[string]struct{}, len(cfg.AllowedOrigins))
 	for _, o := range cfg.AllowedOrigins {
-		allowed[strings.TrimSpace(o)] = struct{}{}
+		origin := strings.TrimSpace(o)
+		if origin == "" {
+			continue
+		}
+		trimmedOrigins = append(trimmedOrigins, origin)
+		allowed[origin] = struct{}{}
 	}
+	if len(trimmedOrigins) == 0 {
+		// CORS disabled; return a no-op middleware.
+		return func(c *gin.Context) { c.Next() }
+	}
+	allowAny := len(trimmedOrigins) == 1 && trimmedOrigins[0] == "*"
 
 	methods := strings.Join(cfg.AllowedMethods, ", ")
 	headers := strings.Join(cfg.AllowedHeaders, ", ")
