@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -24,15 +26,16 @@ import (
 
 // MessageHandler holds dependencies for message routes.
 type MessageHandler struct {
-	DB          *db.DB
-	DataDir     string
-	MaxDataSize int64
-	MaxMsgSize  int64
+	DB            *db.DB
+	DataDir       string
+	MaxDataSize   int64
+	MaxMsgSize    int64
+	ShortTextSize int
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize}
 }
 
 // messageListItem is the JSON shape for each message in the list response.
@@ -53,6 +56,7 @@ type messageListItem struct {
 	Topic       string              `json:"topic"`
 	Type        string              `json:"type"`
 	Size        int                 `json:"size"`
+	ShortText   string              `json:"short_text,omitempty"`
 	Attachments []models.Attachment `json:"attachments"`
 }
 
@@ -173,7 +177,7 @@ func (h *MessageHandler) latestMessageIDForRecipient(ctx context.Context, identi
 	return latestID, nil
 }
 
-// List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
+// List handles GET /fmsg — lists messages where the authenticated user is a recipient.
 func (h *MessageHandler) List(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 
@@ -185,7 +189,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
 		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
 		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
@@ -204,12 +208,14 @@ func (h *MessageHandler) List(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		var dataPath string
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
+		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
 	}
@@ -300,7 +306,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
 		 WHERE m.from_addr = $1
 		 ORDER BY m.id DESC
@@ -318,12 +324,14 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		var dataPath string
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
 			log.Printf("list sent messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
+		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
 	}
@@ -397,7 +405,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	c.JSON(http.StatusOK, messages)
 }
 
-// Create handles POST /api/v1/messages — creates a draft message.
+// Create handles POST /fmsg — creates a draft message.
 func (h *MessageHandler) Create(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 
@@ -415,6 +423,16 @@ func (h *MessageHandler) Create(c *gin.Context) {
 
 	if len(msg.To) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "to list must not be empty"})
+		return
+	}
+
+	if err := validateAddresses(msg.From, msg.To, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -489,7 +507,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"id": msgID})
 }
 
-// Get handles GET /api/v1/messages/:id — retrieves a message.
+// Get handles GET /fmsg/:id — retrieves a message.
 func (h *MessageHandler) Get(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -498,7 +516,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	msg, err := h.fetchMessage(ctx, msgID)
+	msg, dataPath, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -515,10 +533,13 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		return
 	}
 
+	// Compute ShortText only after authorization has been confirmed.
+	msg.ShortText = h.extractShortText(dataPath, msg.Type)
+
 	c.JSON(http.StatusOK, msg)
 }
 
-// DownloadData handles GET /api/v1/messages/:id/data — downloads the message body as a file.
+// DownloadData handles GET /fmsg/:id/data — downloads the message body as a file.
 func (h *MessageHandler) DownloadData(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -565,9 +586,8 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	}
 
 	// Path traversal protection: ensure the path is within DataDir.
-	cleanPath := filepath.Clean(dataPath)
-	cleanDataDir := filepath.Clean(h.DataDir)
-	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
+	if !ok {
 		log.Printf("download data: path traversal attempt: %s", dataPath)
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
@@ -576,7 +596,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	c.FileAttachment(cleanPath, filepath.Base(cleanPath))
 }
 
-// Update handles PUT /api/v1/messages/:id — updates a draft message.
+// Update handles PUT /fmsg/:id — updates a draft message.
 func (h *MessageHandler) Update(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -585,7 +605,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, err := h.fetchMessage(ctx, msgID)
+	existing, _, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -612,6 +632,16 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 	if msg.From != identity {
 		c.JSON(http.StatusForbidden, gin.H{"error": "from address must match authenticated user"})
+		return
+	}
+
+	if err := validateAddresses(msg.From, msg.To, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -671,7 +701,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": msgID})
 }
 
-// Delete handles DELETE /api/v1/messages/:id — deletes a draft message.
+// Delete handles DELETE /fmsg/:id — deletes a draft message.
 func (h *MessageHandler) Delete(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -680,7 +710,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, err := h.fetchMessage(ctx, msgID)
+	existing, _, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -743,7 +773,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Send handles POST /api/v1/messages/:id/send — marks a message as sent.
+// Send handles POST /fmsg/:id/send — marks a message as sent.
 func (h *MessageHandler) Send(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -752,7 +782,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, err := h.fetchMessage(ctx, msgID)
+	existing, _, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -787,7 +817,7 @@ type addToInput struct {
 	AddTo []string `json:"add_to"`
 }
 
-// AddRecipients handles POST /api/v1/messages/:id/add-to — adds additional recipients to a message.
+// AddRecipients handles POST /fmsg/:id/add-to — adds additional recipients to a message.
 func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -806,13 +836,21 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		return
 	}
 
+	for _, addr := range input.AddTo {
+		if !middleware.IsValidAddr(addr) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid add_to address: %q", addr)})
+			return
+		}
+	}
+
 	ctx := c.Request.Context()
 
 	// Load the message to verify it exists.
 	var fromAddr string
+	var pid *int64
 	err := h.DB.Pool.QueryRow(ctx,
-		"SELECT from_addr FROM msg WHERE id = $1", msgID,
-	).Scan(&fromAddr)
+		"SELECT from_addr, pid FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &pid)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -820,6 +858,12 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 			log.Printf("add recipients: fetch msg %d: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		}
+		return
+	}
+
+	// add_to is only valid on replies (messages with a pid).
+	if pid == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to is only valid when pid is supplied"})
 		return
 	}
 
@@ -854,17 +898,20 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 }
 
 // fetchMessage loads a message with its recipients and attachments from the DB.
-func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, error) {
+// It also returns the raw filepath stored in the database so callers can use it
+// after performing their own authorization checks.
+func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, string, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
 		msgID,
 	)
 
 	msg := &models.Message{}
 	var pid *int64
 	var timeSent *float64
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
-		return nil, err
+	var dataPath string
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
+		return nil, "", err
 	}
 	msg.PID = pid
 	msg.Time = timeSent
@@ -907,7 +954,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 		attRows.Close()
 	}
 
-	return msg, nil
+	return msg, dataPath, nil
 }
 
 // saveMessageData writes data to the filesystem and returns the absolute path.
@@ -1019,6 +1066,132 @@ func isRecipient(to []string, addr string) bool {
 // isZip reports whether data starts with the zip local file header signature.
 func isZip(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
+}
+
+// safeDataPath cleans dataPath and verifies it lies inside dataDir. Returns
+// the cleaned absolute path and true on success, or "" and false otherwise.
+func safeDataPath(dataPath, dataDir string) (string, bool) {
+	if dataPath == "" || dataDir == "" {
+		return "", false
+	}
+	absPath, err := filepath.Abs(dataPath)
+	if err != nil {
+		return "", false
+	}
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return "", false
+	}
+	cleanPath := filepath.Clean(absPath)
+	cleanDataDir := filepath.Clean(absDataDir)
+	relPath, err := filepath.Rel(cleanDataDir, cleanPath)
+	if err != nil {
+		return "", false
+	}
+	if strings.HasPrefix(relPath, "..") {
+		return "", false
+	}
+	return cleanPath, true
+}
+
+// isTextMIME reports whether the given Content-Type's media type begins with
+// "text/". Charset and other parameters are ignored.
+func isTextMIME(mimeType string) bool {
+	if mimeType == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(mediaType, "text/")
+}
+
+// extractShortText reads up to ShortTextSize bytes from the message body
+// referenced by dataPath and returns it as a string when the message type
+// is text/* and the bytes form valid UTF-8. Truncation is rounded down to
+// the last complete UTF-8 rune so the result is always valid UTF-8.
+// Returns "" on any failure (non-text type, invalid UTF-8, missing/unsafe
+// path, read error). Errors are logged but not propagated.
+func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
+	if h.ShortTextSize <= 0 {
+		return ""
+	}
+	if !isTextMIME(mimeType) {
+		return ""
+	}
+	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
+	if !ok {
+		return ""
+	}
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("short text: open %s: %v", cleanPath, err)
+		}
+		return ""
+	}
+	defer f.Close()
+
+	buf := make([]byte, h.ShortTextSize)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		log.Printf("short text: read %s: %v", cleanPath, err)
+		return ""
+	}
+	buf = buf[:n]
+
+	// Trim to the largest valid UTF-8 prefix so that we only drop trailing
+	// incomplete bytes, while preserving complete multi-byte runes that end
+	// exactly at the buffer boundary.
+	for len(buf) > 0 && !utf8.Valid(buf) {
+		buf = buf[:len(buf)-1]
+	}
+	if len(buf) == 0 {
+		return ""
+	}
+	return string(buf)
+}
+
+// validateAddresses returns an error if any of the provided fmsg address
+// fields is not a valid "@user@domain" address. addToFrom is optional.
+func validateAddresses(from string, to, addTo []string, addToFrom *string) error {
+	if !middleware.IsValidAddr(from) {
+		return fmt.Errorf("invalid from address: %q", from)
+	}
+	for _, addr := range to {
+		if !middleware.IsValidAddr(addr) {
+			return fmt.Errorf("invalid to address: %q", addr)
+		}
+	}
+	for _, addr := range addTo {
+		if !middleware.IsValidAddr(addr) {
+			return fmt.Errorf("invalid add_to address: %q", addr)
+		}
+	}
+	if addToFrom != nil && *addToFrom != "" && !middleware.IsValidAddr(*addToFrom) {
+		return fmt.Errorf("invalid add_to_from address: %q", *addToFrom)
+	}
+	return nil
+}
+
+// validatePidRelations enforces:
+//   - If pid is set, topic must be empty (replies inherit topic from parent).
+//   - If pid is not set, add_to and add_to_from must be empty (a thread
+//     must exist before recipients can be added to it).
+func validatePidRelations(pid *int64, topic string, addTo []string, addToFrom *string) error {
+	if pid != nil && topic != "" {
+		return fmt.Errorf("topic must be empty when pid is supplied")
+	}
+	if pid == nil {
+		if len(addTo) > 0 {
+			return fmt.Errorf("add_to is only valid when pid is supplied")
+		}
+		if addToFrom != nil && *addToFrom != "" {
+			return fmt.Errorf("add_to_from is only valid when pid is supplied")
+		}
+	}
+	return nil
 }
 
 // checkDistinctRecipients returns an error if any address in to or addTo

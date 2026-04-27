@@ -151,7 +151,7 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 		}
 
 		addr, _ := claims["sub"].(string)
-		if !isValidAddr(addr) {
+		if !IsValidAddr(addr) {
 			log.Printf("auth rejected: ip=%s reason=invalid_addr sub=%q", c.ClientIP(), addr)
 			respondAuth(c, http.StatusUnauthorized, "invalid identity")
 			return
@@ -234,8 +234,8 @@ func GetIdentity(c *gin.Context) string {
 	return addr
 }
 
-// isValidAddr checks that the address has the form "@user@domain".
-func isValidAddr(addr string) bool {
+// IsValidAddr checks that the address has the form "@user@domain".
+func IsValidAddr(addr string) bool {
 	if len(addr) < 3 {
 		return false
 	}

@@ -50,6 +50,7 @@ func main() {
 	maxDataSize := int64(envOrDefaultInt("FMSG_API_MAX_DATA_SIZE", 10)) * 1024 * 1024
 	maxAttachSize := int64(envOrDefaultInt("FMSG_API_MAX_ATTACH_SIZE", 10)) * 1024 * 1024
 	maxMsgSize := int64(envOrDefaultInt("FMSG_API_MAX_MSG_SIZE", 20)) * 1024 * 1024
+	shortTextSize := envOrDefaultInt("FMSG_API_SHORT_TEXT_SIZE", 768)
 
 	// CORS: comma-separated list of allowed browser origins, e.g.
 	// "https://fmsg.io,https://www.fmsg.io". Empty disables CORS.
@@ -91,7 +92,7 @@ func main() {
 	router.Use(middleware.NewRateLimiter(ctx, float64(rateLimit), rateBurst))
 
 	// Instantiate handlers.
-	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize)
+	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Register routes under /fmsg, all protected by JWT.
