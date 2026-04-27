@@ -9,7 +9,10 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
-| `FMSG_API_JWT_SECRET` | *(required)*           | HMAC secret used to validate JWT tokens. Prefix with `base64:` to supply a base64-encoded key (e.g. `base64:c2VjcmV0`); otherwise the raw string is used. |
+| `FMSG_JWT_JWKS_URL` | *(prod)*                 | URL of the IdP's JWKS endpoint (e.g. `https://idp.fmsg.io/.well-known/jwks.json`). When set, the API verifies EdDSA tokens issued by the IdP. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
+| `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.fmsg.io`). Tokens with a different issuer are rejected. |
+| `FMSG_JWT_AUDIENCE` | *(optional)*             | When set, tokens must include this value in their `aud` claim. |
+| `FMSG_API_JWT_SECRET` | *(dev)*                | HMAC secret for HS256 token verification. Used only in dev mode (when `FMSG_JWT_JWKS_URL` is unset). Prefix with `base64:` to supply a base64-encoded key. Either this or `FMSG_JWT_JWKS_URL` must be set. |
 | `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS on port 443. |
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
 | `FMSG_API_PORT`     | `8000`                   | TCP port for plain HTTP mode (ignored when TLS is enabled) |
@@ -25,6 +28,42 @@ Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 
 A `.env` file placed in the working directory is loaded automatically at startup
 (values in the environment take precedence).
+
+## Authentication
+
+All `/fmsg/*` routes require an `Authorization: Bearer <token>` header. The API
+operates in one of two verification modes, selected automatically at startup:
+
+### EdDSA (production)
+
+Active when `FMSG_JWT_JWKS_URL` is set. Tokens are expected to be issued by the
+fmsg IdP and signed with Ed25519. The JWKS endpoint is polled on a schedule;
+the IdP can rotate keys by adding a new JWK with a fresh `kid`.
+
+Required token header: `alg: EdDSA`, `kid: <known to JWKS>`, `typ: JWT`.
+
+Required claims:
+
+| Claim | Description |
+| ----- | ----------- |
+| `iss` | Must equal `FMSG_JWT_ISSUER`. |
+| `sub` | User address in `@user@domain` form. |
+| `iat` | Issued-at timestamp (Unix seconds). |
+| `nbf` | Not-before timestamp. |
+| `exp` | Expiry timestamp (must be in the future, ±10 s leeway). |
+| `jti` | Unique token ID. Used for in-process replay prevention until `exp`. |
+| `aud` | Optional; required only when `FMSG_JWT_AUDIENCE` is set. |
+
+A 10-second clock-skew leeway is applied to `iat`/`nbf`/`exp` validation.
+Replay prevention is in-process and does not coordinate across multiple API
+instances; deploy as a single instance or replace the cache before scaling
+horizontally.
+
+### HMAC (development)
+
+Active when `FMSG_JWT_JWKS_URL` is unset. Tokens must be HS256-signed with the
+shared secret in `FMSG_API_JWT_SECRET`. Required claims are `sub` and `exp`;
+`iat`/`nbf` are honoured when present. No replay prevention is applied.
 
 ## Building
 
@@ -50,7 +89,8 @@ Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS on port `443`.
 
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
-export FMSG_API_JWT_SECRET=changeme
+export FMSG_JWT_JWKS_URL=https://idp.fmsg.io/.well-known/jwks.json
+export FMSG_JWT_ISSUER=https://idp.fmsg.io
 export FMSG_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
 export FMSG_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem
 export PGHOST=localhost

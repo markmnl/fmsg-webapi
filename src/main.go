@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MicahParks/keyfunc/v3"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
@@ -26,8 +27,13 @@ func main() {
 
 	// Required configuration.
 	dataDir := mustEnv("FMSG_DATA_DIR")
-	jwtSecret := mustEnv("FMSG_API_JWT_SECRET")
-	jwtKey := parseSecret(jwtSecret)
+
+	// JWT configuration. Mode is selected automatically:
+	//   * EdDSA (prod) when FMSG_JWT_JWKS_URL is set.
+	//   * HMAC (dev) otherwise, using FMSG_API_JWT_SECRET.
+	jwksURL := os.Getenv("FMSG_JWT_JWKS_URL")
+	jwtIssuer := os.Getenv("FMSG_JWT_ISSUER")
+	jwtAudience := os.Getenv("FMSG_JWT_AUDIENCE")
 
 	// TLS configuration (optional — omit both to run plain HTTP).
 	tlsCert := os.Getenv("FMSG_TLS_CERT")
@@ -55,7 +61,11 @@ func main() {
 	log.Println("connected to PostgreSQL")
 
 	// Initialise JWT middleware.
-	jwtMiddleware, err := middleware.SetupJWT(jwtKey, idURL)
+	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, idURL)
+	if err != nil {
+		log.Fatalf("failed to configure JWT: %v", err)
+	}
+	jwtMiddleware, err := middleware.New(jwtCfg)
 	if err != nil {
 		log.Fatalf("failed to initialise JWT middleware: %v", err)
 	}
@@ -72,7 +82,7 @@ func main() {
 
 	// Register routes under /fmsg, all protected by JWT.
 	fmsg := router.Group("/fmsg")
-	fmsg.Use(jwtMiddleware.MiddlewareFunc())
+	fmsg.Use(jwtMiddleware)
 	{
 		fmsg.GET("/wait", msgHandler.Wait)
 		fmsg.GET("", msgHandler.List)
@@ -143,6 +153,40 @@ func envOrDefaultInt(key string, defaultValue int) int {
 		return n
 	}
 	return defaultValue
+}
+
+// buildJWTConfig assembles a middleware.Config from environment-derived
+// inputs, picking EdDSA (prod) when a JWKS URL is supplied and falling back
+// to HMAC (dev) otherwise.
+func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, idURL string) (middleware.Config, error) {
+	cfg := middleware.Config{
+		Issuer:   issuer,
+		Audience: audience,
+		IDURL:    idURL,
+	}
+
+	if jwksURL != "" {
+		if issuer == "" {
+			return cfg, errors.New("FMSG_JWT_ISSUER is required when FMSG_JWT_JWKS_URL is set")
+		}
+		k, err := keyfunc.NewDefaultCtx(ctx, []string{jwksURL})
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Mode = middleware.ModeEdDSA
+		cfg.JWKS = k.Keyfunc
+		log.Printf("JWT mode: EdDSA (issuer=%s, jwks=%s)", issuer, jwksURL)
+		return cfg, nil
+	}
+
+	secret := os.Getenv("FMSG_API_JWT_SECRET")
+	if secret == "" {
+		return cfg, errors.New("either FMSG_JWT_JWKS_URL (prod) or FMSG_API_JWT_SECRET (dev) must be set")
+	}
+	cfg.Mode = middleware.ModeHMAC
+	cfg.HMACKey = parseSecret(secret)
+	log.Println("JWT mode: HMAC (development)")
+	return cfg, nil
 }
 
 // parseSecret returns the HMAC key bytes for the given secret string.
