@@ -13,9 +13,9 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.fmsg.io`). Tokens with a different issuer are rejected. |
 | `FMSG_JWT_AUDIENCE` | *(optional)*             | When set, tokens must include this value in their `aud` claim. |
 | `FMSG_API_JWT_SECRET` | *(dev)*                | HMAC secret for HS256 token verification. Used only in dev mode (when `FMSG_JWT_JWKS_URL` is unset). Prefix with `base64:` to supply a base64-encoded key. Either this or `FMSG_JWT_JWKS_URL` must be set. |
-| `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS on port 443. |
+| `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS. |
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
-| `FMSG_API_PORT`     | `8000`                   | TCP port for plain HTTP mode (ignored when TLS is enabled) |
+| `FMSG_API_PORT`     | `443` (TLS) / `8000` (plain) | TCP port to listen on. |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
 | `FMSG_API_RATE_LIMIT`| `10`                    | Max sustained requests per second per IP                |
 | `FMSG_API_RATE_BURST`| `20`                    | Max burst size for the per-IP rate limiter              |
@@ -85,7 +85,8 @@ go test ./...
 
 ### TLS mode (production)
 
-Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS on port `443`.
+Set `FMSG_TLS_CERT` and `FMSG_TLS_KEY` to enable HTTPS. Listens on port `443`
+by default; override with `FMSG_API_PORT`.
 
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
@@ -106,6 +107,10 @@ go run .
 
 Omit the TLS variables to run a plain HTTP server. Override the port with
 `FMSG_API_PORT` (default `8000`).
+
+This is the recommended mode when fronting fmsg-webapi with Apache, nginx, or
+any other reverse proxy that already terminates TLS (e.g. Apache on `:443`
+proxying `https://fmsgapi.example.com/` to `http://127.0.0.1:8000/`).
 
 ```bash
 export FMSG_DATA_DIR=/var/lib/fmsgd/

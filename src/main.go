@@ -109,8 +109,9 @@ func main() {
 	}
 
 	if tlsEnabled {
-		srv.Addr = ":443"
-		log.Println("fmsg-webapi starting on :443")
+		port := envOrDefault("FMSG_API_PORT", "443")
+		srv.Addr = ":" + port
+		log.Printf("fmsg-webapi starting on :%s (HTTPS)", port)
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		if err = srv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
