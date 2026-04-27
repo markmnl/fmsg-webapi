@@ -286,9 +286,11 @@ Retrieves a single message by ID. The authenticated user must be a participant â
 ```
 
 The `short_text` field is included only when the message `type` is `text/*` and
-the stored body is valid UTF-8. It contains up to `FMSG_API_SHORT_TEXT_SIZE`
-bytes (default 768) of the body, truncated on a UTF-8 rune boundary, so UIs
-can render a preview without a separate `GET /fmsg/:id/data` round-trip.
+the stored body is valid UTF-8. When `FMSG_API_SHORT_TEXT_SIZE` is greater than
+`0`, it contains up to that many bytes (default 768) of the body, truncated on
+a UTF-8 rune boundary, so UIs can render a preview without a separate
+`GET /fmsg/:id/data` round-trip. Set `FMSG_API_SHORT_TEXT_SIZE=0` to disable
+`short_text` generation.
 
 **Errors:**
 

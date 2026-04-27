@@ -506,7 +506,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	msg, err := h.fetchMessage(ctx, msgID)
+	msg, dataPath, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -522,6 +522,9 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
+
+	// Compute ShortText only after authorization has been confirmed.
+	msg.ShortText = h.extractShortText(dataPath, msg.Type)
 
 	c.JSON(http.StatusOK, msg)
 }
@@ -592,7 +595,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, err := h.fetchMessage(ctx, msgID)
+	existing, _, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -687,7 +690,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, err := h.fetchMessage(ctx, msgID)
+	existing, _, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -759,7 +762,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, err := h.fetchMessage(ctx, msgID)
+	existing, _, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -861,7 +864,9 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 }
 
 // fetchMessage loads a message with its recipients and attachments from the DB.
-func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, error) {
+// It also returns the raw filepath stored in the database so callers can use it
+// after performing their own authorization checks.
+func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, string, error) {
 	row := h.DB.Pool.QueryRow(ctx,
 		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
 		msgID,
@@ -872,12 +877,11 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	var timeSent *float64
 	var dataPath string
 	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	msg.PID = pid
 	msg.Time = timeSent
 	msg.HasPid = pid != nil
-	msg.ShortText = h.extractShortText(dataPath, msg.Type)
 
 	// Load recipients.
 	rows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_to WHERE msg_id = $1", msgID)
@@ -916,7 +920,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 		attRows.Close()
 	}
 
-	return msg, nil
+	return msg, dataPath, nil
 }
 
 // saveMessageData writes data to the filesystem and returns the absolute path.
@@ -1036,9 +1040,21 @@ func safeDataPath(dataPath, dataDir string) (string, bool) {
 	if dataPath == "" || dataDir == "" {
 		return "", false
 	}
-	cleanPath := filepath.Clean(dataPath)
-	cleanDataDir := filepath.Clean(dataDir)
-	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+	absPath, err := filepath.Abs(dataPath)
+	if err != nil {
+		return "", false
+	}
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return "", false
+	}
+	cleanPath := filepath.Clean(absPath)
+	cleanDataDir := filepath.Clean(absDataDir)
+	relPath, err := filepath.Rel(cleanDataDir, cleanPath)
+	if err != nil {
+		return "", false
+	}
+	if strings.HasPrefix(relPath, "..") {
 		return "", false
 	}
 	return cleanPath, true
@@ -1091,25 +1107,13 @@ func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
 	}
 	buf = buf[:n]
 
-	// If the buffer ends in the middle of a multi-byte UTF-8 sequence, drop
-	// the trailing partial rune so the result is valid UTF-8.
-	for len(buf) > 0 && !utf8.RuneStart(buf[len(buf)-1]) {
+	// Trim to the largest valid UTF-8 prefix so that we only drop trailing
+	// incomplete bytes, while preserving complete multi-byte runes that end
+	// exactly at the buffer boundary.
+	for len(buf) > 0 && !utf8.Valid(buf) {
 		buf = buf[:len(buf)-1]
 	}
-	// Drop the last rune if it is itself the start of an incomplete sequence
-	// (e.g. a 0xC2 lead byte with no continuation).
-	if len(buf) > 0 {
-		last := buf[len(buf)-1]
-		switch {
-		case last < 0x80:
-			// single-byte rune, complete
-		case last >= 0xC0:
-			// lead byte with no continuation bytes following
-			buf = buf[:len(buf)-1]
-		}
-	}
-
-	if !utf8.Valid(buf) {
+	if len(buf) == 0 {
 		return ""
 	}
 	return string(buf)
