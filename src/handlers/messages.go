@@ -177,7 +177,7 @@ func (h *MessageHandler) latestMessageIDForRecipient(ctx context.Context, identi
 	return latestID, nil
 }
 
-// List handles GET /api/v1/messages — lists messages where the authenticated user is a recipient.
+// List handles GET /fmsg — lists messages where the authenticated user is a recipient.
 func (h *MessageHandler) List(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 
@@ -405,7 +405,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	c.JSON(http.StatusOK, messages)
 }
 
-// Create handles POST /api/v1/messages — creates a draft message.
+// Create handles POST /fmsg — creates a draft message.
 func (h *MessageHandler) Create(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 
@@ -497,7 +497,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"id": msgID})
 }
 
-// Get handles GET /api/v1/messages/:id — retrieves a message.
+// Get handles GET /fmsg/:id — retrieves a message.
 func (h *MessageHandler) Get(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -529,7 +529,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, msg)
 }
 
-// DownloadData handles GET /api/v1/messages/:id/data — downloads the message body as a file.
+// DownloadData handles GET /fmsg/:id/data — downloads the message body as a file.
 func (h *MessageHandler) DownloadData(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -586,7 +586,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	c.FileAttachment(cleanPath, filepath.Base(cleanPath))
 }
 
-// Update handles PUT /api/v1/messages/:id — updates a draft message.
+// Update handles PUT /fmsg/:id — updates a draft message.
 func (h *MessageHandler) Update(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -681,7 +681,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": msgID})
 }
 
-// Delete handles DELETE /api/v1/messages/:id — deletes a draft message.
+// Delete handles DELETE /fmsg/:id — deletes a draft message.
 func (h *MessageHandler) Delete(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -753,7 +753,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Send handles POST /api/v1/messages/:id/send — marks a message as sent.
+// Send handles POST /fmsg/:id/send — marks a message as sent.
 func (h *MessageHandler) Send(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -797,7 +797,7 @@ type addToInput struct {
 	AddTo []string `json:"add_to"`
 }
 
-// AddRecipients handles POST /api/v1/messages/:id/add-to — adds additional recipients to a message.
+// AddRecipients handles POST /fmsg/:id/add-to — adds additional recipients to a message.
 func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)

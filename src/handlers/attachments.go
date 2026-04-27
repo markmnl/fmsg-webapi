@@ -30,7 +30,7 @@ func NewAttachmentHandler(database *db.DB, dataDir string, maxAttachSize, maxMsg
 	return &AttachmentHandler{DB: database, DataDir: dataDir, MaxAttachSize: maxAttachSize, MaxMsgSize: maxMsgSize}
 }
 
-// Upload handles POST /api/v1/messages/:id/attachments.
+// Upload handles POST /fmsg/:id/attachments.
 func (h *AttachmentHandler) Upload(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -166,7 +166,7 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"filename": intendedFilename, "size": written})
 }
 
-// Download handles GET /api/v1/messages/:id/attachments/:filename.
+// Download handles GET /fmsg/:id/attachments/:filename.
 func (h *AttachmentHandler) Download(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
@@ -239,7 +239,7 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 	c.FileAttachment(cleanPath, filename)
 }
 
-// DeleteAttachment handles DELETE /api/v1/messages/:id/attachments/:filename.
+// DeleteAttachment handles DELETE /fmsg/:id/attachments/:filename.
 func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := parseID(c)
