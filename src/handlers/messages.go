@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -24,15 +26,16 @@ import (
 
 // MessageHandler holds dependencies for message routes.
 type MessageHandler struct {
-	DB          *db.DB
-	DataDir     string
-	MaxDataSize int64
-	MaxMsgSize  int64
+	DB            *db.DB
+	DataDir       string
+	MaxDataSize   int64
+	MaxMsgSize    int64
+	ShortTextSize int
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize}
 }
 
 // messageListItem is the JSON shape for each message in the list response.
@@ -53,6 +56,7 @@ type messageListItem struct {
 	Topic       string              `json:"topic"`
 	Type        string              `json:"type"`
 	Size        int                 `json:"size"`
+	ShortText   string              `json:"short_text,omitempty"`
 	Attachments []models.Attachment `json:"attachments"`
 }
 
@@ -185,7 +189,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
 		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
 		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
@@ -204,12 +208,14 @@ func (h *MessageHandler) List(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		var dataPath string
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
+		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
 	}
@@ -300,7 +306,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
 		 WHERE m.from_addr = $1
 		 ORDER BY m.id DESC
@@ -318,12 +324,14 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	var msgIDs []int64
 	for rows.Next() {
 		var m messageListItem
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size); err != nil {
+		var dataPath string
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
 			log.Printf("list sent messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
+		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
 	}
@@ -565,9 +573,8 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	}
 
 	// Path traversal protection: ensure the path is within DataDir.
-	cleanPath := filepath.Clean(dataPath)
-	cleanDataDir := filepath.Clean(h.DataDir)
-	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
+	if !ok {
 		log.Printf("download data: path traversal attempt: %s", dataPath)
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
@@ -856,19 +863,21 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 // fetchMessage loads a message with its recipients and attachments from the DB.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
 		msgID,
 	)
 
 	msg := &models.Message{}
 	var pid *int64
 	var timeSent *float64
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size); err != nil {
+	var dataPath string
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
 		return nil, err
 	}
 	msg.PID = pid
 	msg.Time = timeSent
 	msg.HasPid = pid != nil
+	msg.ShortText = h.extractShortText(dataPath, msg.Type)
 
 	// Load recipients.
 	rows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_to WHERE msg_id = $1", msgID)
@@ -1019,6 +1028,91 @@ func isRecipient(to []string, addr string) bool {
 // isZip reports whether data starts with the zip local file header signature.
 func isZip(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
+}
+
+// safeDataPath cleans dataPath and verifies it lies inside dataDir. Returns
+// the cleaned absolute path and true on success, or "" and false otherwise.
+func safeDataPath(dataPath, dataDir string) (string, bool) {
+	if dataPath == "" || dataDir == "" {
+		return "", false
+	}
+	cleanPath := filepath.Clean(dataPath)
+	cleanDataDir := filepath.Clean(dataDir)
+	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+		return "", false
+	}
+	return cleanPath, true
+}
+
+// isTextMIME reports whether the given Content-Type's media type begins with
+// "text/". Charset and other parameters are ignored.
+func isTextMIME(mimeType string) bool {
+	if mimeType == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(mediaType, "text/")
+}
+
+// extractShortText reads up to ShortTextSize bytes from the message body
+// referenced by dataPath and returns it as a string when the message type
+// is text/* and the bytes form valid UTF-8. Truncation is rounded down to
+// the last complete UTF-8 rune so the result is always valid UTF-8.
+// Returns "" on any failure (non-text type, invalid UTF-8, missing/unsafe
+// path, read error). Errors are logged but not propagated.
+func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
+	if h.ShortTextSize <= 0 {
+		return ""
+	}
+	if !isTextMIME(mimeType) {
+		return ""
+	}
+	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
+	if !ok {
+		return ""
+	}
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("short text: open %s: %v", cleanPath, err)
+		}
+		return ""
+	}
+	defer f.Close()
+
+	buf := make([]byte, h.ShortTextSize)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		log.Printf("short text: read %s: %v", cleanPath, err)
+		return ""
+	}
+	buf = buf[:n]
+
+	// If the buffer ends in the middle of a multi-byte UTF-8 sequence, drop
+	// the trailing partial rune so the result is valid UTF-8.
+	for len(buf) > 0 && !utf8.RuneStart(buf[len(buf)-1]) {
+		buf = buf[:len(buf)-1]
+	}
+	// Drop the last rune if it is itself the start of an incomplete sequence
+	// (e.g. a 0xC2 lead byte with no continuation).
+	if len(buf) > 0 {
+		last := buf[len(buf)-1]
+		switch {
+		case last < 0x80:
+			// single-byte rune, complete
+		case last >= 0xC0:
+			// lead byte with no continuation bytes following
+			buf = buf[:len(buf)-1]
+		}
+	}
+
+	if !utf8.Valid(buf) {
+		return ""
+	}
+	return string(buf)
 }
 
 // checkDistinctRecipients returns an error if any address in to or addTo

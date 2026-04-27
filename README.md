@@ -22,6 +22,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
 | `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
+| `FMSG_API_SHORT_TEXT_SIZE`| `768`               | Maximum bytes of message body returned inline as `short_text` for `text/*` UTF-8 messages |
 | `FMSG_CORS_ORIGINS` | *(optional)*             | Comma-separated list of browser origins allowed via CORS, e.g. `https://example.com,https://www.example.com`. Use `*` to allow any origin. When unset, no CORS headers are emitted (server-to-server callers are unaffected). |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
@@ -279,9 +280,15 @@ Retrieves a single message by ID. The authenticated user must be a participant â
   "topic": "Hello",
   "type": "text/plain",
   "size": 12,
+  "short_text": "hello world",
   "attachments": []
 }
 ```
+
+The `short_text` field is included only when the message `type` is `text/*` and
+the stored body is valid UTF-8. It contains up to `FMSG_API_SHORT_TEXT_SIZE`
+bytes (default 768) of the body, truncated on a UTF-8 rune boundary, so UIs
+can render a preview without a separate `GET /fmsg/:id/data` round-trip.
 
 **Errors:**
 

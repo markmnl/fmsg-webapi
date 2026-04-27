@@ -23,5 +23,6 @@ type Message struct {
 	Topic       string       `json:"topic"`
 	Type        string       `json:"type"`
 	Size        int          `json:"size"`
+	ShortText   string       `json:"short_text,omitempty"`
 	Attachments []Attachment `json:"attachments"`
 }
