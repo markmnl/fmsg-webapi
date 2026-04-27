@@ -9,8 +9,8 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
-| `FMSG_JWT_JWKS_URL` | *(prod)*                 | URL of the IdP's JWKS endpoint (e.g. `https://idp.fmsg.io/.well-known/jwks.json`). When set, the API verifies EdDSA tokens issued by the IdP. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
-| `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.fmsg.io`). Tokens with a different issuer are rejected. |
+| `FMSG_JWT_JWKS_URL` | *(prod)*                 | URL of the IdP's JWKS endpoint (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies EdDSA tokens issued by the IdP. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
+| `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com`). Tokens with a different issuer are rejected. |
 | `FMSG_JWT_AUDIENCE` | *(optional)*             | When set, tokens must include this value in their `aud` claim. |
 | `FMSG_API_JWT_SECRET` | *(dev)*                | HMAC secret for HS256 token verification. Used only in dev mode (when `FMSG_JWT_JWKS_URL` is unset). Prefix with `base64:` to supply a base64-encoded key. Either this or `FMSG_JWT_JWKS_URL` must be set. |
 | `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS. |
@@ -22,7 +22,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
 | `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
-| `FMSG_CORS_ORIGINS` | *(optional)*             | Comma-separated list of browser origins allowed via CORS, e.g. `https://fmsg.io,https://www.fmsg.io`. Use `*` to allow any origin. When unset, no CORS headers are emitted (server-to-server callers are unaffected). |
+| `FMSG_CORS_ORIGINS` | *(optional)*             | Comma-separated list of browser origins allowed via CORS, e.g. `https://example.com,https://www.example.com`. Use `*` to allow any origin. When unset, no CORS headers are emitted (server-to-server callers are unaffected). |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -91,8 +91,8 @@ by default; override with `FMSG_API_PORT`.
 
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
-export FMSG_JWT_JWKS_URL=https://idp.fmsg.io/.well-known/jwks.json
-export FMSG_JWT_ISSUER=https://idp.fmsg.io
+export FMSG_JWT_JWKS_URL=https://idp.example.com/.well-known/jwks.json
+export FMSG_JWT_ISSUER=https://idp.example.com
 export FMSG_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
 export FMSG_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem
 export PGHOST=localhost
