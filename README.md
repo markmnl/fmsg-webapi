@@ -22,6 +22,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
 | `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
+| `FMSG_CORS_ORIGINS` | *(optional)*             | Comma-separated list of browser origins allowed via CORS, e.g. `https://fmsg.io,https://www.fmsg.io`. Use `*` to allow any origin. When unset, no CORS headers are emitted (server-to-server callers are unaffected). |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.

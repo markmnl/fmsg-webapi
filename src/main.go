@@ -51,6 +51,10 @@ func main() {
 	maxAttachSize := int64(envOrDefaultInt("FMSG_API_MAX_ATTACH_SIZE", 10)) * 1024 * 1024
 	maxMsgSize := int64(envOrDefaultInt("FMSG_API_MAX_MSG_SIZE", 20)) * 1024 * 1024
 
+	// CORS: comma-separated list of allowed browser origins, e.g.
+	// "https://fmsg.io,https://www.fmsg.io". Empty disables CORS.
+	corsOrigins := parseCSV(os.Getenv("FMSG_CORS_ORIGINS"))
+
 	// Connect to PostgreSQL (uses standard PG* environment variables).
 	ctx := context.Background()
 	database, err := db.New(ctx, "")
@@ -72,6 +76,16 @@ func main() {
 
 	// Create Gin router.
 	router := gin.Default()
+
+	// CORS must run before authentication so that browser preflight (OPTIONS)
+	// requests, which do not carry the Authorization header, are answered
+	// directly instead of being rejected by the JWT middleware.
+	if len(corsOrigins) > 0 {
+		corsCfg := middleware.DefaultCORSConfig()
+		corsCfg.AllowedOrigins = corsOrigins
+		router.Use(middleware.NewCORS(corsCfg))
+		log.Printf("CORS enabled for origins: %s", strings.Join(corsOrigins, ", "))
+	}
 
 	// Global rate limiter.
 	router.Use(middleware.NewRateLimiter(ctx, float64(rateLimit), rateBurst))
@@ -133,6 +147,21 @@ func mustEnv(key string) string {
 		log.Fatalf("required environment variable %s is not set", key)
 	}
 	return v
+}
+
+// parseCSV splits a comma-separated string into trimmed, non-empty values.
+func parseCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // envOrDefault returns the environment variable value or defaultValue when unset.
