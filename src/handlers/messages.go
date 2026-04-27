@@ -426,6 +426,11 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
+	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	if int64(len(msg.Data)) > h.MaxDataSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
 		return
@@ -625,6 +630,11 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	if int64(len(msg.Data)) > h.MaxDataSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
 		return
@@ -820,9 +830,10 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 
 	// Load the message to verify it exists.
 	var fromAddr string
+	var pid *int64
 	err := h.DB.Pool.QueryRow(ctx,
-		"SELECT from_addr FROM msg WHERE id = $1", msgID,
-	).Scan(&fromAddr)
+		"SELECT from_addr, pid FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &pid)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -830,6 +841,12 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 			log.Printf("add recipients: fetch msg %d: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		}
+		return
+	}
+
+	// add_to is only valid on replies (messages with a pid).
+	if pid == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "add_to is only valid when pid is supplied"})
 		return
 	}
 
@@ -1117,6 +1134,25 @@ func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
 		return ""
 	}
 	return string(buf)
+}
+
+// validatePidRelations enforces:
+//   - If pid is set, topic must be empty (replies inherit topic from parent).
+//   - If pid is not set, add_to and add_to_from must be empty (a thread
+//     must exist before recipients can be added to it).
+func validatePidRelations(pid *int64, topic string, addTo []string, addToFrom *string) error {
+	if pid != nil && topic != "" {
+		return fmt.Errorf("topic must be empty when pid is supplied")
+	}
+	if pid == nil {
+		if len(addTo) > 0 {
+			return fmt.Errorf("add_to is only valid when pid is supplied")
+		}
+		if addToFrom != nil && *addToFrom != "" {
+			return fmt.Errorf("add_to_from is only valid when pid is supplied")
+		}
+	}
+	return nil
 }
 
 // checkDistinctRecipients returns an error if any address in to or addTo

@@ -253,7 +253,7 @@ When `add_to` recipients are provided, `add_to_from` is automatically populated 
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Missing/invalid fields or empty `to` |
+| `400`  | Missing/invalid fields, empty `to`, `topic` set together with `pid`, or `add_to`/`add_to_from` set without `pid` |
 | `403`  | `from` does not match authenticated user |
 
 ### GET `/fmsg/:id`
@@ -307,7 +307,7 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Invalid fields |
+| `400`  | Invalid fields, `topic` set together with `pid`, or `add_to`/`add_to_from` set without `pid` |
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 
@@ -358,7 +358,7 @@ New addresses must be distinct among themselves (case-insensitive).
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Empty `add_to` or duplicate addresses in request |
+| `400`  | Empty `add_to`, duplicate addresses, or target message has no `pid` |
 | `403`  | Authenticated user is not an existing participant (sender or `to` recipient) |
 | `404`  | Message not found |
 
