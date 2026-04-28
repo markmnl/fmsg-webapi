@@ -2,6 +2,7 @@
 package middleware
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -20,6 +21,24 @@ const IdentityKey = "sub"
 // DefaultClockSkew is the leeway applied to iat/nbf/exp validation to tolerate
 // minor clock differences between services.
 const DefaultClockSkew = 10 * time.Second
+
+// fmsgIDClient is a dedicated HTTP client for the fmsgid lookup performed on
+// every authenticated request. It MUST have an overall timeout — using
+// http.DefaultClient (no timeout) caused all API requests to hang whenever
+// fmsgid became slow or a pooled keep-alive connection went stale.
+var fmsgIDClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          50,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     false,
+	},
+}
 
 // Mode selects the JWT verification strategy.
 type Mode int
@@ -176,7 +195,7 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 			}
 		}
 
-		code, accepting, err := checkFmsgID(idURL, addr)
+		code, accepting, err := checkFmsgID(c.Request.Context(), idURL, addr)
 		if err != nil {
 			log.Printf("fmsgid check error for %s: %v", addr, err)
 			respondAuth(c, http.StatusServiceUnavailable, "identity service unavailable")
@@ -248,9 +267,16 @@ func IsValidAddr(addr string) bool {
 
 // checkFmsgID queries the fmsgid service for a user address.
 // Returns (statusCode, acceptingNew, error).
-func checkFmsgID(idURL, addr string) (int, bool, error) {
+//
+// Uses fmsgIDClient (bounded timeout) and propagates ctx so that a client
+// disconnect aborts the upstream lookup instead of leaking a goroutine.
+func checkFmsgID(ctx context.Context, idURL, addr string) (int, bool, error) {
 	url := strings.TrimRight(idURL, "/") + "/fmsgid/" + addr
-	resp, err := http.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	resp, err := fmsgIDClient.Do(req) //nolint:gosec // URL constructed from trusted config + validated addr
 	if err != nil {
 		return 0, false, err
 	}

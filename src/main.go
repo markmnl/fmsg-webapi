@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
@@ -64,6 +65,18 @@ func main() {
 	}
 	defer database.Close()
 	log.Println("connected to PostgreSQL")
+
+	// Diagnostic pprof server, bound to localhost only. Access via SSH tunnel:
+	//   ssh -L 6060:127.0.0.1:6060 user@host
+	// then visit http://localhost:6060/debug/pprof/goroutine?debug=2
+	// to see every goroutine's stack — invaluable when requests appear stuck.
+	go func() {
+		addr := envOrDefault("FMSG_PPROF_ADDR", "127.0.0.1:6060")
+		log.Printf("pprof listening on %s", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil { //nolint:gosec // localhost-only diagnostic endpoint
+			log.Printf("pprof server exited: %v", err)
+		}
+	}()
 
 	// Initialise JWT middleware.
 	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, idURL)
