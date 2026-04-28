@@ -53,19 +53,16 @@ Required claims:
 | `iat` | Issued-at timestamp (Unix seconds). |
 | `nbf` | Not-before timestamp. |
 | `exp` | Expiry timestamp (must be in the future, ±10 s leeway). |
-| `jti` | Unique token ID. Used for in-process replay prevention until `exp`. |
+| `jti` | Optional unique token ID. |
 | `aud` | Optional; required only when `FMSG_JWT_AUDIENCE` is set. |
 
 A 10-second clock-skew leeway is applied to `iat`/`nbf`/`exp` validation.
-Replay prevention is in-process and does not coordinate across multiple API
-instances; deploy as a single instance or replace the cache before scaling
-horizontally.
 
 ### HMAC (development)
 
 Active when `FMSG_JWT_JWKS_URL` is unset. Tokens must be HS256-signed with the
 shared secret in `FMSG_API_JWT_SECRET`. Required claims are `sub` and `exp`;
-`iat`/`nbf` are honoured when present. No replay prevention is applied.
+`iat`/`nbf` are honoured when present.
 
 ## Building
 

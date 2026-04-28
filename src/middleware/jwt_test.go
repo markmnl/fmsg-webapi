@@ -282,7 +282,7 @@ func TestEdDSAMode_Expired(t *testing.T) {
 	}
 }
 
-func TestEdDSAMode_Replay(t *testing.T) {
+func TestEdDSAMode_Reuse(t *testing.T) {
 	srv := fmsgIDServer(t, http.StatusOK, true)
 	defer srv.Close()
 	priv, jwks := newEdDSAFixture(t)
@@ -295,15 +295,15 @@ func TestEdDSAMode_Replay(t *testing.T) {
 		"sub": "@alice@example.com",
 		"iat": time.Now().Unix(),
 		"exp": time.Now().Add(time.Hour).Unix(),
-		"jti": "replay-me",
+		"jti": "reuse-me",
 	}
 	tok := signEdDSA(t, priv, "prod-1", claims)
 
 	if w := runMiddleware(t, mw, tok); w.Code != http.StatusOK {
 		t.Fatalf("first call expected 200, got %d", w.Code)
 	}
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("replay expected 401, got %d", w.Code)
+	if w := runMiddleware(t, mw, tok); w.Code != http.StatusOK {
+		t.Fatalf("reuse expected 200, got %d", w.Code)
 	}
 }
 
@@ -323,26 +323,5 @@ func TestEdDSAMode_FmsgIDUnavailable(t *testing.T) {
 	})
 	if w := runMiddleware(t, mw, tok); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", w.Code)
-	}
-}
-
-func TestJTICache_SeenAndExpiry(t *testing.T) {
-	c := newJTICache()
-	defer c.Close()
-	exp := time.Now().Add(time.Hour)
-	if c.Seen("a", exp) {
-		t.Fatal("first Seen should be false")
-	}
-	if !c.Seen("a", exp) {
-		t.Fatal("second Seen should be true")
-	}
-	// Expired entry should not count as seen.
-	if c.Seen("b", time.Now().Add(-time.Second)) {
-		t.Fatal("expired entry: first Seen should be false")
-	}
-	// And subsequently the cached entry, having expired in the past, should
-	// be replaceable.
-	if c.Seen("b", time.Now().Add(-time.Second)) {
-		t.Fatal("expired entry: should not flag as replay")
 	}
 }

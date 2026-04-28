@@ -67,7 +67,6 @@ type Config struct {
 //   - extracts a Bearer token from the Authorization header,
 //   - parses & verifies the signature according to cfg.Mode,
 //   - validates iss/aud/exp/nbf claims,
-//   - rejects replays (EdDSA mode only) by tracking jti in-process,
 //   - extracts sub as the user address and validates its shape,
 //   - calls fmsgid to confirm the user is known and accepting messages,
 //   - on success stores the address in the Gin context under IdentityKey.
@@ -129,11 +128,6 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 	}
 	parser := jwt.NewParser(parserOpts...)
 
-	var replay *jtiCache
-	if cfg.Mode == ModeEdDSA {
-		replay = newJTICache()
-	}
-
 	idURL := cfg.IDURL
 
 	return func(c *gin.Context) {
@@ -155,25 +149,6 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 			log.Printf("auth rejected: ip=%s reason=invalid_addr sub=%q", c.ClientIP(), addr)
 			respondAuth(c, http.StatusUnauthorized, "invalid identity")
 			return
-		}
-
-		if replay != nil {
-			jti, _ := claims["jti"].(string)
-			if jti == "" {
-				log.Printf("auth rejected: ip=%s addr=%s reason=missing_jti", c.ClientIP(), addr)
-				respondAuth(c, http.StatusUnauthorized, "invalid token")
-				return
-			}
-			expTime, err := claims.GetExpirationTime()
-			if err != nil || expTime == nil {
-				respondAuth(c, http.StatusUnauthorized, "invalid token")
-				return
-			}
-			if replay.Seen(jti, expTime.Time) {
-				log.Printf("auth rejected: ip=%s addr=%s reason=jti_replay jti=%s", c.ClientIP(), addr, jti)
-				respondAuth(c, http.StatusUnauthorized, "token already used")
-				return
-			}
 		}
 
 		code, accepting, err := checkFmsgID(idURL, addr)
