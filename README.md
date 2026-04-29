@@ -17,8 +17,6 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
 | `FMSG_API_PORT`     | `443` (TLS) / `8000` (plain) | TCP port to listen on. |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
-| `FMSG_API_RATE_LIMIT`| `10`                    | Max sustained requests per second per IP                |
-| `FMSG_API_RATE_BURST`| `20`                    | Max burst size for the per-IP rate limiter              |
 | `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
 | `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
@@ -133,12 +131,8 @@ maximum long-poll duration (60 s) so connections are not dropped prematurely.
 
 All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header.
 
-All routes are subject to per-IP rate limiting. When the limit is exceeded, the
-server responds with `429 Too Many Requests`:
-
-```json
-{"error": "rate limit exceeded"}
-```
+Rate limiting is enforced at the host level (e.g. `nftables`) rather than in
+the application.
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |

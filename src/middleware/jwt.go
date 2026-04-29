@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/sync/singleflight"
 )
 
 // IdentityKey is the Gin context key under which the authenticated user
@@ -221,28 +223,95 @@ func IsValidAddr(addr string) bool {
 	return strings.Contains(rest, "@")
 }
 
+// fmsgIDClient is a dedicated HTTP client with a bounded timeout so that a
+// slow or hung fmsgid never blocks an API request goroutine indefinitely
+// (which would otherwise hold the inbound HTTP connection open and exhaust
+// the browser's per-host connection limit).
+var fmsgIDClient = &http.Client{Timeout: 5 * time.Second}
+
+// fmsgIDCacheTTL is how long a positive fmsgid lookup is cached. Tokens are
+// re-validated every time, but the relatively expensive network round-trip to
+// fmsgid is short-circuited for this window. Negative results are not cached.
+const fmsgIDCacheTTL = 30 * time.Second
+
+type fmsgIDEntry struct {
+	expires      time.Time
+	code         int
+	acceptingNew bool
+}
+
+var fmsgIDCache sync.Map // map[string]fmsgIDEntry, key = addr
+
+// fmsgIDGroup coalesces concurrent lookups for the same address so that a
+// burst of cache misses (e.g. several browser requests arriving before the
+// first response is cached) results in a single upstream fmsgid call.
+var fmsgIDGroup singleflight.Group
+
+type fmsgIDResult struct {
+	code         int
+	acceptingNew bool
+}
+
 // checkFmsgID queries the fmsgid service for a user address.
-// Returns (statusCode, acceptingNew, error).
+// Returns (statusCode, acceptingNew, error). Successful 200 responses are
+// cached for fmsgIDCacheTTL to avoid hammering fmsgid when a browser fires
+// many concurrent requests with the same JWT. Concurrent cache misses for
+// the same address are deduplicated via singleflight.
 func checkFmsgID(idURL, addr string) (int, bool, error) {
-	url := strings.TrimRight(idURL, "/") + "/fmsgid/" + addr
-	resp, err := http.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
+	if v, ok := fmsgIDCache.Load(addr); ok {
+		entry := v.(fmsgIDEntry)
+		if time.Now().Before(entry.expires) {
+			return entry.code, entry.acceptingNew, nil
+		}
+		fmsgIDCache.Delete(addr)
+	}
+
+	v, err, _ := fmsgIDGroup.Do(addr, func() (interface{}, error) {
+		// Re-check inside the singleflight in case another goroutine just
+		// populated the cache while we were waiting to enter.
+		if v, ok := fmsgIDCache.Load(addr); ok {
+			entry := v.(fmsgIDEntry)
+			if time.Now().Before(entry.expires) {
+				return fmsgIDResult{code: entry.code, acceptingNew: entry.acceptingNew}, nil
+			}
+		}
+		return fetchFmsgID(idURL, addr)
+	})
 	if err != nil {
 		return 0, false, err
+	}
+	res := v.(fmsgIDResult)
+	return res.code, res.acceptingNew, nil
+}
+
+// fetchFmsgID performs the actual HTTP call to fmsgid and stores positive
+// results in the cache.
+func fetchFmsgID(idURL, addr string) (fmsgIDResult, error) {
+	url := strings.TrimRight(idURL, "/") + "/fmsgid/" + addr
+	resp, err := fmsgIDClient.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
+	if err != nil {
+		return fmsgIDResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return http.StatusNotFound, false, nil
+		return fmsgIDResult{code: http.StatusNotFound}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return resp.StatusCode, false, nil
+		return fmsgIDResult{code: resp.StatusCode}, nil
 	}
 
 	var result struct {
 		AcceptingNew bool `json:"acceptingNew"`
 	}
 	if err := decodeJSON(resp.Body, &result); err != nil {
-		return http.StatusOK, true, nil // assume accepting if parse fails
+		return fmsgIDResult{code: http.StatusOK, acceptingNew: true}, nil // assume accepting if parse fails
 	}
-	return http.StatusOK, result.AcceptingNew, nil
+
+	fmsgIDCache.Store(addr, fmsgIDEntry{
+		expires:      time.Now().Add(fmsgIDCacheTTL),
+		code:         http.StatusOK,
+		acceptingNew: result.AcceptingNew,
+	})
+	return fmsgIDResult{code: http.StatusOK, acceptingNew: result.AcceptingNew}, nil
 }

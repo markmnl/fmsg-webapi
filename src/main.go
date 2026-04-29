@@ -45,8 +45,6 @@ func main() {
 
 	// Optional configuration with defaults.
 	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
-	rateLimit := envOrDefaultInt("FMSG_API_RATE_LIMIT", 10)
-	rateBurst := envOrDefaultInt("FMSG_API_RATE_BURST", 20)
 	maxDataSize := int64(envOrDefaultInt("FMSG_API_MAX_DATA_SIZE", 10)) * 1024 * 1024
 	maxAttachSize := int64(envOrDefaultInt("FMSG_API_MAX_ATTACH_SIZE", 10)) * 1024 * 1024
 	maxMsgSize := int64(envOrDefaultInt("FMSG_API_MAX_MSG_SIZE", 20)) * 1024 * 1024
@@ -88,8 +86,7 @@ func main() {
 		log.Printf("CORS enabled for origins: %s", strings.Join(corsOrigins, ", "))
 	}
 
-	// Global rate limiter.
-	router.Use(middleware.NewRateLimiter(ctx, float64(rateLimit), rateBurst))
+	// Global rate limiting is handled by nftables at the host level.
 
 	// Instantiate handlers.
 	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize)
