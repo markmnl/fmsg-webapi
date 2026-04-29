@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -221,11 +222,41 @@ func IsValidAddr(addr string) bool {
 	return strings.Contains(rest, "@")
 }
 
+// fmsgIDClient is a dedicated HTTP client with a bounded timeout so that a
+// slow or hung fmsgid never blocks an API request goroutine indefinitely
+// (which would otherwise hold the inbound HTTP connection open and exhaust
+// the browser's per-host connection limit).
+var fmsgIDClient = &http.Client{Timeout: 5 * time.Second}
+
+// fmsgIDCacheTTL is how long a positive fmsgid lookup is cached. Tokens are
+// re-validated every time, but the relatively expensive network round-trip to
+// fmsgid is short-circuited for this window. Negative results are not cached.
+const fmsgIDCacheTTL = 30 * time.Second
+
+type fmsgIDEntry struct {
+	expires      time.Time
+	code         int
+	acceptingNew bool
+}
+
+var fmsgIDCache sync.Map // map[string]fmsgIDEntry, key = addr
+
 // checkFmsgID queries the fmsgid service for a user address.
-// Returns (statusCode, acceptingNew, error).
+// Returns (statusCode, acceptingNew, error). Successful 200 responses are
+// cached for fmsgIDCacheTTL to avoid hammering fmsgid when a browser fires
+// many concurrent requests with the same JWT.
 func checkFmsgID(idURL, addr string) (int, bool, error) {
+	cacheKey := idURL + "|" + addr
+	if v, ok := fmsgIDCache.Load(cacheKey); ok {
+		entry := v.(fmsgIDEntry)
+		if time.Now().Before(entry.expires) {
+			return entry.code, entry.acceptingNew, nil
+		}
+		fmsgIDCache.Delete(cacheKey)
+	}
+
 	url := strings.TrimRight(idURL, "/") + "/fmsgid/" + addr
-	resp, err := http.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
+	resp, err := fmsgIDClient.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
 	if err != nil {
 		return 0, false, err
 	}
@@ -244,5 +275,11 @@ func checkFmsgID(idURL, addr string) (int, bool, error) {
 	if err := decodeJSON(resp.Body, &result); err != nil {
 		return http.StatusOK, true, nil // assume accepting if parse fails
 	}
+
+	fmsgIDCache.Store(cacheKey, fmsgIDEntry{
+		expires:      time.Now().Add(fmsgIDCacheTTL),
+		code:         http.StatusOK,
+		acceptingNew: result.AcceptingNew,
+	})
 	return http.StatusOK, result.AcceptingNew, nil
 }
