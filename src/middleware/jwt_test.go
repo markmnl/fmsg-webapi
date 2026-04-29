@@ -308,6 +308,7 @@ func TestEdDSAMode_Reuse(t *testing.T) {
 }
 
 func TestEdDSAMode_FmsgIDUnavailable(t *testing.T) {
+	fmsgIDCache.Delete("@alice@example.com")
 	srv := fmsgIDServer(t, http.StatusInternalServerError, false)
 	defer srv.Close()
 	priv, jwks := newEdDSAFixture(t)
