@@ -57,6 +57,8 @@ type messageListItem struct {
 	Type        string              `json:"type"`
 	Size        int                 `json:"size"`
 	ShortText   string              `json:"short_text,omitempty"`
+	Read        bool                `json:"read"`
+	TimeRead    *float64            `json:"time_read"`
 	Attachments []models.Attachment `json:"attachments"`
 }
 
@@ -189,7 +191,11 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
+		        COALESCE(
+		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1),
+		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
+		        ) AS time_read
 		 FROM msg m
 		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
 		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
@@ -209,12 +215,13 @@ func (h *MessageHandler) List(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
+		m.Read = m.TimeRead != nil
 		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
@@ -536,6 +543,23 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	// Compute ShortText only after authorization has been confirmed.
 	msg.ShortText = h.extractShortText(dataPath, msg.Type)
 
+	// Populate per-recipient read state for the calling user. The sender
+	// has no read state of their own.
+	if msg.From != identity {
+		var timeRead *float64
+		err := h.DB.Pool.QueryRow(ctx,
+			`SELECT COALESCE(
+			    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2),
+			    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)
+			 )`,
+			msgID, identity,
+		).Scan(&timeRead)
+		if err == nil {
+			msg.TimeRead = timeRead
+			msg.Read = timeRead != nil
+		}
+	}
+
 	c.JSON(http.StatusOK, msg)
 }
 
@@ -810,6 +834,75 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "time": now})
+}
+
+// MarkRead handles POST /fmsg/:id/read — marks a message as read by the
+// calling recipient. Idempotent: re-reading an already-read message returns
+// the original time_read without updating it.
+func (h *MessageHandler) MarkRead(c *gin.Context) {
+	identity := middleware.GetIdentity(c)
+	msgID, ok := parseID(c)
+	if !ok {
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Look up the caller's existing time_read across both recipient tables.
+	// COALESCE returns NULL if the user is not a recipient at all (in which
+	// case both subqueries return zero rows); we distinguish that case with
+	// an EXISTS check.
+	var existing *float64
+	var recipient bool
+	err := h.DB.Pool.QueryRow(ctx,
+		`SELECT
+		    COALESCE(
+		        (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2),
+		        (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)
+		    ),
+		    EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2)
+		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)`,
+		msgID, identity,
+	).Scan(&existing, &recipient)
+	if err != nil {
+		log.Printf("mark read %d: lookup: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark message read"})
+		return
+	}
+	if !recipient {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+	if existing != nil {
+		// Already read; return the original timestamp unchanged.
+		c.JSON(http.StatusOK, gin.H{"id": msgID, "time_read": *existing})
+		return
+	}
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	// Update whichever recipient row matches; only one of these will affect
+	// rows for any given (msg_id, addr) pair given the unique constraint on
+	// each table.
+	if _, err = h.DB.Pool.Exec(ctx,
+		`UPDATE msg_to SET time_read = $1
+		 WHERE msg_id = $2 AND addr = $3 AND time_read IS NULL`,
+		now, msgID, identity,
+	); err != nil {
+		log.Printf("mark read %d: update msg_to: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark message read"})
+		return
+	}
+	if _, err = h.DB.Pool.Exec(ctx,
+		`UPDATE msg_add_to SET time_read = $1
+		 WHERE msg_id = $2 AND addr = $3 AND time_read IS NULL`,
+		now, msgID, identity,
+	); err != nil {
+		log.Printf("mark read %d: update msg_add_to: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark message read"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"id": msgID, "time_read": now})
 }
 
 // addToInput is the JSON shape for the add-to request body.

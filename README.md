@@ -144,6 +144,7 @@ the application.
 | `PUT`    | `/fmsg/:id`                      | Update a draft message   |
 | `DELETE` | `/fmsg/:id`                      | Delete a draft message   |
 | `POST`   | `/fmsg/:id/send`                 | Send a message           |
+| `POST`   | `/fmsg/:id/read`                 | Mark a message as read   |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
 | `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
@@ -199,7 +200,7 @@ Returns messages where the authenticated user is a recipient (listed in `msg_to`
 | `limit`   | `20`    | Max messages to return (1–100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
-**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /fmsg/:id` (with an additional `id` field). Message body data and attachment contents are not included — use the dedicated download endpoints instead.
+**Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /fmsg/:id` (with an additional `id` field), including the `read`/`time_read` fields reflecting the caller's per-recipient read state. Message body data and attachment contents are not included — use the dedicated download endpoints instead.
 
 ### GET `/fmsg/sent`
 
@@ -272,9 +273,15 @@ Retrieves a single message by ID. The authenticated user must be a participant �
   "type": "text/plain",
   "size": 12,
   "short_text": "hello world",
+  "read": false,
+  "time_read": null,
   "attachments": []
 }
 ```
+
+The `read` and `time_read` fields reflect the calling user's per-recipient
+read state (set by `POST /fmsg/:id/read`). For the sender's own messages
+they are always `false`/`null` (read state is recipient-scoped).
 
 The `short_text` field is included only when the message `type` is `text/*` and
 the stored body is valid UTF-8. When `FMSG_API_SHORT_TEXT_SIZE` is greater than
@@ -328,6 +335,20 @@ Marks a draft message as sent by setting `time_sent` to the current timestamp. O
 | `403`  | Not the owner |
 | `404`  | Message not found |
 | `409`  | Message already sent |
+
+### POST `/fmsg/:id/read`
+
+Marks a message as read by the authenticated recipient by setting `time_read`
+on the caller's `msg_to` or `msg_add_to` row. Idempotent: re-reading an
+already-read message returns the original `time_read` without updating it.
+
+**Response:** `200 OK` with `{"id": <int>, "time_read": <float64>}`.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `404`  | Authenticated user is not a recipient of this message (or message does not exist) |
 
 ### POST `/fmsg/:id/add-to`
 

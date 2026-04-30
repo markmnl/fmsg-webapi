@@ -24,5 +24,7 @@ type Message struct {
 	Type        string       `json:"type"`
 	Size        int          `json:"size"`
 	ShortText   string       `json:"short_text,omitempty"`
+	Read        bool         `json:"read"`
+	TimeRead    *float64     `json:"time_read"`
 	Attachments []Attachment `json:"attachments"`
 }
