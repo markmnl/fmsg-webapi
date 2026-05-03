@@ -104,6 +104,7 @@ func main() {
 		fmsg.PUT("/:id", msgHandler.Update)
 		fmsg.DELETE("/:id", msgHandler.Delete)
 		fmsg.POST("/:id/send", msgHandler.Send)
+		fmsg.POST("/:id/read", msgHandler.MarkRead)
 		fmsg.POST("/:id/add-to", msgHandler.AddRecipients)
 		fmsg.GET("/:id/data", msgHandler.DownloadData)
 
