@@ -307,6 +307,45 @@ func TestEdDSAMode_Reuse(t *testing.T) {
 	}
 }
 
+func TestVerifier_Authenticate(t *testing.T) {
+	srv := fmsgIDServer(t, http.StatusOK, true)
+	defer srv.Close()
+	secret := []byte("dev-secret")
+	v, err := NewVerifier(Config{Mode: ModeHMAC, HMACKey: secret, IDURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+
+	// Valid token is accepted and yields the sub address.
+	tok := signHS256(t, secret, jwt.MapClaims{
+		"sub": "@alice@example.com",
+		"iat": time.Now().Unix(),
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	addr, status, _ := v.Authenticate(tok)
+	if status != http.StatusOK || addr != "@alice@example.com" {
+		t.Fatalf("valid token: got addr=%q status=%d, want @alice@example.com/200", addr, status)
+	}
+
+	// Token signed with the wrong secret is rejected.
+	bad := signHS256(t, []byte("wrong-secret"), jwt.MapClaims{
+		"sub": "@alice@example.com",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	if _, status, _ := v.Authenticate(bad); status != http.StatusUnauthorized {
+		t.Fatalf("bad signature: expected 401, got %d", status)
+	}
+
+	// Token with a malformed sub is rejected.
+	noaddr := signHS256(t, secret, jwt.MapClaims{
+		"sub": "not-an-address",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	if _, status, _ := v.Authenticate(noaddr); status != http.StatusUnauthorized {
+		t.Fatalf("invalid addr: expected 401, got %d", status)
+	}
+}
+
 func TestEdDSAMode_FmsgIDUnavailable(t *testing.T) {
 	fmsgIDCache.Delete("@alice@example.com")
 	srv := fmsgIDServer(t, http.StatusInternalServerError, false)

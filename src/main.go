@@ -73,6 +73,13 @@ func main() {
 		log.Fatalf("failed to initialise JWT middleware: %v", err)
 	}
 
+	// The WebSocket endpoint authenticates outside the Gin middleware chain,
+	// so it needs a directly callable verifier built from the same config.
+	jwtVerifier, err := middleware.NewVerifier(jwtCfg)
+	if err != nil {
+		log.Fatalf("failed to initialise JWT verifier: %v", err)
+	}
+
 	// Create Gin router.
 	router := gin.Default()
 
@@ -91,6 +98,13 @@ func main() {
 	// Instantiate handlers.
 	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
+
+	// WebSocket hub: a single dedicated PostgreSQL listener fans out
+	// new-message events to every connected client, so the number of clients
+	// does not consume connection-pool capacity.
+	hub := handlers.NewHub(msgHandler)
+	go hub.Run(context.Background())
+	wsHandler := handlers.NewWSHandler(jwtVerifier, hub, corsOrigins)
 
 	// Register routes under /fmsg, all protected by JWT.
 	fmsg := router.Group("/fmsg")
@@ -112,6 +126,12 @@ func main() {
 		fmsg.GET("/:id/attach/:filename", attHandler.Download)
 		fmsg.DELETE("/:id/attach/:filename", attHandler.DeleteAttachment)
 	}
+
+	// The WebSocket endpoint is registered outside the JWT-protected group:
+	// browsers cannot set an Authorization header on a WebSocket, so the
+	// handler authenticates itself via the access_token query parameter or
+	// an Authorization header.
+	router.GET("/fmsg/ws", wsHandler.Connect)
 
 	srv := &http.Server{
 		Handler:           router,

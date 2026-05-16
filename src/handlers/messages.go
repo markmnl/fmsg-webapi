@@ -1050,6 +1050,52 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	return msg, dataPath, nil
 }
 
+// messageItemFor builds the JSON list-item representation of a single message
+// for a given recipient, including the recipient's own read state. It is used
+// by the WebSocket hub to push newly arrived messages and produces the same
+// shape as items in the GET /fmsg list response.
+func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipient string) (*messageListItem, error) {
+	msg, dataPath, err := h.fetchMessage(ctx, msgID)
+	if err != nil {
+		return nil, err
+	}
+
+	item := &messageListItem{
+		ID:          msgID,
+		Version:     msg.Version,
+		HasPid:      msg.HasPid,
+		HasAddTo:    msg.HasAddTo,
+		Important:   msg.Important,
+		NoReply:     msg.NoReply,
+		Deflate:     msg.Deflate,
+		PID:         msg.PID,
+		From:        msg.From,
+		To:          msg.To,
+		AddTo:       msg.AddTo,
+		Time:        msg.Time,
+		Topic:       msg.Topic,
+		Type:        msg.Type,
+		Size:        msg.Size,
+		ShortText:   h.extractShortText(dataPath, msg.Type),
+		Attachments: msg.Attachments,
+	}
+
+	// Populate the recipient's per-recipient read state, mirroring Get.
+	var timeRead *float64
+	if err := h.DB.Pool.QueryRow(ctx,
+		`SELECT COALESCE(
+		    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2),
+		    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)
+		 )`,
+		msgID, recipient,
+	).Scan(&timeRead); err == nil {
+		item.TimeRead = timeRead
+		item.Read = timeRead != nil
+	}
+
+	return item, nil
+}
+
 // saveMessageData writes data to the filesystem and returns the absolute path.
 func (h *MessageHandler) saveMessageData(fromAddr string, msgID int64, ext, data string) (string, error) {
 	dir := msgDataDir(h.DataDir, fromAddr, msgID)
