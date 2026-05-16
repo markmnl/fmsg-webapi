@@ -18,6 +18,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/markmnl/fmsgd/pkg/fmsg"
 
 	"github.com/markmnl/fmsg-webapi/db"
 	"github.com/markmnl/fmsg-webapi/middleware"
@@ -806,7 +807,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	existing, _, err := h.fetchMessage(ctx, msgID)
+	existing, dataPath, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -826,8 +827,118 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
+	// Fetch psha256 (the parent message's sha256 hash used as the pid wire field).
+	var psha256 []byte
+	if existing.HasPid {
+		if err = h.DB.Pool.QueryRow(ctx, "SELECT psha256 FROM msg WHERE id = $1", msgID).Scan(&psha256); err != nil {
+			log.Printf("send message %d: fetch psha256: %v", msgID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve parent message hash"})
+			return
+		}
+		if len(psha256) != 32 {
+			log.Printf("send message %d: psha256 invalid length %d", msgID, len(psha256))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "parent message has no valid hash"})
+			return
+		}
+	}
+
+	// Fetch attachment metadata needed for hash computation.
+	type attachMeta struct {
+		flags    int16
+		typ      string
+		filename string
+		filesize int32
+		path     string
+	}
+	var attachments []attachMeta
+	attRows, err := h.DB.Pool.Query(ctx,
+		"SELECT flags, type, filename, filesize, filepath FROM msg_attachment WHERE msg_id = $1 ORDER BY position",
+		msgID,
+	)
+	if err != nil {
+		log.Printf("send message %d: fetch attachments: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve attachments"})
+		return
+	}
+	for attRows.Next() {
+		var a attachMeta
+		if scanErr := attRows.Scan(&a.flags, &a.typ, &a.filename, &a.filesize, &a.path); scanErr != nil {
+			attRows.Close()
+			log.Printf("send message %d: scan attachment: %v", msgID, scanErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read attachment data"})
+			return
+		}
+		attachments = append(attachments, a)
+	}
+	attRows.Close()
+	if err = attRows.Err(); err != nil {
+		log.Printf("send message %d: iterate attachments: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read attachment data"})
+		return
+	}
+
 	now := float64(time.Now().UnixMicro()) / 1e6
-	if _, err = h.DB.Pool.Exec(ctx, "UPDATE msg SET time_sent = $1 WHERE id = $2", now, msgID); err != nil {
+
+	// Build fmsg.Header for hash computation.
+	fromUser, fromDomain := parseAddr(existing.From)
+	hdr := fmsg.Header{
+		Version:   uint8(existing.Version),
+		From:      fmsg.Address{User: fromUser, Domain: fromDomain},
+		Timestamp: now,
+		Topic:     existing.Topic,
+		Type:      existing.Type,
+		Size:      uint32(existing.Size),
+		Filepath:  dataPath,
+	}
+
+	if existing.HasPid {
+		hdr.Flags |= fmsg.FlagHasPid
+		hdr.Pid = psha256
+	}
+	if existing.Important {
+		hdr.Flags |= fmsg.FlagImportant
+	}
+	if existing.NoReply {
+		hdr.Flags |= fmsg.FlagNoReply
+	}
+	if existing.HasAddTo {
+		hdr.Flags |= fmsg.FlagHasAddTo
+		for _, addr := range existing.AddTo {
+			u, d := parseAddr(addr)
+			hdr.AddTo = append(hdr.AddTo, fmsg.Address{User: u, Domain: d})
+		}
+		if existing.AddToFrom != nil {
+			u, d := parseAddr(*existing.AddToFrom)
+			hdr.AddToFrom = &fmsg.Address{User: u, Domain: d}
+		}
+	}
+
+	for _, addr := range existing.To {
+		u, d := parseAddr(addr)
+		hdr.To = append(hdr.To, fmsg.Address{User: u, Domain: d})
+	}
+
+	for _, a := range attachments {
+		hdr.Attachments = append(hdr.Attachments, fmsg.AttachmentHeader{
+			Flags:    uint8(a.flags),
+			Type:     a.typ,
+			Filename: a.filename,
+			Size:     uint32(a.filesize),
+			Filepath: a.path,
+		})
+	}
+
+	msgHash, err := hdr.GetMessageHash()
+	if err != nil {
+		log.Printf("send message %d: compute hash: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to compute message hash"})
+		return
+	}
+
+	if _, err = h.DB.Pool.Exec(ctx,
+		"UPDATE msg SET time_sent = $1, sha256 = $2 WHERE id = $3",
+		now, msgHash, msgID,
+	); err != nil {
 		log.Printf("send message %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send message"})
 		return
@@ -995,7 +1106,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 // after performing their own authorization checks.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, string, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, add_to_from, topic, type, size, filepath FROM msg WHERE id = $1`,
 		msgID,
 	)
 
@@ -1003,7 +1114,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	var pid *int64
 	var timeSent *float64
 	var dataPath string
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.AddToFrom, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
 		return nil, "", err
 	}
 	msg.PID = pid
