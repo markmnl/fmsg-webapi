@@ -830,7 +830,16 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	// Fetch psha256 (the parent message's sha256 hash used as the pid wire field).
 	var psha256 []byte
 	if existing.HasPid {
-		_ = h.DB.Pool.QueryRow(ctx, "SELECT psha256 FROM msg WHERE id = $1", msgID).Scan(&psha256)
+		if err = h.DB.Pool.QueryRow(ctx, "SELECT psha256 FROM msg WHERE id = $1", msgID).Scan(&psha256); err != nil {
+			log.Printf("send message %d: fetch psha256: %v", msgID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve parent message hash"})
+			return
+		}
+		if len(psha256) != 32 {
+			log.Printf("send message %d: psha256 invalid length %d", msgID, len(psha256))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "parent message has no valid hash"})
+			return
+		}
 	}
 
 	// Fetch attachment metadata needed for hash computation.
@@ -842,18 +851,30 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		path     string
 	}
 	var attachments []attachMeta
-	attRows, attErr := h.DB.Pool.Query(ctx,
+	attRows, err := h.DB.Pool.Query(ctx,
 		"SELECT flags, type, filename, filesize, filepath FROM msg_attachment WHERE msg_id = $1 ORDER BY position",
 		msgID,
 	)
-	if attErr == nil {
-		for attRows.Next() {
-			var a attachMeta
-			if scanErr := attRows.Scan(&a.flags, &a.typ, &a.filename, &a.filesize, &a.path); scanErr == nil {
-				attachments = append(attachments, a)
-			}
+	if err != nil {
+		log.Printf("send message %d: fetch attachments: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve attachments"})
+		return
+	}
+	for attRows.Next() {
+		var a attachMeta
+		if scanErr := attRows.Scan(&a.flags, &a.typ, &a.filename, &a.filesize, &a.path); scanErr != nil {
+			attRows.Close()
+			log.Printf("send message %d: scan attachment: %v", msgID, scanErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read attachment data"})
+			return
 		}
-		attRows.Close()
+		attachments = append(attachments, a)
+	}
+	attRows.Close()
+	if err = attRows.Err(); err != nil {
+		log.Printf("send message %d: iterate attachments: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read attachment data"})
+		return
 	}
 
 	now := float64(time.Now().UnixMicro()) / 1e6
