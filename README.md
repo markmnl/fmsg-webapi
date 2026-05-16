@@ -413,7 +413,7 @@ New addresses must be distinct among themselves (case-insensitive).
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Empty `add_to`, duplicate addresses, or target message has no `pid` |
+| `400`  | Empty `add_to` or duplicate addresses |
 | `403`  | Authenticated user is not an existing participant (sender or `to` recipient) |
 | `404`  | Message not found |
 
