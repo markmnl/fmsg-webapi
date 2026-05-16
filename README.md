@@ -126,10 +126,13 @@ The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
 The HTTP server is configured with `ReadHeaderTimeout: 10s`, `WriteTimeout: 65s`,
 and `IdleTimeout: 120s`. The write timeout exceeds the `/wait` endpoint's
 maximum long-poll duration (60 s) so connections are not dropped prematurely.
+These timeouts do not apply to `/fmsg/ws` connections: once upgraded, a
+WebSocket connection is hijacked from the HTTP server and kept alive by its own
+ping/pong heartbeat.
 
 ## API Routes
 
-All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header.
+All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header. The one exception is the WebSocket route `/fmsg/ws`, which additionally accepts the token via an `access_token` query parameter (browsers cannot set headers on a WebSocket).
 
 Rate limiting is enforced at the host level (e.g. `nftables`) rather than in
 the application.
@@ -139,6 +142,7 @@ the application.
 | `GET`    | `/fmsg`                          | List messages for user   |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/wait`                     | Long-poll for new messages |
+| `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
 | `PUT`    | `/fmsg/:id`                      | Update a draft message   |
@@ -187,6 +191,45 @@ loop:
     latestID = response.body.latest_id
     fetch and display GET /fmsg/<latestID>
   # on 204 or transient error: loop immediately (with brief back-off on error)
+```
+
+### GET `/fmsg/ws`
+
+Upgrades the connection to a WebSocket over which the server pushes events that
+pertain to the authenticated user. Intended for always-connected clients
+(browsers, desktop apps) as a more scalable alternative to long-polling
+`/fmsg/wait`: a single shared PostgreSQL listener fans events out to all
+connected clients, so the number of connections does not consume database
+connection-pool capacity.
+
+**Authentication:** the JWT is verified exactly as for the REST API. Supply it
+either as an `Authorization: Bearer <token>` header (non-browser clients) or as
+an `access_token` query parameter (browsers, which cannot set headers on a
+WebSocket). The handshake fails with `401`/`400`/`403`/`503` — the same statuses
+as the REST middleware — before the connection is upgraded.
+
+**Events:** every frame is a JSON envelope with a `type` discriminator so new
+event types can be added without breaking clients:
+
+```json
+{ "type": "new_msg", "data": { ...message... } }
+```
+
+| `type`     | `data` | Sent when |
+| ---------- | ------ | --------- |
+| `new_msg`  | A message object, same shape as an item in the `GET /fmsg` list response (includes `id`). | A new message arrives for the authenticated user. |
+
+A client only ever receives events for messages it is a participant on. The
+server sends periodic WebSocket pings; clients should respond with pongs (most
+WebSocket libraries do this automatically) to keep the connection alive.
+
+**Browser example:**
+```js
+const ws = new WebSocket(`wss://api.example.com/fmsg/ws?access_token=${jwt}`);
+ws.onmessage = (e) => {
+  const event = JSON.parse(e.data);
+  if (event.type === "new_msg") displayMessage(event.data);
+};
 ```
 
 ### GET `/fmsg`

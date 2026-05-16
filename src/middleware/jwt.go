@@ -63,18 +63,18 @@ type Config struct {
 	ClockSkew time.Duration
 }
 
-// New constructs the JWT verification middleware.
-//
-// The returned handler:
-//   - extracts a Bearer token from the Authorization header,
-//   - parses & verifies the signature according to cfg.Mode,
-//   - validates iss/aud/exp/nbf claims,
-//   - extracts sub as the user address and validates its shape,
-//   - calls fmsgid to confirm the user is known and accepting messages,
-//   - on success stores the address in the Gin context under IdentityKey.
-//
-// On failure the response is 400/401/403/503 with a JSON `{"error": "..."}` body.
-func New(cfg Config) (gin.HandlerFunc, error) {
+// Verifier verifies fmsg JWT bearer tokens. It is safe for concurrent use and
+// is shared by the Gin authentication middleware and the WebSocket handler,
+// which authenticates outside the Gin middleware chain (browsers cannot set an
+// Authorization header on a WebSocket connection).
+type Verifier struct {
+	parser  *jwt.Parser
+	keyFunc jwt.Keyfunc
+	idURL   string
+}
+
+// NewVerifier constructs a Verifier from the given configuration.
+func NewVerifier(cfg Config) (*Verifier, error) {
 	if cfg.ClockSkew == 0 {
 		cfg.ClockSkew = DefaultClockSkew
 	}
@@ -128,9 +128,69 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 	if cfg.Audience != "" {
 		parserOpts = append(parserOpts, jwt.WithAudience(cfg.Audience))
 	}
-	parser := jwt.NewParser(parserOpts...)
 
-	idURL := cfg.IDURL
+	return &Verifier{
+		parser:  jwt.NewParser(parserOpts...),
+		keyFunc: keyFunc,
+		idURL:   cfg.IDURL,
+	}, nil
+}
+
+// Authenticate parses & verifies a bearer token string, validates its claims,
+// and confirms via fmsgid that the user is known and accepting messages.
+//
+// On success it returns the user address and http.StatusOK. On failure it
+// returns the empty address, an HTTP status (400/401/403/503), and a
+// client-safe error message.
+func (v *Verifier) Authenticate(tokenStr string) (addr string, status int, msg string) {
+	claims := jwt.MapClaims{}
+	if _, err := v.parser.ParseWithClaims(tokenStr, claims, v.keyFunc); err != nil {
+		log.Printf("auth rejected: reason=parse_error err=%v", err)
+		return "", http.StatusUnauthorized, "invalid token"
+	}
+
+	addr, _ = claims["sub"].(string)
+	if !IsValidAddr(addr) {
+		log.Printf("auth rejected: reason=invalid_addr sub=%q", addr)
+		return "", http.StatusUnauthorized, "invalid identity"
+	}
+
+	code, accepting, err := checkFmsgID(v.idURL, addr)
+	if err != nil {
+		log.Printf("fmsgid check error for %s: %v", addr, err)
+		return "", http.StatusServiceUnavailable, "identity service unavailable"
+	}
+	switch {
+	case code == http.StatusNotFound:
+		log.Printf("auth rejected: addr=%s reason=not_found", addr)
+		return "", http.StatusBadRequest, fmt.Sprintf("User %s not found", addr)
+	case code == http.StatusOK && !accepting:
+		log.Printf("auth rejected: addr=%s reason=not_accepting", addr)
+		return "", http.StatusForbidden, fmt.Sprintf("User %s not authorised to send new messages", addr)
+	case code != http.StatusOK:
+		log.Printf("auth rejected: addr=%s reason=fmsgid_status=%d", addr, code)
+		return "", http.StatusServiceUnavailable, "identity service unavailable"
+	}
+
+	return addr, http.StatusOK, ""
+}
+
+// New constructs the JWT verification middleware.
+//
+// The returned handler:
+//   - extracts a Bearer token from the Authorization header,
+//   - parses & verifies the signature according to cfg.Mode,
+//   - validates iss/aud/exp/nbf claims,
+//   - extracts sub as the user address and validates its shape,
+//   - calls fmsgid to confirm the user is known and accepting messages,
+//   - on success stores the address in the Gin context under IdentityKey.
+//
+// On failure the response is 400/401/403/503 with a JSON `{"error": "..."}` body.
+func New(cfg Config) (gin.HandlerFunc, error) {
+	verifier, err := NewVerifier(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	return func(c *gin.Context) {
 		tokenStr, err := extractBearer(c.GetHeader("Authorization"))
@@ -139,38 +199,9 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 			return
 		}
 
-		claims := jwt.MapClaims{}
-		if _, err := parser.ParseWithClaims(tokenStr, claims, keyFunc); err != nil {
-			log.Printf("auth rejected: ip=%s reason=parse_error err=%v", c.ClientIP(), err)
-			respondAuth(c, http.StatusUnauthorized, "invalid token")
-			return
-		}
-
-		addr, _ := claims["sub"].(string)
-		if !IsValidAddr(addr) {
-			log.Printf("auth rejected: ip=%s reason=invalid_addr sub=%q", c.ClientIP(), addr)
-			respondAuth(c, http.StatusUnauthorized, "invalid identity")
-			return
-		}
-
-		code, accepting, err := checkFmsgID(idURL, addr)
-		if err != nil {
-			log.Printf("fmsgid check error for %s: %v", addr, err)
-			respondAuth(c, http.StatusServiceUnavailable, "identity service unavailable")
-			return
-		}
-		switch {
-		case code == http.StatusNotFound:
-			log.Printf("auth rejected: ip=%s addr=%s reason=not_found", c.ClientIP(), addr)
-			respondAuth(c, http.StatusBadRequest, fmt.Sprintf("User %s not found", addr))
-			return
-		case code == http.StatusOK && !accepting:
-			log.Printf("auth rejected: ip=%s addr=%s reason=not_accepting", c.ClientIP(), addr)
-			respondAuth(c, http.StatusForbidden, fmt.Sprintf("User %s not authorised to send new messages", addr))
-			return
-		case code != http.StatusOK:
-			log.Printf("auth rejected: ip=%s addr=%s reason=fmsgid_status=%d", c.ClientIP(), addr, code)
-			respondAuth(c, http.StatusServiceUnavailable, "identity service unavailable")
+		addr, status, msg := verifier.Authenticate(tokenStr)
+		if status != http.StatusOK {
+			respondAuth(c, status, msg)
 			return
 		}
 
