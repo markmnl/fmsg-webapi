@@ -30,3 +30,6 @@ The API routes table and each route's section must reflect the live code in
   whenever a message becomes sent/arrived. Do not rename or remove that trigger
   without updating the hub. The `new_msg_to` channel is the sender daemon's
   outbound delivery queue and is not used by this service.
+- For each `new_msg` notification the hub also dispatches a Web Push (when
+  VAPID is configured) to the recipient's `push_subscription` rows, so delivery
+  does not depend on a live WebSocket.

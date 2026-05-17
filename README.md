@@ -22,6 +22,10 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
 | `FMSG_API_SHORT_TEXT_SIZE`| `768`               | Maximum bytes of message body returned inline as `short_text` for `text/*` UTF-8 messages |
 | `FMSG_CORS_ORIGINS` | *(optional)*             | Comma-separated list of browser origins allowed via CORS, e.g. `https://example.com,https://www.example.com`. Use `*` to allow any origin. When unset, no CORS headers are emitted (server-to-server callers are unaffected). |
+| `FMSG_VAPID_PUBLIC_KEY` | *(optional)*         | VAPID public key (URL-safe base64) for Web Push. Browsers also pass this as `applicationServerKey`. Generate the pair once with `npx web-push generate-vapid-keys`. |
+| `FMSG_VAPID_PRIVATE_KEY` | *(optional)*        | VAPID private key (URL-safe base64) for Web Push. |
+| `FMSG_VAPID_SUBJECT` | *(optional)*            | VAPID `sub` contact, a `mailto:` or `https:` URL, e.g. `mailto:admin@example.com`. |
+| `FMSG_PUSH_ICON_URL` | `/icon-192.png`         | Icon URL placed in the Web Push payload. |
 
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
@@ -152,6 +156,11 @@ the application.
 | `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
 | `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
 | `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
+| `POST`   | `/fmsg/push/subscribe`           | Register a Web Push subscription |
+| `DELETE` | `/fmsg/push/subscribe`           | Remove a Web Push subscription   |
+
+The `/fmsg/push/subscribe` routes are registered only when Web Push is
+configured (see [Web Push](#web-push)).
 
 ### GET `/fmsg/ws`
 
@@ -432,3 +441,95 @@ Deletes an attachment from a draft message. Only the owner may delete, and the m
 | `400`  | Invalid filename |
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message or attachment not found |
+
+### POST `/fmsg/push/subscribe`
+
+Registers (or refreshes) a [Web Push](https://developer.mozilla.org/docs/Web/API/Push_API)
+subscription for the authenticated user. The subscription is keyed by
+`(user address, endpoint)` — POSTing the same endpoint again updates its keys.
+
+**Request body:** the browser's `PushSubscription.toJSON()` output. The
+`expirationTime` field is accepted but ignored.
+
+```json
+{
+  "endpoint": "https://fcm.googleapis.com/fcm/send/abc...",
+  "expirationTime": null,
+  "keys": { "p256dh": "BPx...", "auth": "k9..." }
+}
+```
+
+**Response:** `201 Created`.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `400`  | Malformed body, or missing `endpoint`/`keys.p256dh`/`keys.auth` |
+
+### DELETE `/fmsg/push/subscribe`
+
+Removes a Web Push subscription for the authenticated user. Idempotent —
+removing an unknown endpoint still returns success.
+
+**Request body:**
+
+```json
+{ "endpoint": "https://fcm.googleapis.com/fcm/send/abc..." }
+```
+
+**Response:** `204 No Content`.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `400`  | Malformed body, or missing `endpoint` |
+
+## Web Push
+
+When a `new_msg` event fires for a recipient (the same trigger that drives the
+`/fmsg/ws` WebSocket), the server also sends an encrypted [Web Push](https://developer.mozilla.org/docs/Web/API/Push_API)
+to every subscription that recipient has registered — so a user is notified
+even with no live WebSocket. The client service worker decides whether to
+display a notification; the server always sends.
+
+The push carries a JSON payload:
+
+```json
+{
+  "title": "@sender@example.com",
+  "body": "message preview text",
+  "threadId": 42,
+  "url": "/app3.html?thread=42",
+  "tag": "thread-42",
+  "icon": "/icon-192.png"
+}
+```
+
+`threadId`, `url` and `tag` reference the thread's **root** message id, so
+replies group with their thread. If a push service responds `404` or `410` the
+subscription is dead and is deleted automatically.
+
+**Enabling.** Web Push is active only when `FMSG_VAPID_PUBLIC_KEY`,
+`FMSG_VAPID_PRIVATE_KEY` and `FMSG_VAPID_SUBJECT` are all set; otherwise the
+`/fmsg/push/subscribe` routes are not registered and no pushes are sent.
+Generate the key pair once and keep it stable (rotating it invalidates every
+existing browser subscription):
+
+```
+npx web-push generate-vapid-keys
+```
+
+**Database.** Subscriptions are stored in a `push_subscription` table:
+
+```sql
+CREATE TABLE push_subscription (
+    addr       text        NOT NULL,
+    endpoint   text        NOT NULL,
+    p256dh     text        NOT NULL,
+    auth       text        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (addr, endpoint)
+);
+```
