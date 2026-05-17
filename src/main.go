@@ -110,7 +110,6 @@ func main() {
 	fmsg := router.Group("/fmsg")
 	fmsg.Use(jwtMiddleware)
 	{
-		fmsg.GET("/wait", msgHandler.Wait)
 		fmsg.GET("", msgHandler.List)
 		fmsg.GET("/sent", msgHandler.Sent)
 		fmsg.POST("", msgHandler.Create)
@@ -136,7 +135,7 @@ func main() {
 	srv := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      65 * time.Second, // must exceed /wait max timeout (60s)
+		WriteTimeout:      65 * time.Second, // generous, to allow large file transfers
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MB
 	}

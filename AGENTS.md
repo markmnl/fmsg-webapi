@@ -25,5 +25,8 @@ The API routes table and each route's section must reflect the live code in
 - Ensure all SQL in Go source files aligns with that schema.
 - When adding recipients via the `add-to` route, update `msg.add_to_from`
   in the same transaction as the `msg_add_to` inserts.
-- The `new_msg_to` LISTEN/NOTIFY channel is used by the `/wait` long-poll
-  endpoint. Do not rename or remove the trigger without updating the handler.
+- The WebSocket hub (`/fmsg/ws`) LISTENs on the `new_msg` LISTEN/NOTIFY channel
+  for push delivery. `new_msg` fires once per recipient (payload `<msg id>,<addr>`)
+  whenever a message becomes sent/arrived. Do not rename or remove that trigger
+  without updating the hub. The `new_msg_to` channel is the sender daemon's
+  outbound delivery queue and is not used by this service.
