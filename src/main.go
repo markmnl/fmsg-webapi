@@ -54,6 +54,16 @@ func main() {
 	// "https://fmsg.io,https://www.fmsg.io". Empty disables CORS.
 	corsOrigins := parseCSV(os.Getenv("FMSG_CORS_ORIGINS"))
 
+	// Web Push (VAPID) configuration. Push is enabled only when all three
+	// VAPID values are set; otherwise the subscribe routes are not registered
+	// and no pushes are sent. Generate the key pair once with
+	// `npx web-push generate-vapid-keys`.
+	vapidPublic := os.Getenv("FMSG_VAPID_PUBLIC_KEY")
+	vapidPrivate := os.Getenv("FMSG_VAPID_PRIVATE_KEY")
+	vapidSubject := os.Getenv("FMSG_VAPID_SUBJECT")
+	pushIconURL := envOrDefault("FMSG_PUSH_ICON_URL", "/icon-192.png")
+	pushEnabled := vapidPublic != "" && vapidPrivate != "" && vapidSubject != ""
+
 	// Connect to PostgreSQL (uses standard PG* environment variables).
 	ctx := context.Background()
 	database, err := db.New(ctx, "")
@@ -99,10 +109,24 @@ func main() {
 	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
+	// Web Push handler: stores subscriptions and delivers VAPID pushes for
+	// new-message events. Only instantiated when VAPID is configured.
+	var pushHandler *handlers.PushHandler
+	if pushEnabled {
+		pushHandler = handlers.NewPushHandler(database, msgHandler, vapidPublic, vapidPrivate, vapidSubject, pushIconURL)
+		log.Println("web push enabled")
+	} else {
+		log.Println("web push disabled (FMSG_VAPID_* not set)")
+	}
+
 	// WebSocket hub: a single dedicated PostgreSQL listener fans out
 	// new-message events to every connected client, so the number of clients
 	// does not consume connection-pool capacity.
 	hub := handlers.NewHub(msgHandler)
+	if pushHandler != nil {
+		// The hub also dispatches a Web Push for every new_msg notification.
+		hub.SetPushNotifier(pushHandler.NotifyNewMsg)
+	}
 	go hub.Run(context.Background())
 	wsHandler := handlers.NewWSHandler(jwtVerifier, hub, corsOrigins)
 
@@ -124,6 +148,11 @@ func main() {
 		fmsg.POST("/:id/attach", attHandler.Upload)
 		fmsg.GET("/:id/attach/:filename", attHandler.Download)
 		fmsg.DELETE("/:id/attach/:filename", attHandler.DeleteAttachment)
+
+		if pushHandler != nil {
+			fmsg.POST("/push/subscribe", pushHandler.Subscribe)
+			fmsg.DELETE("/push/subscribe", pushHandler.Unsubscribe)
+		}
 	}
 
 	// The WebSocket endpoint is registered outside the JWT-protected group:

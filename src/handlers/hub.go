@@ -35,10 +35,21 @@ type Hub struct {
 	// tested without a database.
 	buildItem func(ctx context.Context, msgID int64, recipient string) (*messageListItem, error)
 
+	// notifyPush, when non-nil, dispatches a Web Push for a new_msg
+	// notification. It runs independently of WebSocket fan-out so pushes are
+	// delivered even when the recipient has no live WebSocket.
+	notifyPush func(ctx context.Context, msgID int64, addr string)
+
 	mu sync.RWMutex
 	// registry maps a lower-cased user address to the set of that user's
 	// currently connected clients (a user may have several connections).
 	registry map[string]map[*wsClient]struct{}
+}
+
+// SetPushNotifier registers a Web Push dispatcher invoked for every new_msg
+// notification. It must be called before Run.
+func (h *Hub) SetPushNotifier(fn func(ctx context.Context, msgID int64, addr string)) {
+	h.notifyPush = fn
 }
 
 // NewHub creates a Hub that builds pushed message payloads via msgs.
@@ -124,6 +135,13 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 		if !ok {
 			log.Printf("ws hub: ignoring malformed notification payload %q", n.Payload)
 			continue
+		}
+		// Web Push runs in its own goroutine: it is network I/O to many
+		// endpoints and must not stall the single listener. It is dispatched
+		// here, alongside (not inside) dispatch, so a push is sent even when
+		// the recipient has no live WebSocket.
+		if h.notifyPush != nil {
+			go h.notifyPush(ctx, msgID, addr)
 		}
 		h.dispatch(ctx, msgID, addr)
 	}
