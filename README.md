@@ -124,11 +124,10 @@ go run .
 The server starts on port `8000` by default. Override with `FMSG_API_PORT`.
 
 The HTTP server is configured with `ReadHeaderTimeout: 10s`, `WriteTimeout: 65s`,
-and `IdleTimeout: 120s`. The write timeout exceeds the `/wait` endpoint's
-maximum long-poll duration (60 s) so connections are not dropped prematurely.
-These timeouts do not apply to `/fmsg/ws` connections: once upgraded, a
-WebSocket connection is hijacked from the HTTP server and kept alive by its own
-ping/pong heartbeat.
+and `IdleTimeout: 120s`. The write timeout is generous so large attachment
+transfers are not dropped prematurely. These timeouts do not apply to
+`/fmsg/ws` connections: once upgraded, a WebSocket connection is hijacked from
+the HTTP server and kept alive by its own ping/pong heartbeat.
 
 ## API Routes
 
@@ -141,7 +140,6 @@ the application.
 | -------- | ------------------------------------------- | ------------------------ |
 | `GET`    | `/fmsg`                          | List messages for user   |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
-| `GET`    | `/fmsg/wait`                     | Long-poll for new messages |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
@@ -155,51 +153,12 @@ the application.
 | `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
 | `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
 
-### GET `/fmsg/wait`
-
-Long-polls until a new message arrives for the authenticated user, then returns immediately. Intended for CLI and daemon clients that want near-instant delivery notification without polling.
-
-Uses PostgreSQL `LISTEN` on the `new_msg_to` channel — woken directly by the database trigger on new recipient rows.
-
-**Query parameters:**
-
-| Parameter  | Default | Description |
-| ---------- | ------- | ----------- |
-| `since_id` | `0`     | Only messages with `id` greater than this value are considered new |
-| `timeout`  | `25`    | Maximum seconds to wait before returning (1–60) |
-
-**Response:**
-
-| Status | Meaning |
-| ------ | ------- |
-| `200`  | New message available. Body: `{"has_new": true, "latest_id": <id>}`. Use `latest_id` with `GET /fmsg/<id>` to fetch the message. |
-| `204`  | Timeout elapsed — no new messages. Client should immediately re-issue the request. |
-
-**Errors:**
-
-| Status | Condition |
-| ------ | --------- |
-| `400`  | Invalid `since_id` or `timeout` |
-| `401`  | Missing or invalid JWT |
-
-**Client loop example:**
-```
-latestID = 0
-loop:
-  response = GET /fmsg/wait?since_id=<latestID>
-  if response.status == 200:
-    latestID = response.body.latest_id
-    fetch and display GET /fmsg/<latestID>
-  # on 204 or transient error: loop immediately (with brief back-off on error)
-```
-
 ### GET `/fmsg/ws`
 
 Upgrades the connection to a WebSocket over which the server pushes events that
 pertain to the authenticated user. Intended for always-connected clients
-(browsers, desktop apps) as a more scalable alternative to long-polling
-`/fmsg/wait`: a single shared PostgreSQL listener fans events out to all
-connected clients, so the number of connections does not consume database
+(browsers, desktop apps): a single shared PostgreSQL listener fans events out to
+all connected clients, so the number of connections does not consume database
 connection-pool capacity.
 
 **Authentication:** the JWT is verified exactly as for the REST API. Supply it

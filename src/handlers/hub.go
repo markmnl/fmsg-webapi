@@ -27,7 +27,7 @@ type wsEnvelope struct {
 
 // Hub maintains the set of connected WebSocket clients and fans out database
 // notifications to the clients they pertain to. A single dedicated PostgreSQL
-// connection LISTENs on new_msg_to for the whole process, so the number of
+// connection LISTENs on new_msg for the whole process, so the number of
 // connected clients does not affect the size of the database connection pool.
 type Hub struct {
 	// buildItem produces the message payload pushed for a notification. It is
@@ -97,7 +97,7 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// listen opens a dedicated connection, LISTENs on new_msg_to, and dispatches
+// listen opens a dedicated connection, LISTENs on new_msg, and dispatches
 // every notification until the connection fails or ctx is cancelled. onConnected
 // is invoked once the LISTEN has succeeded so the caller can reset its backoff.
 func (h *Hub) listen(ctx context.Context, onConnected func()) error {
@@ -109,10 +109,10 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	}
 	defer conn.Close(context.Background())
 
-	if _, err := conn.Exec(ctx, "LISTEN new_msg_to"); err != nil {
+	if _, err := conn.Exec(ctx, "LISTEN new_msg"); err != nil {
 		return err
 	}
-	log.Println("ws hub: listening on new_msg_to")
+	log.Println("ws hub: listening on new_msg")
 	onConnected()
 
 	for {
@@ -129,7 +129,7 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	}
 }
 
-// parseNotifyPayload parses a new_msg_to payload of the form "msgID,addr".
+// parseNotifyPayload parses a new_msg payload of the form "msgID,addr".
 func parseNotifyPayload(payload string) (msgID int64, addr string, ok bool) {
 	comma := strings.IndexByte(payload, ',')
 	if comma < 0 {
