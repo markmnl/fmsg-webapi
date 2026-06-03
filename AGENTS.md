@@ -21,7 +21,7 @@ The API routes table and each route's section must reflect the live code in
 
 ## Database
 
-- Schema source of truth: `https://github.com/markmnl/fmsgd/blob/main/dd.sql`
+- Schema source of truth: `https://github.com/markmnl/fmsgd/blob/add-to-batches/dd.sql`
 - Ensure all SQL in Go source files aligns with that schema.
 - When adding recipients via the `add-to` route, insert one `msg_add_to_batch`
   row (`add_to_from` = authenticated identity, plus `time_added`) and insert the

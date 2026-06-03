@@ -6,6 +6,14 @@ type Attachment struct {
 	Filename string `json:"filename"`
 }
 
+// AddToBatch represents a single add-to delivery: the recipients added in one
+// POST /fmsg/:id/add-to call, who added them (add_to_from), and when (time).
+type AddToBatch struct {
+	AddToFrom string   `json:"add_to_from"`
+	To        []string `json:"to"`
+	Time      float64  `json:"time"`
+}
+
 // Message represents a fmsg message as exchanged over the HTTP API.
 type Message struct {
 	Version     int          `json:"version"`
@@ -17,8 +25,7 @@ type Message struct {
 	PID         *int64       `json:"pid"`
 	From        string       `json:"from"`
 	To          []string     `json:"to"`
-	AddTo       []string     `json:"add_to"`
-	AddToFrom   *string      `json:"add_to_from"`
+	AddTo       []AddToBatch `json:"add_to"`
 	Time        *float64     `json:"time"`
 	Topic       string       `json:"topic"`
 	Type        string       `json:"type"`

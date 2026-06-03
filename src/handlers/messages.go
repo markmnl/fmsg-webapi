@@ -51,7 +51,7 @@ type messageListItem struct {
 	PID         *int64              `json:"pid"`
 	From        string              `json:"from"`
 	To          []string            `json:"to"`
-	AddTo       []string            `json:"add_to"`
+	AddTo       []models.AddToBatch `json:"add_to"`
 	Time        *float64            `json:"time"`
 	Topic       string              `json:"topic"`
 	Type        string              `json:"type"`
@@ -63,9 +63,14 @@ type messageListItem struct {
 }
 
 // messageInput is used for JSON binding on Create/Update — includes Data for the message body.
+// The outer AddTo field shadows models.Message.AddTo (same JSON name, shallower
+// depth wins), capturing any add_to in the body into an ignored value of any
+// shape. Recipients are only added via POST /fmsg/:id/add-to, never on
+// create/update, so add_to here is intentionally discarded.
 type messageInput struct {
 	models.Message
-	Data string `json:"data"`
+	AddTo any    `json:"add_to"`
+	Data  string `json:"data"`
 }
 
 // List handles GET /fmsg — lists messages where the authenticated user is a recipient.
@@ -141,25 +146,11 @@ func (h *MessageHandler) List(c *gin.Context) {
 		}
 	}
 
-	// Batch-load add_to recipients.
-	addToRows, err := h.DB.Pool.Query(ctx,
-		"SELECT msg_id, addr FROM msg_add_to WHERE msg_id = ANY($1)",
-		msgIDs,
-	)
-	if err == nil {
-		addToMap := make(map[int64][]string)
-		for addToRows.Next() {
-			var id int64
-			var addr string
-			if scanErr := addToRows.Scan(&id, &addr); scanErr == nil {
-				addToMap[id] = append(addToMap[id], addr)
-			}
-		}
-		addToRows.Close()
-		for i := range messages {
-			messages[i].AddTo = addToMap[messages[i].ID]
-			messages[i].HasAddTo = len(messages[i].AddTo) > 0
-		}
+	// Batch-load add_to batches.
+	addToMap := h.loadAddToBatches(ctx, msgIDs)
+	for i := range messages {
+		messages[i].AddTo = addToMap[messages[i].ID]
+		messages[i].HasAddTo = len(messages[i].AddTo) > 0
 	}
 
 	// Batch-load attachments.
@@ -257,25 +248,11 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 		}
 	}
 
-	// Batch-load add_to recipients.
-	addToRows, err := h.DB.Pool.Query(ctx,
-		"SELECT msg_id, addr FROM msg_add_to WHERE msg_id = ANY($1)",
-		msgIDs,
-	)
-	if err == nil {
-		addToMap := make(map[int64][]string)
-		for addToRows.Next() {
-			var id int64
-			var addr string
-			if scanErr := addToRows.Scan(&id, &addr); scanErr == nil {
-				addToMap[id] = append(addToMap[id], addr)
-			}
-		}
-		addToRows.Close()
-		for i := range messages {
-			messages[i].AddTo = addToMap[messages[i].ID]
-			messages[i].HasAddTo = len(messages[i].AddTo) > 0
-		}
+	// Batch-load add_to batches.
+	addToMap := h.loadAddToBatches(ctx, msgIDs)
+	for i := range messages {
+		messages[i].AddTo = addToMap[messages[i].ID]
+		messages[i].HasAddTo = len(messages[i].AddTo) > 0
 	}
 
 	// Batch-load attachments.
@@ -322,12 +299,12 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
-	if err := validateAddresses(msg.From, msg.To, msg.AddTo, msg.AddToFrom); err != nil {
+	if err := validateAddresses(msg.From, msg.To); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
+	if err := validatePidRelations(msg.PID, msg.Topic); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -424,7 +401,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	}
 
 	// Authorization: owner or recipient (to or add_to).
-	if msg.From != identity && !isRecipient(msg.To, identity) && !isRecipient(msg.AddTo, identity) {
+	if msg.From != identity && !isRecipient(msg.To, identity) && !addToContains(msg.AddTo, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
@@ -548,12 +525,12 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if err := validateAddresses(msg.From, msg.To, msg.AddTo, msg.AddToFrom); err != nil {
+	if err := validateAddresses(msg.From, msg.To); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := validatePidRelations(msg.PID, msg.Topic, msg.AddTo, msg.AddToFrom); err != nil {
+	if err := validatePidRelations(msg.PID, msg.Topic); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -905,6 +882,51 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
 }
 
+// loadAddToBatches loads the add-to batches for the given messages, keyed by
+// msg_id. Each batch carries who added the recipients (add_to_from), when
+// (time_added), and the recipients themselves. A LEFT JOIN is used so a batch
+// whose addresses were all already present still records the provenance of the
+// add-to. Batches are ordered by their insertion order (batch id).
+func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) map[int64][]models.AddToBatch {
+	result := make(map[int64][]models.AddToBatch)
+	rows, err := h.DB.Pool.Query(ctx,
+		`SELECT b.msg_id, b.id, b.add_to_from, b.time_added, mat.addr
+		 FROM msg_add_to_batch b
+		 LEFT JOIN msg_add_to mat ON mat.batch_id = b.id
+		 WHERE b.msg_id = ANY($1)
+		 ORDER BY b.id, mat.id`,
+		msgIDs,
+	)
+	if err != nil {
+		log.Printf("load add_to batches: %v", err)
+		return result
+	}
+	defer rows.Close()
+
+	// Track the slice index of each batch so addresses append to the right one.
+	idx := make(map[int64]int)
+	for rows.Next() {
+		var msgID, batchID int64
+		var addToFrom string
+		var timeAdded float64
+		var addr *string
+		if err := rows.Scan(&msgID, &batchID, &addToFrom, &timeAdded, &addr); err != nil {
+			log.Printf("load add_to batches scan: %v", err)
+			continue
+		}
+		i, ok := idx[batchID]
+		if !ok {
+			result[msgID] = append(result[msgID], models.AddToBatch{AddToFrom: addToFrom, Time: timeAdded})
+			i = len(result[msgID]) - 1
+			idx[batchID] = i
+		}
+		if addr != nil {
+			result[msgID][i].To = append(result[msgID][i].To, *addr)
+		}
+	}
+	return result
+}
+
 // fetchMessage loads a message with its recipients and attachments from the DB.
 // It also returns the raw filepath stored in the database so callers can use it
 // after performing their own authorization checks.
@@ -937,17 +959,8 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 		rows.Close()
 	}
 
-	// Load add_to recipients.
-	addToRows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_add_to WHERE msg_id = $1", msgID)
-	if err == nil {
-		for addToRows.Next() {
-			var addr string
-			if scanErr := addToRows.Scan(&addr); scanErr == nil {
-				msg.AddTo = append(msg.AddTo, addr)
-			}
-		}
-		addToRows.Close()
-	}
+	// Load add_to batches.
+	msg.AddTo = h.loadAddToBatches(ctx, []int64{msgID})[msgID]
 	msg.HasAddTo = len(msg.AddTo) > 0
 
 	// Load attachments.
@@ -1117,6 +1130,17 @@ func isRecipient(to []string, addr string) bool {
 	return false
 }
 
+// addToContains reports whether addr is a recipient in any add-to batch
+// (case-insensitive).
+func addToContains(batches []models.AddToBatch, addr string) bool {
+	for _, b := range batches {
+		if isRecipient(b.To, addr) {
+			return true
+		}
+	}
+	return false
+}
+
 // isZip reports whether data starts with the zip local file header signature.
 func isZip(data []byte) bool {
 	return len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4b && data[2] == 0x03 && data[3] == 0x04
@@ -1207,9 +1231,10 @@ func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
 	return string(buf)
 }
 
-// validateAddresses returns an error if any of the provided fmsg address
-// fields is not a valid "@user@domain" address. addToFrom is optional.
-func validateAddresses(from string, to, addTo []string, addToFrom *string) error {
+// validateAddresses returns an error if the from address or any to address is
+// not a valid "@user@domain" address. (add_to recipients are validated by the
+// add-to route, not on create/update.)
+func validateAddresses(from string, to []string) error {
 	if !middleware.IsValidAddr(from) {
 		return fmt.Errorf("invalid from address: %q", from)
 	}
@@ -1218,32 +1243,14 @@ func validateAddresses(from string, to, addTo []string, addToFrom *string) error
 			return fmt.Errorf("invalid to address: %q", addr)
 		}
 	}
-	for _, addr := range addTo {
-		if !middleware.IsValidAddr(addr) {
-			return fmt.Errorf("invalid add_to address: %q", addr)
-		}
-	}
-	if addToFrom != nil && *addToFrom != "" && !middleware.IsValidAddr(*addToFrom) {
-		return fmt.Errorf("invalid add_to_from address: %q", *addToFrom)
-	}
 	return nil
 }
 
-// validatePidRelations enforces:
-//   - If pid is set, topic must be empty (replies inherit topic from parent).
-//   - If pid is not set, add_to and add_to_from must be empty (a thread
-//     must exist before recipients can be added to it).
-func validatePidRelations(pid *int64, topic string, addTo []string, addToFrom *string) error {
+// validatePidRelations enforces that if pid is set, topic must be empty
+// (replies inherit their topic from the parent).
+func validatePidRelations(pid *int64, topic string) error {
 	if pid != nil && topic != "" {
 		return fmt.Errorf("topic must be empty when pid is supplied")
-	}
-	if pid == nil {
-		if len(addTo) > 0 {
-			return fmt.Errorf("add_to is only valid when pid is supplied")
-		}
-		if addToFrom != nil && *addToFrom != "" {
-			return fmt.Errorf("add_to_from is only valid when pid is supplied")
-		}
 	}
 	return nil
 }
