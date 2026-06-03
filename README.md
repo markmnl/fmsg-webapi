@@ -232,7 +232,7 @@ This includes both sent messages and drafts (`time_sent` may be `NULL`).
 
 Creates a draft message. The `from` address must match the authenticated user. The message is stored with `time_sent = NULL` (draft status) until explicitly sent.
 
-When `add_to` recipients are provided, `add_to_from` is automatically populated from the authenticated identity.
+Add-to recipients are not part of this body â€” they are added later via `POST /fmsg/:id/add-to`. Any `add_to` field sent here is ignored.
 
 **Request body (JSON):**
 
@@ -247,7 +247,6 @@ When `add_to` recipients are provided, `add_to_from` is automatically populated 
 | `size`      | `int`      | yes      | Data size in bytes |
 | `important` | `bool`     | no       | Mark message as important |
 | `no_reply`  | `bool`     | no       | Indicate replies will be discarded |
-| `add_to`    | `string[]` | no       | Additional recipients for add-to semantics |
 | `data`      | `string`   | no       | Message body content |
 
 **Response:** `201 Created` with `{"id": <int>}`.
@@ -256,7 +255,7 @@ When `add_to` recipients are provided, `add_to_from` is automatically populated 
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Missing/invalid fields, empty `to`, `topic` set together with `pid`, or `add_to`/`add_to_from` set without `pid` |
+| `400`  | Missing/invalid fields, empty `to`, or `topic` set together with `pid` |
 | `403`  | `from` does not match authenticated user |
 
 ### GET `/fmsg/:id`
@@ -277,8 +276,13 @@ Retrieves a single message by ID. The authenticated user must be a participant â
   "pid": null,
   "from": "@alice@example.com",
   "to": ["@bob@example.com"],
-  "add_to": [],
-  "add_to_from": null,
+  "add_to": [
+    {
+      "add_to_from": "@bob@example.com",
+      "to": ["@carol@example.com", "@dave@example.com"],
+      "time": 1717459200.123
+    }
+  ],
   "time": null,
   "topic": "Hello",
   "type": "text/plain",
@@ -289,6 +293,11 @@ Retrieves a single message by ID. The authenticated user must be a participant â
   "attachments": []
 }
 ```
+
+`add_to` is an array of add-to batches, one per `POST /fmsg/:id/add-to` call.
+Each batch records who added the recipients (`add_to_from`), the recipients
+added (`to`), and when the add-to happened (`time`, seconds since the Unix
+epoch). `has_add_to` is `true` when the array is non-empty.
 
 The `read` and `time_read` fields reflect the calling user's per-recipient
 read state (set by `POST /fmsg/:id/read`). For the sender's own messages
@@ -316,7 +325,7 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Invalid fields, `topic` set together with `pid`, or `add_to`/`add_to_from` set without `pid` |
+| `400`  | Invalid fields, or `topic` set together with `pid` |
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 
@@ -365,7 +374,7 @@ already-read message returns the original `time_read` without updating it.
 
 Adds additional recipients to an existing message. The authenticated user must be an existing participant â€” the sender (`from`) or a primary recipient (listed in `to`).
 
-This endpoint updates the message `add_to_from` field to the authenticated identity in the same transaction as the `msg_add_to` inserts.
+This endpoint records the add-to as a new `msg_add_to_batch` row (capturing the authenticated identity as `add_to_from` and a timestamp) and inserts the recipients into `msg_add_to` referencing that batch â€” all in a single transaction.
 
 **Request body (JSON):**
 
