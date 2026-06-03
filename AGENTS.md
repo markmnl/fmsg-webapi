@@ -23,8 +23,9 @@ The API routes table and each route's section must reflect the live code in
 
 - Schema source of truth: `https://github.com/markmnl/fmsgd/blob/main/dd.sql`
 - Ensure all SQL in Go source files aligns with that schema.
-- When adding recipients via the `add-to` route, update `msg.add_to_from`
-  in the same transaction as the `msg_add_to` inserts.
+- When adding recipients via the `add-to` route, insert one `msg_add_to_batch`
+  row (`add_to_from` = authenticated identity, plus `time_added`) and insert the
+  `msg_add_to` rows with that batch's `batch_id`, all in the same transaction.
 - The WebSocket hub (`/fmsg/ws`) LISTENs on the `new_msg` LISTEN/NOTIFY channel
   for push delivery. `new_msg` fires once per recipient (payload `<msg id>,<addr>`)
   whenever a message becomes sent/arrived. Do not rename or remove that trigger

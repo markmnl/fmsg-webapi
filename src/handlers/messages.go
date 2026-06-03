@@ -871,23 +871,29 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 
+	// Each add-to is recorded as a batch row capturing who added the recipients
+	// and when, then the recipients are inserted referencing that batch.
+	now := float64(time.Now().UnixMicro()) / 1e6
+	var batchID int64
+	if err = tx.QueryRow(ctx,
+		`INSERT INTO msg_add_to_batch (msg_id, add_to_from, time_added)
+		 VALUES ($1, $2, $3) RETURNING id`,
+		msgID, identity, now,
+	).Scan(&batchID); err != nil {
+		log.Printf("add recipients: insert batch for msg %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+		return
+	}
+
 	for _, addr := range input.AddTo {
 		if _, err = tx.Exec(ctx,
-			"INSERT INTO msg_add_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-			msgID, addr,
+			"INSERT INTO msg_add_to (msg_id, batch_id, addr) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+			msgID, batchID, addr,
 		); err != nil {
 			log.Printf("add recipients: insert %s into msg %d: %v", addr, msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
 			return
 		}
-	}
-
-	if _, err = tx.Exec(ctx,
-		"UPDATE msg SET add_to_from = $1 WHERE id = $2", identity, msgID,
-	); err != nil {
-		log.Printf("add recipients: update add_to_from for msg %d: %v", msgID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
-		return
 	}
 
 	if err = tx.Commit(ctx); err != nil {

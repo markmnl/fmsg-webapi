@@ -365,7 +365,7 @@ already-read message returns the original `time_read` without updating it.
 
 Adds additional recipients to an existing message. The authenticated user must be an existing participant — the sender (`from`) or a primary recipient (listed in `to`).
 
-This endpoint updates the message `add_to_from` field to the authenticated identity in the same transaction as the `msg_add_to` inserts.
+This endpoint records the add-to as a new `msg_add_to_batch` row (capturing the authenticated identity as `add_to_from` and a timestamp) and inserts the recipients into `msg_add_to` referencing that batch — all in a single transaction.
 
 **Request body (JSON):**
 
