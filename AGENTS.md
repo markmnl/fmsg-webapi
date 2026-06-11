@@ -2,11 +2,12 @@
 
 ## General
 
-- This is a Go HTTP API backed by PostgreSQL. Source lives under `src/`.
-- Build: `cd src && go build ./...`
-- Test: `cd src && go test ./...`
+- This is a Go HTTP API backed by PostgreSQL. The executable entrypoint lives under `cmd/fmsg-webapi/`, with application packages under `internal/`.
+- Build: `go build ./...`
+- Test: `go test ./...`
 - Always run tests after making code changes to verify nothing is broken.
 - This repository is an open-source implementation and not tied to one specific deployment - config should come from the environment
+- Check sensitive files are not accidentally committed to git, e.g .env should NEVER be
 
 ## README
 
@@ -18,7 +19,7 @@
 - Change build or run instructions.
 
 The API routes table and each route's section must reflect the live code in
-`src/main.go` and `src/handlers/`.
+`cmd/fmsg-webapi/main.go` and `internal/handlers/`.
 
 ## Database
 
