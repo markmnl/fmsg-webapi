@@ -19,9 +19,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/markmnl/fmsg-webapi/db"
-	"github.com/markmnl/fmsg-webapi/middleware"
-	"github.com/markmnl/fmsg-webapi/models"
+	"github.com/markmnl/fmsg-webapi/internal/db"
+	"github.com/markmnl/fmsg-webapi/internal/middleware"
+	"github.com/markmnl/fmsg-webapi/internal/models"
 )
 
 // MessageHandler holds dependencies for message routes.

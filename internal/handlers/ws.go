@@ -10,7 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
-	"github.com/markmnl/fmsg-webapi/middleware"
+	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
 // WebSocket tuning constants.

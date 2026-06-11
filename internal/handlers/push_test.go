@@ -8,7 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/markmnl/fmsg-webapi/middleware"
+	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
 func TestShouldPrune(t *testing.T) {

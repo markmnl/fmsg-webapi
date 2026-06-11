@@ -79,14 +79,12 @@ shared secret in `FMSG_API_JWT_SECRET`. Required claims are `sub` and `exp`;
 Requires **Go 1.25** or newer.
 
 ```bash
-cd src
 go build ./...
 ```
 
 ## Testing
 
 ```bash
-cd src
 go test ./...
 ```
 
@@ -110,8 +108,7 @@ export PGUSER=fmsg
 export PGPASSWORD=secret
 export PGDATABASE=fmsg
 
-cd src
-go run .
+go run ./cmd/fmsg-webapi
 ```
 
 ### Plain HTTP mode (development / reverse proxy)
@@ -131,8 +128,7 @@ export PGUSER=fmsg
 export PGPASSWORD=secret
 export PGDATABASE=fmsg
 
-cd src
-go run .
+go run ./cmd/fmsg-webapi
 ```
 
 The server starts on port `8000` by default. Override with `FMSG_API_PORT`.

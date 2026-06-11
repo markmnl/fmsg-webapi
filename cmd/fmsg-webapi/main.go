@@ -16,9 +16,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
-	"github.com/markmnl/fmsg-webapi/db"
-	"github.com/markmnl/fmsg-webapi/handlers"
-	"github.com/markmnl/fmsg-webapi/middleware"
+	"github.com/markmnl/fmsg-webapi/internal/db"
+	"github.com/markmnl/fmsg-webapi/internal/handlers"
+	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
 func main() {

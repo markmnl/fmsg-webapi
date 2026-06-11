@@ -13,12 +13,10 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: src/go.mod
+          go-version-file: go.mod
 
       - name: Build
-        working-directory: src
         run: go build ./...
 
       - name: Test
-        working-directory: src
         run: go test ./...

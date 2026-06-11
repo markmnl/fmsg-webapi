@@ -13,8 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/markmnl/fmsg-webapi/db"
-	"github.com/markmnl/fmsg-webapi/middleware"
+	"github.com/markmnl/fmsg-webapi/internal/db"
+	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
 // AttachmentHandler holds dependencies for attachment routes.
