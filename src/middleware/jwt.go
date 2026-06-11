@@ -30,30 +30,35 @@ const (
 	// ModeHMAC verifies HS256 tokens with a shared symmetric secret.
 	// Intended for development and testing.
 	ModeHMAC Mode = iota
-	// ModeEdDSA verifies EdDSA (Ed25519) tokens whose public keys are
-	// served by an external IdP via JWKS.
-	ModeEdDSA
+	// ModeRS256 verifies RS256 JWTs whose public keys are served via JWKS.
+	ModeRS256
 )
 
 // Config configures the JWT middleware.
 type Config struct {
-	// Mode selects HMAC (dev) or EdDSA (prod) verification.
+	// Mode selects HMAC (dev) or RS256 (prod) verification.
 	Mode Mode
 
 	// HMACKey is the symmetric secret bytes (required when Mode == ModeHMAC).
 	HMACKey []byte
 
-	// JWKS resolves Ed25519 public keys (typically by token header `kid`).
-	// Required when Mode == ModeEdDSA.
+	// JWKS resolves RSA public keys (typically by token header `kid`).
+	// Required when Mode == ModeRS256.
 	JWKS jwt.Keyfunc
 
 	// Issuer, when non-empty, is required to match the token `iss` claim.
-	// Mandatory in EdDSA mode.
+	// Mandatory in RS256 mode.
 	Issuer string
 
 	// Audience, when non-empty, is required to be present in the token
-	// `aud` claim. Optional.
+	// `aud` claim. Mandatory in RS256 mode to pin tokens to the configured
+	// application or API.
 	Audience string
+
+	// AddressClaim is the JWT claim name carrying the user's fmsg address.
+	// Mandatory in RS256 mode because external identity providers usually
+	// put provider-specific identifiers in `sub`.
+	AddressClaim string
 
 	// IDURL is the base URL of the fmsgid identity service.
 	IDURL string
@@ -68,9 +73,11 @@ type Config struct {
 // which authenticates outside the Gin middleware chain (browsers cannot set an
 // Authorization header on a WebSocket connection).
 type Verifier struct {
-	parser  *jwt.Parser
-	keyFunc jwt.Keyfunc
-	idURL   string
+	mode         Mode
+	parser       *jwt.Parser
+	keyFunc      jwt.Keyfunc
+	idURL        string
+	addressClaim string
 }
 
 // NewVerifier constructs a Verifier from the given configuration.
@@ -97,17 +104,23 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 			}
 			return key, nil
 		}
-	case ModeEdDSA:
+	case ModeRS256:
 		if cfg.JWKS == nil {
-			return nil, errors.New("middleware: EdDSA mode requires a JWKS keyfunc")
+			return nil, errors.New("middleware: RS256 mode requires a JWKS keyfunc")
 		}
 		if cfg.Issuer == "" {
-			return nil, errors.New("middleware: EdDSA mode requires an Issuer")
+			return nil, errors.New("middleware: RS256 mode requires an Issuer")
 		}
-		validMethods = []string{jwt.SigningMethodEdDSA.Alg()}
+		if cfg.Audience == "" {
+			return nil, errors.New("middleware: RS256 mode requires an Audience")
+		}
+		if cfg.AddressClaim == "" {
+			return nil, errors.New("middleware: RS256 mode requires an AddressClaim")
+		}
+		validMethods = []string{jwt.SigningMethodRS256.Alg()}
 		jwks := cfg.JWKS
 		keyFunc = func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
+			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 			}
 			return jwks(t)
@@ -130,14 +143,21 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 	}
 
 	return &Verifier{
-		parser:  jwt.NewParser(parserOpts...),
-		keyFunc: keyFunc,
-		idURL:   cfg.IDURL,
+		mode:         cfg.Mode,
+		parser:       jwt.NewParser(parserOpts...),
+		keyFunc:      keyFunc,
+		idURL:        cfg.IDURL,
+		addressClaim: cfg.AddressClaim,
 	}, nil
 }
 
 // Authenticate parses & verifies a bearer token string, validates its claims,
-// and confirms via fmsgid that the user is known and accepting messages.
+// derives the user's fmsg address, and confirms via fmsgid that the user is
+// known and accepting messages.
+//
+// The address is derived per mode: in RS256 mode the address comes from the
+// configured address claim because `sub` is usually a provider-specific
+// identifier; in HMAC dev mode the `sub` claim is the address.
 //
 // On success it returns the user address and http.StatusOK. On failure it
 // returns the empty address, an HTTP status (400/401/403/503), and a
@@ -149,9 +169,23 @@ func (v *Verifier) Authenticate(tokenStr string) (addr string, status int, msg s
 		return "", http.StatusUnauthorized, "invalid token"
 	}
 
-	addr, _ = claims["sub"].(string)
+	switch v.mode {
+	case ModeRS256:
+		// The token is valid and the user authenticated; a missing address
+		// claim just means no fmsg account exists yet, so respond 403
+		// rather than 401 (which would trigger client token refreshes).
+		addr, _ = claims[v.addressClaim].(string)
+		if addr == "" {
+			sub, _ := claims["sub"].(string)
+			log.Printf("auth rejected: reason=no_address_claim claim=%q sub=%q", v.addressClaim, sub)
+			return "", http.StatusForbidden, "no fmsg account for this identity"
+		}
+	default:
+		addr, _ = claims["sub"].(string)
+	}
+
 	if !IsValidAddr(addr) {
-		log.Printf("auth rejected: reason=invalid_addr sub=%q", addr)
+		log.Printf("auth rejected: reason=invalid_addr addr=%q", addr)
 		return "", http.StatusUnauthorized, "invalid identity"
 	}
 
@@ -181,7 +215,8 @@ func (v *Verifier) Authenticate(tokenStr string) (addr string, status int, msg s
 //   - extracts a Bearer token from the Authorization header,
 //   - parses & verifies the signature according to cfg.Mode,
 //   - validates iss/aud/exp/nbf claims,
-//   - extracts sub as the user address and validates its shape,
+//   - derives the user address (RS256: the configured address claim;
+//     HMAC: the sub claim) and validates its shape,
 //   - calls fmsgid to confirm the user is known and accepting messages,
 //   - on success stores the address in the Gin context under IdentityKey.
 //

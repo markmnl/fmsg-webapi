@@ -12,8 +12,8 @@ import (
 // CORSConfig configures the CORS middleware.
 type CORSConfig struct {
 	// AllowedOrigins is the list of exact origins permitted to access the API
-	// from a browser, e.g. "https://fmsg.io". A single entry of "*" allows any
-	// origin (only valid when credentials are not used). An empty list
+	// from a browser, e.g. "https://app.example.com". A single entry of "*"
+	// allows any origin (only valid when credentials are not used). An empty list
 	// disables CORS entirely.
 	AllowedOrigins []string
 	// AllowedMethods are the HTTP methods returned in the preflight response.

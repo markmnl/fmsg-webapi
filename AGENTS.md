@@ -6,10 +6,11 @@
 - Build: `cd src && go build ./...`
 - Test: `cd src && go test ./...`
 - Always run tests after making code changes to verify nothing is broken.
+- This repository is an open-source implementation and not tied to one specific deployment - config should come from the environment
 
 ## README
 
-**Keep `README.md` up to date whenever you:**
+**Keep `README.md` up to date and concise whenever you:**
 
 - Add, remove, or rename a route.
 - Change a route's query parameters, request body, or response shape.
@@ -21,7 +22,7 @@ The API routes table and each route's section must reflect the live code in
 
 ## Database
 
-- Schema source of truth: `https://github.com/markmnl/fmsgd/blob/add-to-batches/dd.sql`
+- Schema source of truth: `https://github.com/markmnl/fmsgd/blob/main/dd.sql`
 - Ensure all SQL in Go source files aligns with that schema.
 - When adding recipients via the `add-to` route, insert one `msg_add_to_batch`
   row (`add_to_from` = authenticated identity, plus `time_added`) and insert the
