@@ -23,7 +23,7 @@ func newCORSTestRouter(origins []string) *gin.Engine {
 }
 
 func TestCORS_NoOriginPassesThrough(t *testing.T) {
-	r := newCORSTestRouter([]string{"https://fmsg.io"})
+	r := newCORSTestRouter([]string{"https://app.example.com"})
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
 	r.ServeHTTP(w, req)
@@ -37,17 +37,17 @@ func TestCORS_NoOriginPassesThrough(t *testing.T) {
 }
 
 func TestCORS_AllowedOriginGetsHeaders(t *testing.T) {
-	r := newCORSTestRouter([]string{"https://fmsg.io"})
+	r := newCORSTestRouter([]string{"https://app.example.com"})
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
-	req.Header.Set("Origin", "https://fmsg.io")
+	req.Header.Set("Origin", "https://app.example.com")
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://fmsg.io" {
-		t.Errorf("Access-Control-Allow-Origin = %q, want https://fmsg.io", got)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want https://app.example.com", got)
 	}
 	if got := w.Header().Get("Vary"); got == "" {
 		t.Errorf("Vary header missing")
@@ -55,7 +55,7 @@ func TestCORS_AllowedOriginGetsHeaders(t *testing.T) {
 }
 
 func TestCORS_DisallowedOriginGetsNoHeaders(t *testing.T) {
-	r := newCORSTestRouter([]string{"https://fmsg.io"})
+	r := newCORSTestRouter([]string{"https://app.example.com"})
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
 	req.Header.Set("Origin", "https://evil.example")
@@ -72,7 +72,7 @@ func TestCORS_DisallowedOriginGetsNoHeaders(t *testing.T) {
 func TestCORS_PreflightShortCircuits(t *testing.T) {
 	r := gin.New()
 	cfg := DefaultCORSConfig()
-	cfg.AllowedOrigins = []string{"https://fmsg.io"}
+	cfg.AllowedOrigins = []string{"https://app.example.com"}
 	r.Use(NewCORS(cfg))
 	// Downstream middleware that would reject if reached.
 	r.Use(func(c *gin.Context) {
@@ -82,7 +82,7 @@ func TestCORS_PreflightShortCircuits(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodOptions, "/x", nil)
-	req.Header.Set("Origin", "https://fmsg.io")
+	req.Header.Set("Origin", "https://app.example.com")
 	req.Header.Set("Access-Control-Request-Method", "POST")
 	req.Header.Set("Access-Control-Request-Headers", "Authorization, Content-Type")
 	r.ServeHTTP(w, req)
@@ -90,7 +90,7 @@ func TestCORS_PreflightShortCircuits(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://fmsg.io" {
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
 		t.Errorf("Access-Control-Allow-Origin = %q", got)
 	}
 	if got := w.Header().Get("Access-Control-Allow-Methods"); got == "" {
@@ -120,7 +120,7 @@ func TestCORS_DisabledWhenNoOrigins(t *testing.T) {
 	r := newCORSTestRouter(nil)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
-	req.Header.Set("Origin", "https://fmsg.io")
+	req.Header.Set("Origin", "https://app.example.com")
 	r.ServeHTTP(w, req)
 
 	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {

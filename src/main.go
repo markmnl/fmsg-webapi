@@ -29,11 +29,12 @@ func main() {
 	dataDir := mustEnv("FMSG_DATA_DIR")
 
 	// JWT configuration. Mode is selected automatically:
-	//   * EdDSA (prod) when FMSG_JWT_JWKS_URL is set.
+	//   * RS256 (prod, JWKS-backed JWTs) when FMSG_JWT_JWKS_URL is set.
 	//   * HMAC (dev) otherwise, using FMSG_API_JWT_SECRET.
 	jwksURL := os.Getenv("FMSG_JWT_JWKS_URL")
 	jwtIssuer := os.Getenv("FMSG_JWT_ISSUER")
 	jwtAudience := os.Getenv("FMSG_JWT_AUDIENCE")
+	jwtAddressClaim := os.Getenv("FMSG_JWT_ADDRESS_CLAIM")
 
 	// TLS configuration (optional — omit both to run plain HTTP).
 	tlsCert := os.Getenv("FMSG_TLS_CERT")
@@ -51,7 +52,7 @@ func main() {
 	shortTextSize := envOrDefaultInt("FMSG_API_SHORT_TEXT_SIZE", 768)
 
 	// CORS: comma-separated list of allowed browser origins, e.g.
-	// "https://fmsg.io,https://www.fmsg.io". Empty disables CORS.
+	// "https://app.example.com,https://www.example.com". Empty disables CORS.
 	corsOrigins := parseCSV(os.Getenv("FMSG_CORS_ORIGINS"))
 
 	// Web Push (VAPID) configuration. Push is enabled only when all three
@@ -74,7 +75,7 @@ func main() {
 	log.Println("connected to PostgreSQL")
 
 	// Initialise JWT middleware.
-	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, idURL)
+	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, jwtAddressClaim, idURL)
 	if err != nil {
 		log.Fatalf("failed to configure JWT: %v", err)
 	}
@@ -233,26 +234,27 @@ func envOrDefaultInt(key string, defaultValue int) int {
 }
 
 // buildJWTConfig assembles a middleware.Config from environment-derived
-// inputs, picking EdDSA (prod) when a JWKS URL is supplied and falling back
-// to HMAC (dev) otherwise.
-func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, idURL string) (middleware.Config, error) {
+// inputs, picking RS256 (prod, JWKS-backed JWTs) when a JWKS URL is supplied
+// and falling back to HMAC (dev) otherwise.
+func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, addressClaim, idURL string) (middleware.Config, error) {
 	cfg := middleware.Config{
-		Issuer:   issuer,
-		Audience: audience,
-		IDURL:    idURL,
+		Issuer:       issuer,
+		Audience:     audience,
+		AddressClaim: addressClaim,
+		IDURL:        idURL,
 	}
 
 	if jwksURL != "" {
-		if issuer == "" {
-			return cfg, errors.New("FMSG_JWT_ISSUER is required when FMSG_JWT_JWKS_URL is set")
+		if issuer == "" || audience == "" || addressClaim == "" {
+			return cfg, errors.New("FMSG_JWT_ISSUER, FMSG_JWT_AUDIENCE and FMSG_JWT_ADDRESS_CLAIM are required when FMSG_JWT_JWKS_URL is set")
 		}
 		k, err := keyfunc.NewDefaultCtx(ctx, []string{jwksURL})
 		if err != nil {
 			return cfg, err
 		}
-		cfg.Mode = middleware.ModeEdDSA
+		cfg.Mode = middleware.ModeRS256
 		cfg.JWKS = k.Keyfunc
-		log.Printf("JWT mode: EdDSA (issuer=%s, jwks=%s)", issuer, jwksURL)
+		log.Printf("JWT mode: RS256 (issuer=%s, jwks=%s, audience=%s, address_claim=%s)", issuer, jwksURL, audience, addressClaim)
 		return cfg, nil
 	}
 

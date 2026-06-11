@@ -9,9 +9,10 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
-| `FMSG_JWT_JWKS_URL` | *(prod)*                 | URL of the IdP's JWKS endpoint (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies EdDSA tokens issued by the IdP. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
-| `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com`). Tokens with a different issuer are rejected. |
-| `FMSG_JWT_AUDIENCE` | *(optional)*             | When set, tokens must include this value in their `aud` claim. |
+| `FMSG_JWT_JWKS_URL` | *(prod)*                 | JWKS endpoint for the configured identity provider (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies RS256 JWTs. RSA public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
+| `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com/`). Tokens with a different issuer are rejected. This must exactly match the token issuer. |
+| `FMSG_JWT_AUDIENCE` | *(prod, required with JWKS)* | Expected `aud` claim value for this application or API. |
+| `FMSG_JWT_ADDRESS_CLAIM` | *(prod, required with JWKS)* | JWT claim name containing the fmsg address in `@user@domain` form, e.g. `fmsg_address` or a namespaced custom claim. |
 | `FMSG_API_JWT_SECRET` | *(dev)*                | HMAC secret for HS256 token verification. Used only in dev mode (when `FMSG_JWT_JWKS_URL` is unset). Prefix with `base64:` to supply a base64-encoded key. Either this or `FMSG_JWT_JWKS_URL` must be set. |
 | `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS. |
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
@@ -38,27 +39,34 @@ A `.env` file placed in the working directory is loaded automatically at startup
 All `/fmsg/*` routes require an `Authorization: Bearer <token>` header. The API
 operates in one of two verification modes, selected automatically at startup:
 
-### EdDSA (production)
+### RS256 (production, JWKS-backed JWTs)
 
-Active when `FMSG_JWT_JWKS_URL` is set. Tokens are expected to be issued by the
-fmsg IdP and signed with Ed25519. The JWKS endpoint is polled on a schedule;
-the IdP can rotate keys by adding a new JWK with a fresh `kid`.
+Active when `FMSG_JWT_JWKS_URL` is set. Tokens must be issued by the configured
+identity provider and signed with RS256. The JWKS endpoint is polled on a
+schedule; the provider can rotate keys by adding a new JWK with a fresh `kid`.
 
-Required token header: `alg: EdDSA`, `kid: <known to JWKS>`, `typ: JWT`.
+Required token header: `alg: RS256`, `kid: <known to JWKS>`, `typ: JWT`.
 
-Required claims:
+Relevant claims:
 
 | Claim | Description |
 | ----- | ----------- |
 | `iss` | Must equal `FMSG_JWT_ISSUER`. |
-| `sub` | User address in `@user@domain` form. |
-| `iat` | Issued-at timestamp (Unix seconds). |
-| `nbf` | Not-before timestamp. |
+| `aud` | Must contain `FMSG_JWT_AUDIENCE`. |
+| configured address claim | The claim named by `FMSG_JWT_ADDRESS_CLAIM`; must contain the user address in `@user@domain` form. Tokens without this claim are rejected with `403 no fmsg account for this identity`. |
+| `sub` | Provider-specific identity. It is validated as part of the signed token but is not used as the fmsg address in RS256 mode. |
 | `exp` | Expiry timestamp (must be in the future, ±10 s leeway). |
-| `jti` | Optional unique token ID. |
-| `aud` | Optional; required only when `FMSG_JWT_AUDIENCE` is set. |
+| `iat` | Optional issued-at timestamp; validated when present. |
+| `nbf` | Optional not-before timestamp; validated when present. |
 
-A 10-second clock-skew leeway is applied to `iat`/`nbf`/`exp` validation.
+A 10-second clock-skew leeway is applied to `iat`/`nbf`/`exp` validation. After
+the address claim is validated, the API checks fmsgid to confirm the address is
+known and accepting new messages.
+
+Clients must send a JWT that matches the configured issuer and audience and
+includes the configured address claim. Whether that token is an ID token or
+access token is determined by the identity provider configuration for the
+deployment.
 
 ### HMAC (development)
 
@@ -92,7 +100,9 @@ by default; override with `FMSG_API_PORT`.
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
 export FMSG_JWT_JWKS_URL=https://idp.example.com/.well-known/jwks.json
-export FMSG_JWT_ISSUER=https://idp.example.com
+export FMSG_JWT_ISSUER=https://idp.example.com/
+export FMSG_JWT_AUDIENCE=fmsg-web-client
+export FMSG_JWT_ADDRESS_CLAIM=fmsg_address
 export FMSG_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
 export FMSG_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem
 export PGHOST=localhost

@@ -40,7 +40,7 @@ type PushHandler struct {
 }
 
 // NewPushHandler creates a PushHandler. vapidPublic/vapidPrivate are URL-safe
-// base64 VAPID keys; vapidSubject is the VAPID "sub" (e.g. "mailto:admin@fmsg.io").
+// base64 VAPID keys; vapidSubject is the VAPID "sub" (e.g. "mailto:admin@example.com").
 func NewPushHandler(database *db.DB, msgs *MessageHandler, vapidPublic, vapidPrivate, vapidSubject, iconURL string) *PushHandler {
 	h := &PushHandler{
 		DB:           database,
