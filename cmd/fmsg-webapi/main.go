@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"log"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
+	"github.com/markmnl/fmsg-webapi/internal/apiauth"
 	"github.com/markmnl/fmsg-webapi/internal/db"
 	"github.com/markmnl/fmsg-webapi/internal/handlers"
 	"github.com/markmnl/fmsg-webapi/internal/middleware"
@@ -25,16 +25,26 @@ func main() {
 	// Load .env file if present (ignore error when absent).
 	_ = godotenv.Load()
 
+	if len(os.Args) > 1 && os.Args[1] == "api-key" {
+		if err := runAPIKeyCLI(context.Background(), os.Args[2:]); err != nil {
+			log.Fatalf("api-key: %v", err)
+		}
+		return
+	}
+
 	// Required configuration.
 	dataDir := mustEnv("FMSG_DATA_DIR")
 
-	// JWT configuration. Mode is selected automatically:
-	//   * RS256 (prod, JWKS-backed JWTs) when FMSG_JWT_JWKS_URL is set.
-	//   * HMAC (dev) otherwise, using FMSG_API_JWT_SECRET.
+	// JWT configuration. RS256 provider JWTs and first-party Ed25519 API
+	// tokens can be enabled independently.
 	jwksURL := os.Getenv("FMSG_JWT_JWKS_URL")
 	jwtIssuer := os.Getenv("FMSG_JWT_ISSUER")
 	jwtAudience := os.Getenv("FMSG_JWT_AUDIENCE")
 	jwtAddressClaim := os.Getenv("FMSG_JWT_ADDRESS_CLAIM")
+	apiTokenPrivate := os.Getenv("FMSG_API_TOKEN_ED25519_PRIVATE_KEY")
+	apiTokenIssuer := envOrDefault("FMSG_API_TOKEN_ISSUER", apiauth.DefaultTokenIssuer)
+	apiTokenAudience := envOrDefault("FMSG_API_TOKEN_AUDIENCE", apiauth.DefaultTokenAudience)
+	apiTokenTTL := envOrDefaultDuration("FMSG_API_TOKEN_TTL", apiauth.DefaultTokenTTL)
 
 	// TLS configuration (optional — omit both to run plain HTTP).
 	tlsCert := os.Getenv("FMSG_TLS_CERT")
@@ -74,14 +84,27 @@ func main() {
 	defer database.Close()
 	log.Println("connected to PostgreSQL")
 
-	// Initialise JWT middleware.
-	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, jwtAddressClaim, idURL)
+	apiStore := apiauth.NewStore(database)
+	var tokenIssuer *apiauth.TokenIssuer
+	if apiTokenPrivate != "" {
+		privateKey, err := apiauth.ParseEd25519PrivateKey(apiTokenPrivate)
+		if err != nil {
+			log.Fatalf("failed to parse FMSG_API_TOKEN_ED25519_PRIVATE_KEY: %v", err)
+		}
+		tokenIssuer = apiauth.NewTokenIssuer(privateKey, apiTokenIssuer, apiTokenAudience, apiTokenTTL)
+		log.Printf("API token auth enabled (issuer=%s, audience=%s, ttl=%s)", tokenIssuer.Issuer(), tokenIssuer.Audience(), tokenIssuer.TTL())
+	} else {
+		log.Println("API token auth disabled (FMSG_API_TOKEN_ED25519_PRIVATE_KEY not set)")
+	}
+
+	// Initialise authentication middleware.
+	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, jwtAddressClaim, idURL, tokenIssuer, apiStore)
 	if err != nil {
-		log.Fatalf("failed to configure JWT: %v", err)
+		log.Fatalf("failed to configure auth: %v", err)
 	}
 	jwtMiddleware, err := middleware.New(jwtCfg)
 	if err != nil {
-		log.Fatalf("failed to initialise JWT middleware: %v", err)
+		log.Fatalf("failed to initialise auth middleware: %v", err)
 	}
 
 	// The WebSocket endpoint authenticates outside the Gin middleware chain,
@@ -93,6 +116,13 @@ func main() {
 
 	// Create Gin router.
 	router := gin.Default()
+	if trustedProxies := parseCSV(os.Getenv("FMSG_TRUSTED_PROXIES")); len(trustedProxies) > 0 {
+		if err := router.SetTrustedProxies(trustedProxies); err != nil {
+			log.Fatalf("invalid FMSG_TRUSTED_PROXIES: %v", err)
+		}
+	} else if err := router.SetTrustedProxies(nil); err != nil {
+		log.Fatalf("failed to disable trusted proxies: %v", err)
+	}
 
 	// CORS must run before authentication so that browser preflight (OPTIONS)
 	// requests, which do not carry the Authorization header, are answered
@@ -131,10 +161,23 @@ func main() {
 	go hub.Run(context.Background())
 	wsHandler := handlers.NewWSHandler(jwtVerifier, hub, corsOrigins)
 
+	if tokenIssuer != nil {
+		tokenHandler := handlers.NewTokenHandler(apiStore, tokenIssuer, idURL)
+		router.POST("/fmsg/token", tokenHandler.Exchange)
+	}
+
 	// Register routes under /fmsg, all protected by JWT.
 	fmsg := router.Group("/fmsg")
 	fmsg.Use(jwtMiddleware)
 	{
+		if tokenIssuer != nil {
+			subAccountHandler := handlers.NewSubAccountHandler(apiStore, idURL)
+			fmsg.GET("/sub-accounts", subAccountHandler.List)
+			fmsg.POST("/sub-accounts", subAccountHandler.Create)
+			fmsg.POST("/sub-accounts/:agent/rotate-key", subAccountHandler.RotateKey)
+			fmsg.DELETE("/sub-accounts/:agent", subAccountHandler.Delete)
+		}
+
 		fmsg.GET("", msgHandler.List)
 		fmsg.GET("/sent", msgHandler.Sent)
 		fmsg.POST("", msgHandler.Create)
@@ -233,10 +276,19 @@ func envOrDefaultInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
-// buildJWTConfig assembles a middleware.Config from environment-derived
-// inputs, picking RS256 (prod, JWKS-backed JWTs) when a JWKS URL is supplied
-// and falling back to HMAC (dev) otherwise.
-func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, addressClaim, idURL string) (middleware.Config, error) {
+func envOrDefaultDuration(key string, defaultValue time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Fatalf("environment variable %s must be a Go duration such as 12h: %v", key, err)
+		}
+		return d
+	}
+	return defaultValue
+}
+
+// buildJWTConfig assembles a middleware.Config from environment-derived inputs.
+func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, addressClaim, idURL string, tokenIssuer *apiauth.TokenIssuer, apiStore *apiauth.Store) (middleware.Config, error) {
 	cfg := middleware.Config{
 		Issuer:       issuer,
 		Audience:     audience,
@@ -252,33 +304,21 @@ func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, addressClaim
 		if err != nil {
 			return cfg, err
 		}
-		cfg.Mode = middleware.ModeRS256
 		cfg.JWKS = k.Keyfunc
-		log.Printf("JWT mode: RS256 (issuer=%s, jwks=%s, audience=%s, address_claim=%s)", issuer, jwksURL, audience, addressClaim)
-		return cfg, nil
+		log.Printf("RS256 auth enabled (issuer=%s, jwks=%s, audience=%s, address_claim=%s)", issuer, jwksURL, audience, addressClaim)
+	} else {
+		log.Println("RS256 auth disabled (FMSG_JWT_JWKS_URL not set)")
 	}
 
-	secret := os.Getenv("FMSG_API_JWT_SECRET")
-	if secret == "" {
-		return cfg, errors.New("either FMSG_JWT_JWKS_URL (prod) or FMSG_API_JWT_SECRET (dev) must be set")
+	if tokenIssuer != nil {
+		cfg.APIPublicKey = tokenIssuer.PublicKey()
+		cfg.APIIssuer = tokenIssuer.Issuer()
+		cfg.APIAudience = tokenIssuer.Audience()
+		cfg.APIKeys = apiStore
 	}
-	cfg.Mode = middleware.ModeHMAC
-	cfg.HMACKey = parseSecret(secret)
-	log.Println("JWT mode: HMAC (development)")
+
+	if cfg.JWKS == nil && len(cfg.APIPublicKey) == 0 {
+		return cfg, errors.New("either FMSG_JWT_JWKS_URL or FMSG_API_TOKEN_ED25519_PRIVATE_KEY must be set")
+	}
 	return cfg, nil
-}
-
-// parseSecret returns the HMAC key bytes for the given secret string.
-// If s begins with "base64:" the remainder is base64-decoded; otherwise the
-// raw string bytes are used.
-func parseSecret(s string) []byte {
-	const prefix = "base64:"
-	if strings.HasPrefix(s, prefix) {
-		b, err := base64.StdEncoding.DecodeString(s[len(prefix):])
-		if err != nil {
-			log.Fatalf("FMSG_API_JWT_SECRET has base64: prefix but is not valid base64: %v", err)
-		}
-		return b
-	}
-	return []byte(s)
 }

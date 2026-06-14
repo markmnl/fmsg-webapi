@@ -1,9 +1,12 @@
 package middleware
 
 import (
+	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,9 +14,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/markmnl/fmsg-webapi/internal/apiauth"
 )
 
-// Provider values used by the RS256 fixtures.
 const (
 	testIssuer       = "https://issuer.example.test/"
 	testAudience     = "fmsg-web-client"
@@ -22,6 +26,25 @@ const (
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+type fakeAPIKeys struct {
+	tokenErr error
+	actErr   error
+}
+
+func (f fakeAPIKeys) ValidateToken(_ context.Context, keyID, ownerAddr, subAddr, remoteAddr string) error {
+	if keyID == "" || ownerAddr == "" || subAddr == "" || remoteAddr == "" {
+		return errors.New("missing token validation input")
+	}
+	return f.tokenErr
+}
+
+func (f fakeAPIKeys) ValidateActAs(_ context.Context, ownerAddr, subAddr string) error {
+	if ownerAddr == "" || subAddr == "" {
+		return errors.New("missing act-as input")
+	}
+	return f.actErr
 }
 
 func TestIsValidAddr(t *testing.T) {
@@ -47,8 +70,6 @@ func TestIsValidAddr(t *testing.T) {
 	}
 }
 
-// fakeJWKS returns a jwt.Keyfunc that yields a fixed RSA public key for a
-// single known kid.
 func fakeJWKS(kid string, pub *rsa.PublicKey) jwt.Keyfunc {
 	return func(t *jwt.Token) (interface{}, error) {
 		k, _ := t.Header["kid"].(string)
@@ -59,7 +80,6 @@ func fakeJWKS(kid string, pub *rsa.PublicKey) jwt.Keyfunc {
 	}
 }
 
-// fmsgIDServer returns an httptest server emulating fmsgid responses.
 func fmsgIDServer(t *testing.T, status int, accepting bool) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,18 +92,18 @@ func fmsgIDServer(t *testing.T, status int, accepting bool) *httptest.Server {
 	}))
 }
 
-// runMiddleware executes the middleware against a synthetic request bearing
-// the given token, returning the recorded response.
-func runMiddleware(t *testing.T, mw gin.HandlerFunc, token string) *httptest.ResponseRecorder {
+func runMiddleware(t *testing.T, mw gin.HandlerFunc, token string, actAs string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodGet, "/fmsg", nil)
+	c.Request.RemoteAddr = "127.0.0.1:12345"
 	if token != "" {
 		c.Request.Header.Set("Authorization", "Bearer "+token)
 	}
-	called := false
-	c.Set("__test_next__", &called)
+	if actAs != "" {
+		c.Request.Header.Set("X-FMSG-Act-As", actAs)
+	}
 	mw(c)
 	return w
 }
@@ -109,8 +129,6 @@ func signHS256(t *testing.T, secret []byte, claims jwt.MapClaims) string {
 	return s
 }
 
-// rs256Claims returns provider-token-shaped claims carrying the given fmsg
-// address in the configured address claim.
 func rs256Claims(addr string) jwt.MapClaims {
 	claims := jwt.MapClaims{
 		"iss": testIssuer,
@@ -125,69 +143,6 @@ func rs256Claims(addr string) jwt.MapClaims {
 	return claims
 }
 
-func TestHMACMode_Happy(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-
-	secret := []byte("dev-secret")
-	mw, err := New(Config{Mode: ModeHMAC, HMACKey: secret, IDURL: srv.URL})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	tok := signHS256(t, secret, jwt.MapClaims{
-		"sub": "@alice@example.com",
-		"iat": time.Now().Unix(),
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	w := runMiddleware(t, mw, tok)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-}
-
-func TestHMACMode_ClockSkewLeeway(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-	secret := []byte("dev-secret")
-	mw, err := New(Config{Mode: ModeHMAC, HMACKey: secret, IDURL: srv.URL})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	// iat/nbf within leeway is accepted.
-	now := time.Now()
-	tok := signHS256(t, secret, jwt.MapClaims{
-		"sub": "@alice@example.com",
-		"iat": now.Add(DefaultClockSkew - time.Second).Unix(),
-		"nbf": now.Add(DefaultClockSkew - time.Second).Unix(),
-		"exp": now.Add(time.Hour).Unix(),
-	})
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusOK {
-		t.Fatalf("within-skew token should be accepted, got %d", w.Code)
-	}
-
-	// Beyond leeway is rejected.
-	tok = signHS256(t, secret, jwt.MapClaims{
-		"sub": "@alice@example.com",
-		"nbf": now.Add(DefaultClockSkew + 5*time.Second).Unix(),
-		"exp": now.Add(time.Hour).Unix(),
-	})
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("out-of-skew token should be rejected, got %d", w.Code)
-	}
-}
-
-func TestHMACMode_MissingHeader(t *testing.T) {
-	mw, err := New(Config{Mode: ModeHMAC, HMACKey: []byte("k"), IDURL: "http://127.0.0.1:0"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if w := runMiddleware(t, mw, ""); w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
 func newRS256Fixture(t *testing.T) (priv *rsa.PrivateKey, jwks jwt.Keyfunc) {
 	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -199,7 +154,6 @@ func newRS256Fixture(t *testing.T) (priv *rsa.PrivateKey, jwks jwt.Keyfunc) {
 
 func rs256Config(idURL string, jwks jwt.Keyfunc) Config {
 	return Config{
-		Mode:         ModeRS256,
 		JWKS:         jwks,
 		Issuer:       testIssuer,
 		Audience:     testAudience,
@@ -218,40 +172,53 @@ func TestRS256Mode_Happy(t *testing.T) {
 	}
 
 	tok := signRS256(t, priv, "prod-1", rs256Claims("@alice@example.com"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusOK {
+	if w := runMiddleware(t, mw, tok, ""); w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 
-func TestRS256Mode_IdentityIsAddressClaim(t *testing.T) {
-	const addr = "@claim@example.com"
-	fmsgIDCache.Delete(addr)
-	defer fmsgIDCache.Delete(addr)
+func TestRS256Mode_ActAsSubAccount(t *testing.T) {
+	fmsgIDCache.Delete("@alice@example.com")
+	fmsgIDCache.Delete("@alice_bot@example.com")
+	defer fmsgIDCache.Delete("@alice@example.com")
+	defer fmsgIDCache.Delete("@alice_bot@example.com")
 
-	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if r.URL.Path != "/fmsgid/"+addr {
-			http.Error(w, "wrong address", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]bool{"acceptingNew": true})
-	}))
+	srv := fmsgIDServer(t, http.StatusOK, true)
 	defer srv.Close()
 	priv, jwks := newRS256Fixture(t)
-	v, err := NewVerifier(rs256Config(srv.URL, jwks))
+	apiPub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
+		t.Fatal(err)
+	}
+	mw, err := New(Config{
+		JWKS:         jwks,
+		Issuer:       testIssuer,
+		Audience:     testAudience,
+		AddressClaim: testAddressClaim,
+		IDURL:        srv.URL,
+		APIPublicKey: apiPub,
+		APIKeys:      fakeAPIKeys{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
 
-	tok := signRS256(t, priv, "prod-1", rs256Claims(addr))
-	gotAddr, status, _ := v.Authenticate(tok)
-	if status != http.StatusOK || gotAddr != addr {
-		t.Fatalf("got addr=%q status=%d, want %s/200", gotAddr, status, addr)
+	tok := signRS256(t, priv, "prod-1", rs256Claims("@alice@example.com"))
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/fmsg", nil)
+	c.Request.RemoteAddr = "127.0.0.1:12345"
+	c.Request.Header.Set("Authorization", "Bearer "+tok)
+	c.Request.Header.Set("X-FMSG-Act-As", "@alice_bot@example.com")
+	mw(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	if hits != 1 {
-		t.Fatalf("fmsgid hits = %d, want 1", hits)
+	if got := GetIdentity(c); got != "@alice_bot@example.com" {
+		t.Fatalf("identity=%q", got)
+	}
+	if got := GetOwnerIdentity(c); got != "@alice@example.com" {
+		t.Fatalf("owner=%q", got)
 	}
 }
 
@@ -263,14 +230,13 @@ func TestRS256Mode_MissingAddressClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A valid ID token whose identity has no fmsg account yet.
 	tok := signRS256(t, priv, "prod-1", rs256Claims(""))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusForbidden {
+	if w := runMiddleware(t, mw, tok, ""); w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 
-func TestRS256Mode_MalformedAddressClaim(t *testing.T) {
+func TestRS256Mode_WrongIssuerAudienceAndExpired(t *testing.T) {
 	srv := fmsgIDServer(t, http.StatusOK, true)
 	defer srv.Close()
 	priv, jwks := newRS256Fixture(t)
@@ -278,69 +244,27 @@ func TestRS256Mode_MalformedAddressClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok := signRS256(t, priv, "prod-1", rs256Claims("not-an-address"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
 
-func TestRS256Mode_WrongIssuer(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
-	if err != nil {
-		t.Fatal(err)
-	}
 	claims := rs256Claims("@alice@example.com")
 	claims["iss"] = "https://evil.example.com/"
-	tok := signRS256(t, priv, "prod-1", claims)
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-func TestRS256Mode_WrongAudience(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
-	if err != nil {
-		t.Fatal(err)
+	if w := runMiddleware(t, mw, signRS256(t, priv, "prod-1", claims), ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong issuer expected 401, got %d", w.Code)
 	}
 
-	// Token minted for a different configured application or API.
-	claims := rs256Claims("@alice@example.com")
-	claims["aud"] = "SomeOtherClientID"
-	tok := signRS256(t, priv, "prod-1", claims)
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong aud: expected 401, got %d", w.Code)
-	}
-
-	// Token with no audience at all.
 	claims = rs256Claims("@alice@example.com")
-	delete(claims, "aud")
-	tok = signRS256(t, priv, "prod-1", claims)
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("missing aud: expected 401, got %d", w.Code)
+	claims["aud"] = "other"
+	if w := runMiddleware(t, mw, signRS256(t, priv, "prod-1", claims), ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong audience expected 401, got %d", w.Code)
+	}
+
+	claims = rs256Claims("@alice@example.com")
+	claims["exp"] = time.Now().Add(-time.Hour).Unix()
+	if w := runMiddleware(t, mw, signRS256(t, priv, "prod-1", claims), ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("expired expected 401, got %d", w.Code)
 	}
 }
 
-func TestRS256Mode_UnknownKID(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tok := signRS256(t, priv, "rotated-key", rs256Claims("@alice@example.com"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-func TestRS256Mode_AlgDowngrade(t *testing.T) {
+func TestRS256Mode_RejectsHMACAlg(t *testing.T) {
 	srv := fmsgIDServer(t, http.StatusOK, true)
 	defer srv.Close()
 	_, jwks := newRS256Fixture(t)
@@ -348,148 +272,127 @@ func TestRS256Mode_AlgDowngrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Sign with HS256 - must be rejected by an RS256-only middleware.
 	tok := signHS256(t, []byte("anything"), rs256Claims("@alice@example.com"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
+	if w := runMiddleware(t, mw, tok, ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-func TestRS256Mode_Expired(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
-	if err != nil {
-		t.Fatal(err)
-	}
-	claims := rs256Claims("@alice@example.com")
-	claims["exp"] = time.Now().Add(-time.Hour).Unix()
-	tok := signRS256(t, priv, "prod-1", claims)
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", w.Code)
-	}
-}
-
-func TestRS256Mode_Reuse(t *testing.T) {
-	srv := fmsgIDServer(t, http.StatusOK, true)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tok := signRS256(t, priv, "prod-1", rs256Claims("@alice@example.com"))
-
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusOK {
-		t.Fatalf("first call expected 200, got %d", w.Code)
-	}
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusOK {
-		t.Fatalf("reuse expected 200, got %d", w.Code)
 	}
 }
 
 func TestRS256Mode_ConfigValidation(t *testing.T) {
 	_, jwks := newRS256Fixture(t)
 
-	if _, err := NewVerifier(Config{Mode: ModeRS256, Issuer: testIssuer, Audience: testAudience, AddressClaim: testAddressClaim}); err == nil {
-		t.Error("missing JWKS: expected error")
+	if _, err := NewVerifier(Config{Issuer: testIssuer, Audience: testAudience, AddressClaim: testAddressClaim}); err == nil {
+		t.Error("missing auth modes: expected error")
 	}
-	if _, err := NewVerifier(Config{Mode: ModeRS256, JWKS: jwks, Audience: testAudience, AddressClaim: testAddressClaim}); err == nil {
+	if _, err := NewVerifier(Config{JWKS: jwks, Audience: testAudience, AddressClaim: testAddressClaim}); err == nil {
 		t.Error("missing Issuer: expected error")
 	}
-	if _, err := NewVerifier(Config{Mode: ModeRS256, JWKS: jwks, Issuer: testIssuer, AddressClaim: testAddressClaim}); err == nil {
+	if _, err := NewVerifier(Config{JWKS: jwks, Issuer: testIssuer, AddressClaim: testAddressClaim}); err == nil {
 		t.Error("missing Audience: expected error")
 	}
-	if _, err := NewVerifier(Config{Mode: ModeRS256, JWKS: jwks, Issuer: testIssuer, Audience: testAudience}); err == nil {
+	if _, err := NewVerifier(Config{JWKS: jwks, Issuer: testIssuer, Audience: testAudience}); err == nil {
 		t.Error("missing AddressClaim: expected error")
 	}
 }
 
-func TestRS256Mode_FmsgIDNotFound(t *testing.T) {
-	fmsgIDCache.Delete("@alice@example.com")
-	defer fmsgIDCache.Delete("@alice@example.com")
+func TestRS256Mode_FmsgIDFailures(t *testing.T) {
+	priv, jwks := newRS256Fixture(t)
 
+	fmsgIDCache.Delete("@alice@example.com")
 	srv := fmsgIDServer(t, http.StatusNotFound, false)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
 	mw, err := New(rs256Config(srv.URL, jwks))
 	if err != nil {
 		t.Fatal(err)
 	}
 	tok := signRS256(t, priv, "prod-1", rs256Claims("@alice@example.com"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
+	if w := runMiddleware(t, mw, tok, ""); w.Code != http.StatusBadRequest {
+		t.Fatalf("not found expected 400, got %d", w.Code)
 	}
-}
+	srv.Close()
 
-func TestRS256Mode_FmsgIDNotAccepting(t *testing.T) {
 	fmsgIDCache.Delete("@alice@example.com")
-	defer fmsgIDCache.Delete("@alice@example.com")
-
-	srv := fmsgIDServer(t, http.StatusOK, false)
+	srv = fmsgIDServer(t, http.StatusOK, false)
 	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
+	mw, err = New(rs256Config(srv.URL, jwks))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok := signRS256(t, priv, "prod-1", rs256Claims("@alice@example.com"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
+	if w := runMiddleware(t, mw, tok, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("not accepting expected 403, got %d", w.Code)
 	}
 }
 
-func TestVerifier_Authenticate(t *testing.T) {
+func TestAPITokenMode_Happy(t *testing.T) {
 	srv := fmsgIDServer(t, http.StatusOK, true)
 	defer srv.Close()
-	secret := []byte("dev-secret")
-	v, err := NewVerifier(Config{Mode: ModeHMAC, HMACKey: secret, IDURL: srv.URL})
-	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
-	}
-
-	// Valid token is accepted and yields the sub address.
-	tok := signHS256(t, secret, jwt.MapClaims{
-		"sub": "@alice@example.com",
-		"iat": time.Now().Unix(),
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	addr, status, _ := v.Authenticate(tok)
-	if status != http.StatusOK || addr != "@alice@example.com" {
-		t.Fatalf("valid token: got addr=%q status=%d, want @alice@example.com/200", addr, status)
-	}
-
-	// Token signed with the wrong secret is rejected.
-	bad := signHS256(t, []byte("wrong-secret"), jwt.MapClaims{
-		"sub": "@alice@example.com",
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	if _, status, _ := v.Authenticate(bad); status != http.StatusUnauthorized {
-		t.Fatalf("bad signature: expected 401, got %d", status)
-	}
-
-	// Token with a malformed sub is rejected.
-	noaddr := signHS256(t, secret, jwt.MapClaims{
-		"sub": "not-an-address",
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	if _, status, _ := v.Authenticate(noaddr); status != http.StatusUnauthorized {
-		t.Fatalf("invalid addr: expected 401, got %d", status)
-	}
-}
-
-func TestRS256Mode_FmsgIDUnavailable(t *testing.T) {
-	fmsgIDCache.Delete("@alice@example.com")
-	srv := fmsgIDServer(t, http.StatusInternalServerError, false)
-	defer srv.Close()
-	priv, jwks := newRS256Fixture(t)
-	mw, err := New(rs256Config(srv.URL, jwks))
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok := signRS256(t, priv, "prod-1", rs256Claims("@alice@example.com"))
-	if w := runMiddleware(t, mw, tok); w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503, got %d", w.Code)
+	issuer := apiauth.NewTokenIssuer(priv, apiauth.DefaultTokenIssuer, apiauth.DefaultTokenAudience, time.Hour)
+	token, _, err := issuer.Mint("@alice@example.com", "@alice_bot@example.com", "kid1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mw, err := New(Config{
+		APIPublicKey: issuer.PublicKey(),
+		APIIssuer:    issuer.Issuer(),
+		APIAudience:  issuer.Audience(),
+		APIKeys:      fakeAPIKeys{},
+		IDURL:        srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := runMiddleware(t, mw, token, ""); w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAPITokenMode_RejectsActAsAndRevokedKey(t *testing.T) {
+	srv := fmsgIDServer(t, http.StatusOK, true)
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer := apiauth.NewTokenIssuer(priv, "", "", time.Hour)
+	token, _, err := issuer.Mint("@alice@example.com", "@alice_bot@example.com", "kid1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mw, err := New(Config{
+		APIPublicKey: issuer.PublicKey(),
+		APIKeys:      fakeAPIKeys{},
+		IDURL:        srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := runMiddleware(t, mw, token, "@alice_other@example.com"); w.Code != http.StatusForbidden {
+		t.Fatalf("act-as expected 403, got %d", w.Code)
+	}
+
+	mw, err = New(Config{
+		APIPublicKey: issuer.PublicKey(),
+		APIKeys:      fakeAPIKeys{tokenErr: apiauth.ErrKeyRevoked},
+		IDURL:        srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := runMiddleware(t, mw, token, ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked expected 401, got %d", w.Code)
+	}
+}
+
+func TestAPITokenMode_ConfigValidation(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewVerifier(Config{APIPublicKey: pub}); err == nil {
+		t.Fatal("missing API key checker: expected error")
 	}
 }
