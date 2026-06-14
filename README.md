@@ -13,7 +13,11 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com/`). Tokens with a different issuer are rejected. This must exactly match the token issuer. |
 | `FMSG_JWT_AUDIENCE` | *(prod, required with JWKS)* | Expected `aud` claim value for this application or API. |
 | `FMSG_JWT_ADDRESS_CLAIM` | *(prod, required with JWKS)* | JWT claim name containing the fmsg address in `@user@domain` form, e.g. `fmsg_address` or a namespaced custom claim. |
-| `FMSG_API_JWT_SECRET` | *(dev)*                | HMAC secret for HS256 token verification. Used only in dev mode (when `FMSG_JWT_JWKS_URL` is unset). Prefix with `base64:` to supply a base64-encoded key. Either this or `FMSG_JWT_JWKS_URL` must be set. |
+| `FMSG_API_TOKEN_ED25519_PRIVATE_KEY` | *(optional)* | Base64-encoded Ed25519 private key or seed used to mint first-party JWTs from API keys. Required to enable `/fmsg/token` and sub-account routes. |
+| `FMSG_API_TOKEN_ISSUER` | `fmsg-webapi` | Issuer for first-party API-key JWTs. |
+| `FMSG_API_TOKEN_AUDIENCE` | `fmsg-webapi` | Audience for first-party API-key JWTs. |
+| `FMSG_API_TOKEN_TTL` | `12h` | Lifetime of JWTs minted by `POST /fmsg/token`. |
+| `FMSG_TRUSTED_PROXIES` | *(optional)* | Comma-separated trusted proxy CIDRs/IPs for Gin client IP resolution. Leave unset to use direct client addresses for API-key CIDR checks. |
 | `FMSG_TLS_CERT`     | *(optional)*             | Path to the TLS certificate file (e.g. `/etc/letsencrypt/live/example.com/fullchain.pem`). When set with `FMSG_TLS_KEY`, enables HTTPS. |
 | `FMSG_TLS_KEY`      | *(optional)*             | Path to the TLS private key file (e.g. `/etc/letsencrypt/live/example.com/privkey.pem`). Must be set together with `FMSG_TLS_CERT`. |
 | `FMSG_API_PORT`     | `443` (TLS) / `8000` (plain) | TCP port to listen on. |
@@ -36,8 +40,13 @@ A `.env` file placed in the working directory is loaded automatically at startup
 
 ## Authentication
 
-All `/fmsg/*` routes require an `Authorization: Bearer <token>` header. The API
-operates in one of two verification modes, selected automatically at startup:
+Most `/fmsg/*` routes require an `Authorization: Bearer <token>` header. The
+API can enable either or both authentication methods at startup:
+
+- RS256/JWKS tokens from an external identity provider.
+- First-party Ed25519 JWTs minted by `POST /fmsg/token` from opaque API keys.
+
+Startup fails unless at least one method is configured.
 
 ### RS256 (production, JWKS-backed JWTs)
 
@@ -68,11 +77,60 @@ includes the configured address claim. Whether that token is an ID token or
 access token is determined by the identity provider configuration for the
 deployment.
 
-### HMAC (development)
+### API Keys And First-Party JWTs
 
-Active when `FMSG_JWT_JWKS_URL` is unset. Tokens must be HS256-signed with the
-shared secret in `FMSG_API_JWT_SECRET`. Required claims are `sub` and `exp`;
-`iat`/`nbf` are honoured when present.
+Active when `FMSG_API_TOKEN_ED25519_PRIVATE_KEY` is set. Programmatic clients
+authenticate with opaque API keys bound to sub-account addresses. The server
+stores only API-key hashes and exchanges valid keys for short-lived Ed25519 JWTs.
+
+API keys are sent only to `POST /fmsg/token`:
+
+```http
+Authorization: Bearer fmsgk_<key_id>_<secret>
+```
+
+The returned JWT contains `sub` (the sub-account address), `owner`, `api_key_id`,
+`iss`, `aud`, `iat`, and `exp`. Protected routes re-check the backing key row on
+each request, so deleting a sub-account or expiring its key invalidates existing
+tokens before their normal expiry.
+
+An RS256-authenticated owner can perform normal message routes as one of their
+sub-accounts without changing request bodies:
+
+```http
+X-FMSG-Act-As: @user_bot@example.com
+```
+
+The requested sub-account must be owned by the authenticated user and must exist
+in fmsgid.
+
+Apply [api_keys.sql](api_keys.sql) before enabling API-key auth.
+
+To set a custom per-owner sub-account limit, insert an owner config row:
+
+```sql
+INSERT INTO fmsg_api_sub_account (owner_addr, agent, max_sub_accounts)
+VALUES ('@alice@example.com', '', 10)
+ON CONFLICT (owner_addr, agent)
+DO UPDATE SET max_sub_accounts = EXCLUDED.max_sub_accounts;
+```
+
+Operators can bootstrap or rotate keys without RS256 by using the built-in CLI
+command. It uses the standard `PG*` connection environment variables and prints
+the plaintext API key once:
+
+```bash
+go run ./cmd/fmsg-webapi api-key create \
+  -owner @alice@example.com \
+  -agent bot \
+  -cidr 203.0.113.0/24 \
+  -expires 2026-12-31T00:00:00Z
+
+go run ./cmd/fmsg-webapi api-key rotate \
+  -owner @alice@example.com \
+  -agent bot \
+  -expires 2027-03-31T00:00:00Z
+```
 
 ## Building
 
@@ -101,6 +159,8 @@ export FMSG_JWT_JWKS_URL=https://idp.example.com/.well-known/jwks.json
 export FMSG_JWT_ISSUER=https://idp.example.com/
 export FMSG_JWT_AUDIENCE=fmsg-web-client
 export FMSG_JWT_ADDRESS_CLAIM=fmsg_address
+# Optional: also enable programmatic API keys.
+# export FMSG_API_TOKEN_ED25519_PRIVATE_KEY=$(openssl rand -base64 32)
 export FMSG_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
 export FMSG_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem
 export PGHOST=localhost
@@ -122,7 +182,7 @@ proxying `https://fmsgapi.example.com/` to `http://127.0.0.1:8000/`).
 
 ```bash
 export FMSG_DATA_DIR=/var/lib/fmsgd/
-export FMSG_API_JWT_SECRET=changeme
+export FMSG_API_TOKEN_ED25519_PRIVATE_KEY=$(openssl rand -base64 32)
 export PGHOST=localhost
 export PGUSER=fmsg
 export PGPASSWORD=secret
@@ -141,7 +201,10 @@ the HTTP server and kept alive by its own ping/pong heartbeat.
 
 ## API Routes
 
-All routes are prefixed with `/fmsg` and require a valid `Authorization: Bearer <token>` header. The one exception is the WebSocket route `/fmsg/ws`, which additionally accepts the token via an `access_token` query parameter (browsers cannot set headers on a WebSocket).
+All routes are prefixed with `/fmsg`. `POST /fmsg/token` accepts an API key and
+returns a JWT. Other routes require a valid `Authorization: Bearer <token>`
+header. The WebSocket route `/fmsg/ws` additionally accepts the token via an
+`access_token` query parameter (browsers cannot set headers on a WebSocket).
 
 Rate limiting is enforced at the host level (e.g. `nftables`) rather than in
 the application.
@@ -151,6 +214,11 @@ the application.
 | `GET`    | `/fmsg`                          | List messages for user   |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
+| `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
+| `GET`    | `/fmsg/sub-accounts`             | List owned sub-accounts |
+| `POST`   | `/fmsg/sub-accounts`             | Create a sub-account API key |
+| `POST`   | `/fmsg/sub-accounts/:agent/rotate-key` | Rotate a sub-account API key |
+| `DELETE` | `/fmsg/sub-accounts/:agent`      | Delete a sub-account |
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
 | `PUT`    | `/fmsg/:id`                      | Update a draft message   |
@@ -167,6 +235,76 @@ the application.
 
 The `/fmsg/push/subscribe` routes are registered only when Web Push is
 configured (see [Web Push](#web-push)).
+
+The `/fmsg/token` and `/fmsg/sub-accounts*` routes are registered only when
+API-key auth is configured with `FMSG_API_TOKEN_ED25519_PRIVATE_KEY`.
+
+### POST `/fmsg/token`
+
+Exchanges an opaque API key for a short-lived JWT.
+
+**Authentication:** `Authorization: Bearer fmsgk_<key_id>_<secret>`.
+
+The key must be unexpired, match the stored hash, be used from an allowed CIDR,
+and belong to a sub-account that exists in fmsgid.
+
+**Response:**
+
+```json
+{
+  "access_token": "eyJ...",
+  "token_type": "Bearer",
+  "expires_in": 43200,
+  "expires_at": "2026-12-31T12:00:00Z"
+}
+```
+
+### GET `/fmsg/sub-accounts`
+
+Lists sub-accounts owned by the RS256-authenticated user.
+
+**Response:**
+
+```json
+{
+  "max_sub_accounts": 5,
+  "sub_accounts": [
+    {
+      "agent": "bot",
+      "addr": "@alice_bot@example.com",
+      "key_id": "abc",
+      "allowed_cidrs": ["203.0.113.0/24"],
+      "key_expires_at": "2026-12-31T00:00:00Z"
+    }
+  ]
+}
+```
+
+### POST `/fmsg/sub-accounts`
+
+Creates a sub-account and returns its plaintext API key once. Requires RS256
+owner authentication.
+
+```json
+{
+  "agent": "bot",
+  "allowed_cidrs": ["203.0.113.0/24"],
+  "key_expires_at": "2026-12-31T00:00:00Z"
+}
+```
+
+The derived address is `@user_bot@domain`. `agent` may contain letters, digits,
+dots, and hyphens, but not underscores.
+
+### POST `/fmsg/sub-accounts/:agent/rotate-key`
+
+Rotates a sub-account API key and returns the new plaintext key once. Requires
+`key_expires_at`; `allowed_cidrs` may be supplied to replace the existing ranges.
+
+### DELETE `/fmsg/sub-accounts/:agent`
+
+Deletes a sub-account row and revokes future token exchange. Existing JWTs for
+that key are rejected on their next protected-route request.
 
 ### GET `/fmsg/ws`
 
