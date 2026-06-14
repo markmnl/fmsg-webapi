@@ -14,6 +14,12 @@ func TestGenerateParseAndHashAPIKey(t *testing.T) {
 	if !strings.HasPrefix(key.Value, KeyPrefix+"_") {
 		t.Fatalf("key prefix = %q", key.Value)
 	}
+	if strings.Contains(key.ID, "_") || strings.Contains(key.Secret, "_") {
+		t.Fatalf("key components must not contain delimiter: id=%q secret=%q", key.ID, key.Secret)
+	}
+	if got := strings.Count(key.Value, "_"); got != 2 {
+		t.Fatalf("key delimiter count = %d, want 2 in %q", got, key.Value)
+	}
 	parsed, err := ParseAPIKey(key.Value)
 	if err != nil {
 		t.Fatal(err)
