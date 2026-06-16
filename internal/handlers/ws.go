@@ -82,11 +82,12 @@ func (h *WSHandler) Connect(c *gin.Context) {
 		return
 	}
 
-	addr, status, msg := h.verifier.Authenticate(token)
+	res, status, msg := h.verifier.AuthenticateRequest(c.Request.Context(), token, c.ClientIP(), c.GetHeader("X-FMSG-Act-As"))
 	if status != http.StatusOK {
 		c.JSON(status, gin.H{"error": msg})
 		return
 	}
+	addr := res.Addr
 
 	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
