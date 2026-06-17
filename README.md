@@ -80,8 +80,10 @@ deployment.
 ### API Keys And First-Party JWTs
 
 Active when `FMSG_API_TOKEN_ED25519_PRIVATE_KEY` is set. Programmatic clients
-authenticate with opaque API keys bound to sub-account addresses. The server
-stores only API-key hashes and exchanges valid keys for short-lived Ed25519 JWTs.
+authenticate with opaque API keys bound to API-access grants. A grant may be a
+derived sub-account such as `@alice_bot@example.com`, or an explicit delegated
+identity such as `@sales@example.com`. The server stores only API-key hashes and
+exchanges valid keys for short-lived Ed25519 JWTs.
 
 API keys are sent only to `POST /fmsg/token`:
 
@@ -89,24 +91,26 @@ API keys are sent only to `POST /fmsg/token`:
 Authorization: Bearer fmsgk_<key_id>_<secret>
 ```
 
-The returned JWT contains `sub` (the sub-account address), `owner`, `api_key_id`,
+The returned JWT contains `sub` (the granted address), `owner`, `api_key_id`,
 `iss`, `aud`, `iat`, and `exp`. Protected routes re-check the backing key row on
-each request, so deleting a sub-account or expiring its key invalidates existing
+each request, so deleting a grant or expiring its key invalidates existing
 tokens before their normal expiry.
 
 An RS256-authenticated owner can perform normal message routes as one of their
-sub-accounts without changing request bodies:
+granted identities without changing request bodies:
 
 ```http
 X-FMSG-Act-As: @user_bot@example.com
 ```
 
-The requested sub-account must be owned by the authenticated user and must exist
+The requested address must be granted to the authenticated user and must exist
 in fmsgid.
 
-Apply [api_keys.sql](api_keys.sql) before enabling API-key auth.
+Apply [api_keys.sql](api_keys.sql) before enabling API-key auth. Existing
+deployments that already applied the earlier API-key table should apply
+[api_keys_delegation.sql](api_keys_delegation.sql).
 
-To set a custom per-owner sub-account limit, insert an owner config row:
+To set a custom per-owner grant limit, insert an owner config row:
 
 ```sql
 INSERT INTO fmsg_api_sub_account (owner_addr, agent, max_sub_accounts)
@@ -117,7 +121,9 @@ DO UPDATE SET max_sub_accounts = EXCLUDED.max_sub_accounts;
 
 Operators can bootstrap or rotate keys without RS256 by using the built-in CLI
 command. It uses the standard `PG*` connection environment variables and prints
-the plaintext API key once:
+the plaintext API key once.
+
+Derived sub-account:
 
 ```bash
 go run ./cmd/fmsg-webapi api-key create \
@@ -129,6 +135,22 @@ go run ./cmd/fmsg-webapi api-key create \
 go run ./cmd/fmsg-webapi api-key rotate \
   -owner @alice@example.com \
   -agent bot \
+  -expires 2027-03-31T00:00:00Z
+```
+
+Delegated identity:
+
+```bash
+go run ./cmd/fmsg-webapi api-key create-delegation \
+  -owner @mark@fmsg.io \
+  -agent sales \
+  -addr @sales@fmsg.io \
+  -cidr 203.0.113.0/24 \
+  -expires 2026-12-31T00:00:00Z
+
+go run ./cmd/fmsg-webapi api-key rotate-delegation \
+  -owner @mark@fmsg.io \
+  -agent sales \
   -expires 2027-03-31T00:00:00Z
 ```
 
@@ -215,10 +237,10 @@ the application.
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
-| `GET`    | `/fmsg/sub-accounts`             | List owned sub-accounts |
-| `POST`   | `/fmsg/sub-accounts`             | Create a sub-account API key |
-| `POST`   | `/fmsg/sub-accounts/:agent/rotate-key` | Rotate a sub-account API key |
-| `DELETE` | `/fmsg/sub-accounts/:agent`      | Delete a sub-account |
+| `GET`    | `/fmsg/sub-accounts`             | List owned API-access grants |
+| `POST`   | `/fmsg/sub-accounts`             | Create a derived sub-account API key |
+| `POST`   | `/fmsg/sub-accounts/:agent/rotate-key` | Rotate a grant API key |
+| `DELETE` | `/fmsg/sub-accounts/:agent`      | Delete a grant |
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
 | `PUT`    | `/fmsg/:id`                      | Update a draft message   |
@@ -246,7 +268,7 @@ Exchanges an opaque API key for a short-lived JWT.
 **Authentication:** `Authorization: Bearer fmsgk_<key_id>_<secret>`.
 
 The key must be unexpired, match the stored hash, be used from an allowed CIDR,
-and belong to a sub-account that exists in fmsgid.
+and belong to a granted address that exists in fmsgid.
 
 **Response:**
 
@@ -261,7 +283,10 @@ and belong to a sub-account that exists in fmsgid.
 
 ### GET `/fmsg/sub-accounts`
 
-Lists sub-accounts owned by the RS256-authenticated user.
+Lists API-access grants owned by the RS256-authenticated user. Grants with
+`grant_type: "derived_sub_account"` use the `@user_agent@domain` convention.
+Grants with `grant_type: "delegated_identity"` are explicit operator-created
+delegations to arbitrary fmsg addresses.
 
 **Response:**
 
@@ -272,7 +297,17 @@ Lists sub-accounts owned by the RS256-authenticated user.
     {
       "agent": "bot",
       "addr": "@alice_bot@example.com",
+      "grant_type": "derived_sub_account",
       "key_id": "abc",
+      "allowed_cidrs": ["203.0.113.0/24"],
+      "key_expires_at": "2026-12-31T00:00:00Z"
+    },
+    {
+      "agent": "sales",
+      "addr": "@sales@example.com",
+      "grant_type": "delegated_identity",
+      "display_name": "Sales mailbox",
+      "key_id": "def",
       "allowed_cidrs": ["203.0.113.0/24"],
       "key_expires_at": "2026-12-31T00:00:00Z"
     }
@@ -282,8 +317,8 @@ Lists sub-accounts owned by the RS256-authenticated user.
 
 ### POST `/fmsg/sub-accounts`
 
-Creates a sub-account and returns its plaintext API key once. Requires RS256
-owner authentication.
+Creates a derived sub-account and returns its plaintext API key once. Requires
+RS256 owner authentication.
 
 ```json
 {
@@ -296,15 +331,21 @@ owner authentication.
 The derived address is `@user_bot@domain`. `agent` may contain letters, digits,
 dots, and hyphens, but not underscores.
 
+Delegated identities such as `@sales@example.com` are not created by this
+self-service route. They are operator-created with `api-key create-delegation`
+after the operator has confirmed the owner is allowed to manage the delegated
+address.
+
 ### POST `/fmsg/sub-accounts/:agent/rotate-key`
 
-Rotates a sub-account API key and returns the new plaintext key once. Requires
-`key_expires_at`; `allowed_cidrs` may be supplied to replace the existing ranges.
+Rotates any grant API key owned by the RS256-authenticated user and returns the
+new plaintext key once. Requires `key_expires_at`; `allowed_cidrs` may be
+supplied to replace the existing ranges.
 
 ### DELETE `/fmsg/sub-accounts/:agent`
 
-Deletes a sub-account row and revokes future token exchange. Existing JWTs for
-that key are rejected on their next protected-route request.
+Deletes a grant row and revokes future token exchange. Existing JWTs for that
+key are rejected on their next protected-route request.
 
 ### GET `/fmsg/ws`
 
