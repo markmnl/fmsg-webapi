@@ -111,9 +111,8 @@ X-FMSG-Act-As: @user_bot@example.com
 The requested address must be granted to the authenticated user and must exist
 in fmsgid.
 
-Apply [dd.sql](dd.sql) before enabling API-key auth. Existing
-deployments that already applied the earlier API-key table should apply
-[api_keys_delegation.sql](api_keys_delegation.sql).
+Apply [dd.sql](dd.sql) before enabling API-key auth. The file is idempotent and
+also upgrades deployments that previously applied the earlier API-key table.
 
 To set a custom per-owner grant limit, insert an owner config row:
 
