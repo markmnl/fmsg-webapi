@@ -1,3 +1,11 @@
+-- fmsg-webapi database extensions.
+--
+-- This file extends the fmsgd schema at:
+-- https://github.com/markmnl/fmsgd/blob/main/dd.sql
+--
+-- fmsg-webapi assumes fmsgd is the fmsg host implementation and uses the same
+-- PostgreSQL database.
+
 CREATE TABLE IF NOT EXISTS fmsg_api_sub_account (
     owner_addr varchar(255) NOT NULL,
     agent varchar(64) NOT NULL,
