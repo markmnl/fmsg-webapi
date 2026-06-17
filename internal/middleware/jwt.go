@@ -262,7 +262,7 @@ func authFailureFromError(err error) (int, string, bool) {
 	case errors.Is(err, apiauth.ErrInvalidRemoteIP):
 		return http.StatusUnauthorized, "invalid source IP", true
 	case errors.Is(err, apiauth.ErrNotFound):
-		return http.StatusForbidden, "sub-account not authorised", true
+		return http.StatusForbidden, "grant not authorised", true
 	}
 	return 0, "", false
 }

@@ -35,6 +35,8 @@ type rotateKeyInput struct {
 type subAccountResponse struct {
 	Agent        string   `json:"agent"`
 	Addr         string   `json:"addr"`
+	GrantType    string   `json:"grant_type"`
+	DisplayName  string   `json:"display_name,omitempty"`
 	KeyID        string   `json:"key_id,omitempty"`
 	AllowedCIDRs []string `json:"allowed_cidrs"`
 	KeyExpiresAt string   `json:"key_expires_at"`
@@ -59,6 +61,8 @@ func (h *SubAccountHandler) List(c *gin.Context) {
 		out = append(out, subAccountResponse{
 			Agent:        a.Agent,
 			Addr:         a.Addr,
+			GrantType:    a.GrantType,
+			DisplayName:  a.DisplayName,
 			KeyID:        a.KeyID,
 			AllowedCIDRs: a.AllowedCIDRs,
 			KeyExpiresAt: a.KeyExpiresAt.UTC().Format(time.RFC3339),
@@ -109,6 +113,7 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, subAccountResponse{
 		Agent:        in.Agent,
 		Addr:         subAddr,
+		GrantType:    apiauth.GrantTypeDerivedSubAccount,
 		KeyID:        key.ID,
 		AllowedCIDRs: in.AllowedCIDRs,
 		KeyExpiresAt: expires.UTC().Format(time.RFC3339),
@@ -126,12 +131,12 @@ func (h *SubAccountHandler) RotateKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agent"})
 		return
 	}
-	expectedSubAddr, err := apiauth.DeriveSubAccountAddr(owner, agent)
+	account, err := h.store.Get(c.Request.Context(), owner, agent)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agent"})
+		respondSubAccountStoreError(c, err)
 		return
 	}
-	if !checkAcceptingFmsgID(c, h.idURL, expectedSubAddr) {
+	if !checkAcceptingFmsgID(c, h.idURL, account.Addr) {
 		return
 	}
 
@@ -167,6 +172,7 @@ func (h *SubAccountHandler) RotateKey(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"agent":          agent,
 		"addr":           subAddr,
+		"grant_type":     account.GrantType,
 		"key_id":         key.ID,
 		"key_expires_at": expires.UTC().Format(time.RFC3339),
 		"api_key":        key.Value,
@@ -228,7 +234,7 @@ func checkAcceptingFmsgID(c *gin.Context, idURL, addr string) bool {
 		return false
 	}
 	if code == http.StatusNotFound {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "sub-account not found in fmsgid"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "granted address not found in fmsgid"})
 		return false
 	}
 	if code != http.StatusOK {
@@ -236,7 +242,7 @@ func checkAcceptingFmsgID(c *gin.Context, idURL, addr string) bool {
 		return false
 	}
 	if !accepting {
-		c.JSON(http.StatusForbidden, gin.H{"error": "sub-account is not accepting new messages"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "granted address is not accepting new messages"})
 		return false
 	}
 	return true
@@ -249,9 +255,9 @@ func respondSubAccountStoreError(c *gin.Context, err error) {
 	case errors.Is(err, apiauth.ErrLimitExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "sub-account limit exceeded"})
 	case errors.Is(err, apiauth.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "sub-account not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "grant not found"})
 	default:
-		log.Printf("sub-account store error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update sub-account"})
+		log.Printf("grant store error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update grant"})
 	}
 }

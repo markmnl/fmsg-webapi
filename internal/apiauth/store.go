@@ -15,10 +15,15 @@ import (
 	"github.com/markmnl/fmsg-webapi/internal/db"
 )
 
-const DefaultMaxSubAccounts = 5
+const (
+	DefaultMaxSubAccounts = 5
+
+	GrantTypeDerivedSubAccount = "derived_sub_account"
+	GrantTypeDelegatedIdentity = "delegated_identity"
+)
 
 var (
-	ErrNotFound        = errors.New("sub-account not found")
+	ErrNotFound        = errors.New("grant not found")
 	ErrAlreadyExists   = errors.New("sub-account already exists")
 	ErrLimitExceeded   = errors.New("sub-account limit exceeded")
 	ErrCIDRDenied      = errors.New("source IP not allowed")
@@ -35,6 +40,8 @@ type SubAccount struct {
 	OwnerAddr      string
 	Agent          string
 	Addr           string
+	GrantType      string
+	DisplayName    string
 	KeyID          string
 	AllowedCIDRs   []string
 	KeyExpiresAt   time.Time
@@ -57,7 +64,7 @@ func (s *Store) List(ctx context.Context, ownerAddr string) (int, []SubAccount, 
 		return 0, nil, err
 	}
 	rows, err := s.DB.Pool.Query(ctx,
-		`SELECT owner_addr, agent, sub_addr, key_id,
+		`SELECT owner_addr, agent, sub_addr, grant_type, COALESCE(display_name, ''), key_id,
 		        ARRAY(SELECT cidr_value::text FROM unnest(allowed_cidrs) AS x(cidr_value)),
 		        key_expires_at, max_sub_accounts
 		   FROM fmsg_api_sub_account
@@ -71,7 +78,7 @@ func (s *Store) List(ctx context.Context, ownerAddr string) (int, []SubAccount, 
 	var out []SubAccount
 	for rows.Next() {
 		var a SubAccount
-		if err := rows.Scan(&a.OwnerAddr, &a.Agent, &a.Addr, &a.KeyID, &a.AllowedCIDRs, &a.KeyExpiresAt, &a.MaxSubAccounts); err != nil {
+		if err := rows.Scan(&a.OwnerAddr, &a.Agent, &a.Addr, &a.GrantType, &a.DisplayName, &a.KeyID, &a.AllowedCIDRs, &a.KeyExpiresAt, &a.MaxSubAccounts); err != nil {
 			return 0, nil, err
 		}
 		out = append(out, a)
@@ -97,7 +104,34 @@ func (s *Store) MaxSubAccounts(ctx context.Context, ownerAddr string) (int, erro
 	return max, nil
 }
 
+func (s *Store) Get(ctx context.Context, ownerAddr, agent string) (SubAccount, error) {
+	var a SubAccount
+	err := s.DB.Pool.QueryRow(ctx,
+		`SELECT owner_addr, agent, sub_addr, grant_type, COALESCE(display_name, ''), key_id,
+		        ARRAY(SELECT cidr_value::text FROM unnest(allowed_cidrs) AS x(cidr_value)),
+		        key_expires_at, max_sub_accounts
+		   FROM fmsg_api_sub_account
+		  WHERE lower(owner_addr) = lower($1) AND agent = $2 AND agent <> ''`,
+		ownerAddr, agent).
+		Scan(&a.OwnerAddr, &a.Agent, &a.Addr, &a.GrantType, &a.DisplayName, &a.KeyID, &a.AllowedCIDRs, &a.KeyExpiresAt, &a.MaxSubAccounts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SubAccount{}, ErrNotFound
+	}
+	if err != nil {
+		return SubAccount{}, err
+	}
+	return a, nil
+}
+
 func (s *Store) Create(ctx context.Context, ownerAddr, agent, subAddr, keyID string, keyHash []byte, allowedCIDRs []string, keyExpiresAt time.Time) error {
+	return s.createGrant(ctx, ownerAddr, agent, subAddr, GrantTypeDerivedSubAccount, "", keyID, keyHash, allowedCIDRs, keyExpiresAt)
+}
+
+func (s *Store) CreateDelegated(ctx context.Context, ownerAddr, agent, delegatedAddr, displayName, keyID string, keyHash []byte, allowedCIDRs []string, keyExpiresAt time.Time) error {
+	return s.createGrant(ctx, ownerAddr, agent, delegatedAddr, GrantTypeDelegatedIdentity, displayName, keyID, keyHash, allowedCIDRs, keyExpiresAt)
+}
+
+func (s *Store) createGrant(ctx context.Context, ownerAddr, agent, subAddr, grantType, displayName, keyID string, keyHash []byte, allowedCIDRs []string, keyExpiresAt time.Time) error {
 	tx, err := s.DB.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -121,9 +155,9 @@ func (s *Store) Create(ctx context.Context, ownerAddr, agent, subAddr, keyID str
 
 	_, err = tx.Exec(ctx,
 		`INSERT INTO fmsg_api_sub_account
-		        (owner_addr, agent, sub_addr, key_id, key_hash, allowed_cidrs, key_expires_at, max_sub_accounts, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6::cidr[], $7, $8, now())`,
-		ownerAddr, agent, subAddr, keyID, keyHash, allowedCIDRs, keyExpiresAt, max)
+		        (owner_addr, agent, sub_addr, grant_type, display_name, key_id, key_hash, allowed_cidrs, key_expires_at, max_sub_accounts, updated_at)
+		 VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8::cidr[], $9, $10, now())`,
+		ownerAddr, agent, subAddr, grantType, displayName, keyID, keyHash, allowedCIDRs, keyExpiresAt, max)
 	if isUniqueViolation(err) {
 		return ErrAlreadyExists
 	}
