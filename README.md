@@ -35,6 +35,11 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 `PGPASSWORD`, `PGDATABASE`) are used for database connectivity.
 
+fmsg-webapi assumes [fmsgd](https://github.com/markmnl/fmsgd) is the fmsg host
+implementation and uses the same PostgreSQL database. The fmsgd schema remains
+the base schema; this repository's [dd.sql](dd.sql) adds the API-key and
+delegation tables used by fmsg-webapi.
+
 A `.env` file placed in the working directory is loaded automatically at startup
 (values in the environment take precedence).
 
@@ -106,7 +111,7 @@ X-FMSG-Act-As: @user_bot@example.com
 The requested address must be granted to the authenticated user and must exist
 in fmsgid.
 
-Apply [api_keys.sql](api_keys.sql) before enabling API-key auth. Existing
+Apply [dd.sql](dd.sql) before enabling API-key auth. Existing
 deployments that already applied the earlier API-key table should apply
 [api_keys_delegation.sql](api_keys_delegation.sql).
 
