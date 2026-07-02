@@ -9,10 +9,10 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
-| `FMSG_JWT_JWKS_URL` | *(prod)*                 | JWKS endpoint for the configured identity provider (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies RS256 JWTs. RSA public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
+| `FMSG_JWT_JWKS_URL` | *(prod)*                 | JWKS endpoint for the configured identity provider (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies EdDSA (Ed25519) JWTs. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
 | `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com/`). Tokens with a different issuer are rejected. This must exactly match the token issuer. |
-| `FMSG_JWT_AUDIENCE` | *(prod, required with JWKS)* | Expected `aud` claim value for this application or API. |
-| `FMSG_JWT_ADDRESS_CLAIM` | *(prod, required with JWKS)* | JWT claim name containing the fmsg address in `@user@domain` form, e.g. `fmsg_address` or a namespaced custom claim. |
+| `FMSG_JWT_AUDIENCE` | *(optional)* | When set, tokens must include this value in their `aud` claim. Leave unset if your identity provider does not issue an `aud` claim. |
+| `FMSG_JWT_ADDRESS_CLAIM` | *(prod, required with JWKS)* | JWT claim name containing the fmsg address in `@user@domain` form, e.g. `sub` or a namespaced custom claim. |
 | `FMSG_API_TOKEN_ED25519_PRIVATE_KEY` | *(optional)* | Base64-encoded Ed25519 private key or seed used to mint first-party JWTs from API keys. Required to enable `/fmsg/token` and sub-account routes. |
 | `FMSG_API_TOKEN_ISSUER` | `fmsg-webapi` | Issuer for first-party API-key JWTs. |
 | `FMSG_API_TOKEN_AUDIENCE` | `fmsg-webapi` | Audience for first-party API-key JWTs. |
@@ -48,27 +48,27 @@ A `.env` file placed in the working directory is loaded automatically at startup
 Most `/fmsg/*` routes require an `Authorization: Bearer <token>` header. The
 API can enable either or both authentication methods at startup:
 
-- RS256/JWKS tokens from an external identity provider.
+- EdDSA/JWKS tokens from an external identity provider.
 - First-party Ed25519 JWTs minted by `POST /fmsg/token` from opaque API keys.
 
 Startup fails unless at least one method is configured.
 
-### RS256 (production, JWKS-backed JWTs)
+### EdDSA (production, JWKS-backed JWTs)
 
 Active when `FMSG_JWT_JWKS_URL` is set. Tokens must be issued by the configured
-identity provider and signed with RS256. The JWKS endpoint is polled on a
-schedule; the provider can rotate keys by adding a new JWK with a fresh `kid`.
+identity provider and signed with EdDSA (Ed25519). The JWKS endpoint is polled
+on a schedule; the provider can rotate keys by adding a new JWK with a fresh
+`kid`.
 
-Required token header: `alg: RS256`, `kid: <known to JWKS>`, `typ: JWT`.
+Required token header: `alg: EdDSA`, `kid: <known to JWKS>`, `typ: JWT`.
 
 Relevant claims:
 
 | Claim | Description |
 | ----- | ----------- |
 | `iss` | Must equal `FMSG_JWT_ISSUER`. |
-| `aud` | Must contain `FMSG_JWT_AUDIENCE`. |
-| configured address claim | The claim named by `FMSG_JWT_ADDRESS_CLAIM`; must contain the user address in `@user@domain` form. Tokens without this claim are rejected with `403 no fmsg account for this identity`. |
-| `sub` | Provider-specific identity. It is validated as part of the signed token but is not used as the fmsg address in RS256 mode. |
+| `aud` | Must contain `FMSG_JWT_AUDIENCE`, only checked when that variable is set. |
+| configured address claim | The claim named by `FMSG_JWT_ADDRESS_CLAIM` (commonly `sub`); must contain the user address in `@user@domain` form. Tokens without this claim are rejected with `403 no fmsg account for this identity`. |
 | `exp` | Expiry timestamp (must be in the future, ±10 s leeway). |
 | `iat` | Optional issued-at timestamp; validated when present. |
 | `nbf` | Optional not-before timestamp; validated when present. |
@@ -77,10 +77,10 @@ A 10-second clock-skew leeway is applied to `iat`/`nbf`/`exp` validation. After
 the address claim is validated, the API checks fmsgid to confirm the address is
 known and accepting new messages.
 
-Clients must send a JWT that matches the configured issuer and audience and
-includes the configured address claim. Whether that token is an ID token or
-access token is determined by the identity provider configuration for the
-deployment.
+Clients must send a JWT that matches the configured issuer (and audience, if
+configured) and includes the configured address claim. Whether that token is
+an ID token or access token is determined by the identity provider
+configuration for the deployment.
 
 ### API Keys And First-Party JWTs
 
@@ -101,7 +101,7 @@ The returned JWT contains `sub` (the granted address), `owner`, `api_key_id`,
 each request, so deleting a grant or expiring its key invalidates existing
 tokens before their normal expiry.
 
-An RS256-authenticated owner can perform normal message routes as one of their
+An EdDSA-authenticated owner can perform normal message routes as one of their
 granted identities without changing request bodies:
 
 ```http
@@ -123,7 +123,7 @@ ON CONFLICT (owner_addr, agent)
 DO UPDATE SET max_sub_accounts = EXCLUDED.max_sub_accounts;
 ```
 
-Operators can bootstrap or rotate keys without RS256 by using the built-in CLI
+Operators can bootstrap or rotate keys without EdDSA by using the built-in CLI
 command. It uses the standard `PG*` connection environment variables and prints
 the plaintext API key once.
 
@@ -183,8 +183,9 @@ by default; override with `FMSG_API_PORT`.
 export FMSG_DATA_DIR=/opt/fmsg/data
 export FMSG_JWT_JWKS_URL=https://idp.example.com/.well-known/jwks.json
 export FMSG_JWT_ISSUER=https://idp.example.com/
-export FMSG_JWT_AUDIENCE=fmsg-web-client
-export FMSG_JWT_ADDRESS_CLAIM=fmsg_address
+export FMSG_JWT_ADDRESS_CLAIM=sub
+# Optional: only set this if your identity provider issues an aud claim.
+# export FMSG_JWT_AUDIENCE=fmsg-web-client
 # Optional: also enable programmatic API keys.
 # export FMSG_API_TOKEN_ED25519_PRIVATE_KEY=$(openssl rand -base64 32)
 export FMSG_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem
@@ -237,8 +238,8 @@ the application.
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
-| `GET`    | `/fmsg`                          | List messages for user   |
-| `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
+| `GET`    | `/fmsg`                          | List messages for user (and their sub-accounts) |
+| `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts, and sub-accounts') |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
 | `GET`    | `/fmsg/sub-accounts`             | List owned API-access grants |
@@ -287,7 +288,7 @@ and belong to a granted address that exists in fmsgid.
 
 ### GET `/fmsg/sub-accounts`
 
-Lists API-access grants owned by the RS256-authenticated user. Grants with
+Lists API-access grants owned by the EdDSA-authenticated user. Grants with
 `grant_type: "derived_sub_account"` use the `@user_agent@domain` convention.
 Grants with `grant_type: "delegated_identity"` are explicit operator-created
 delegations to arbitrary fmsg addresses.
@@ -322,7 +323,7 @@ delegations to arbitrary fmsg addresses.
 ### POST `/fmsg/sub-accounts`
 
 Creates a derived sub-account and returns its plaintext API key once. Requires
-RS256 owner authentication.
+EdDSA owner authentication.
 
 ```json
 {
@@ -342,7 +343,7 @@ address.
 
 ### POST `/fmsg/sub-accounts/:agent/rotate-key`
 
-Rotates any grant API key owned by the RS256-authenticated user and returns the
+Rotates any grant API key owned by the EdDSA-authenticated user and returns the
 new plaintext key once. Requires `key_expires_at`; `allowed_cidrs` may be
 supplied to replace the existing ranges.
 
@@ -391,7 +392,15 @@ ws.onmessage = (e) => {
 
 ### GET `/fmsg`
 
-Returns messages where the authenticated user is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
+Returns messages where the authenticated identity is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
+
+An owner authenticated as themselves (not acting as a sub-account) also sees
+messages addressed to any of their `derived_sub_account` addresses
+(`@user_agent@domain`). A sub-account, whether authenticated via its own
+API-key token or via the owner's `X-FMSG-Act-As` header, sees only its own
+messages — visibility does not expand in that direction. The `read`/`time_read`
+fields reflect whether any of the caller's visible addresses has read the
+message.
 
 **Query parameters:**
 
@@ -404,7 +413,7 @@ Returns messages where the authenticated user is a recipient (listed in `msg_to`
 
 ### GET `/fmsg/sent`
 
-Returns messages authored by the authenticated user (`msg.from_addr = <identity>`), ordered by message ID descending.
+Returns messages authored by the authenticated identity (`msg.from_addr`), ordered by message ID descending. Subject to the same owner/sub-account visibility rules as `GET /fmsg`.
 
 This includes both sent messages and drafts (`time_sent` may be `NULL`).
 
@@ -449,7 +458,7 @@ Add-to recipients are not part of this body — they are added later via `POST /
 
 ### GET `/fmsg/:id`
 
-Retrieves a single message by ID. The authenticated user must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
+Retrieves a single message by ID. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`) — considering any of the caller's visible addresses (self plus derived sub-accounts, per `GET /fmsg`).
 
 **Response:** JSON message object:
 
@@ -585,7 +594,7 @@ New addresses must be distinct among themselves (case-insensitive).
 
 ### GET `/fmsg/:id/data`
 
-Downloads the binary body of a message. The authenticated user must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
+Downloads the binary body of a message. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`) — considering any of the caller's visible addresses (self plus derived sub-accounts, per `GET /fmsg`).
 
 **Response:** The raw message body file with `Content-Disposition: attachment` header. The `Content-Type` is inferred from the stored file extension.
 

@@ -39,7 +39,9 @@ type APIKeyChecker interface {
 
 // Config configures authentication.
 type Config struct {
-	// RS256/JWKS provider token verification. Enabled when JWKS is non-nil.
+	// EdDSA/JWKS provider token verification. Enabled when JWKS is non-nil.
+	// Audience is optional; when empty, tokens are not required to carry an
+	// aud claim.
 	JWKS         jwt.Keyfunc
 	Issuer       string
 	Audience     string
@@ -88,28 +90,28 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 
 	if cfg.JWKS != nil {
 		if cfg.Issuer == "" {
-			return nil, errors.New("middleware: RS256 mode requires an Issuer")
-		}
-		if cfg.Audience == "" {
-			return nil, errors.New("middleware: RS256 mode requires an Audience")
+			return nil, errors.New("middleware: EdDSA mode requires an Issuer")
 		}
 		if cfg.AddressClaim == "" {
-			return nil, errors.New("middleware: RS256 mode requires an AddressClaim")
+			return nil, errors.New("middleware: EdDSA mode requires an AddressClaim")
 		}
 		v.rsKeyFunc = func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 			}
 			return cfg.JWKS(t)
 		}
-		v.rsParser = jwt.NewParser(
-			jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
+		parserOpts := []jwt.ParserOption{
+			jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
 			jwt.WithLeeway(cfg.ClockSkew),
 			jwt.WithExpirationRequired(),
 			jwt.WithIssuedAt(),
 			jwt.WithIssuer(cfg.Issuer),
-			jwt.WithAudience(cfg.Audience),
-		)
+		}
+		if cfg.Audience != "" {
+			parserOpts = append(parserOpts, jwt.WithAudience(cfg.Audience))
+		}
+		v.rsParser = jwt.NewParser(parserOpts...)
 		v.issuer = cfg.Issuer
 		v.audience = cfg.Audience
 		v.addressClaim = cfg.AddressClaim

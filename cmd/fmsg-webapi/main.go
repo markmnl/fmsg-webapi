@@ -35,7 +35,7 @@ func main() {
 	// Required configuration.
 	dataDir := mustEnv("FMSG_DATA_DIR")
 
-	// JWT configuration. RS256 provider JWTs and first-party Ed25519 API
+	// JWT configuration. EdDSA provider JWTs and first-party Ed25519 API
 	// tokens can be enabled independently.
 	jwksURL := os.Getenv("FMSG_JWT_JWKS_URL")
 	jwtIssuer := os.Getenv("FMSG_JWT_ISSUER")
@@ -137,7 +137,7 @@ func main() {
 	// Global rate limiting is handled by nftables at the host level.
 
 	// Instantiate handlers.
-	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize)
+	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize, apiStore)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Web Push handler: stores subscriptions and delivers VAPID pushes for
@@ -297,17 +297,17 @@ func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, addressClaim
 	}
 
 	if jwksURL != "" {
-		if issuer == "" || audience == "" || addressClaim == "" {
-			return cfg, errors.New("FMSG_JWT_ISSUER, FMSG_JWT_AUDIENCE and FMSG_JWT_ADDRESS_CLAIM are required when FMSG_JWT_JWKS_URL is set")
+		if issuer == "" || addressClaim == "" {
+			return cfg, errors.New("FMSG_JWT_ISSUER and FMSG_JWT_ADDRESS_CLAIM are required when FMSG_JWT_JWKS_URL is set")
 		}
 		k, err := keyfunc.NewDefaultCtx(ctx, []string{jwksURL})
 		if err != nil {
 			return cfg, err
 		}
 		cfg.JWKS = k.Keyfunc
-		log.Printf("RS256 auth enabled (issuer=%s, jwks=%s, audience=%s, address_claim=%s)", issuer, jwksURL, audience, addressClaim)
+		log.Printf("EdDSA auth enabled (issuer=%s, jwks=%s, audience=%q, address_claim=%s)", issuer, jwksURL, audience, addressClaim)
 	} else {
-		log.Println("RS256 auth disabled (FMSG_JWT_JWKS_URL not set)")
+		log.Println("EdDSA auth disabled (FMSG_JWT_JWKS_URL not set)")
 	}
 
 	if tokenIssuer != nil {

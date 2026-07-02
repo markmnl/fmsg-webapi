@@ -89,6 +89,36 @@ func (s *Store) List(ctx context.Context, ownerAddr string) (int, []SubAccount, 
 	return max, out, nil
 }
 
+// ListDerivedAddrs returns the derived sub-account addresses (@owner_agent@domain)
+// belonging to ownerAddr, for expanding an owner's message visibility to
+// include their sub-accounts'. Delegated identities are excluded: they are
+// operator-granted access to an otherwise unrelated address, not something
+// that "belongs" to the owner.
+func (s *Store) ListDerivedAddrs(ctx context.Context, ownerAddr string) ([]string, error) {
+	rows, err := s.DB.Pool.Query(ctx,
+		`SELECT sub_addr
+		   FROM fmsg_api_sub_account
+		  WHERE lower(owner_addr) = lower($1) AND agent <> '' AND grant_type = $2`,
+		ownerAddr, GrantTypeDerivedSubAccount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		out = append(out, addr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) MaxSubAccounts(ctx context.Context, ownerAddr string) (int, error) {
 	var max int
 	err := s.DB.Pool.QueryRow(ctx,
