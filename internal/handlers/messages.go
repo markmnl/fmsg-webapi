@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/markmnl/fmsg-webapi/internal/apiauth"
 	"github.com/markmnl/fmsg-webapi/internal/db"
 	"github.com/markmnl/fmsg-webapi/internal/middleware"
 	"github.com/markmnl/fmsg-webapi/internal/models"
@@ -31,11 +32,20 @@ type MessageHandler struct {
 	MaxDataSize   int64
 	MaxMsgSize    int64
 	ShortTextSize int
+	SubAccounts   *apiauth.Store
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int, subAccounts *apiauth.Store) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize, SubAccounts: subAccounts}
+}
+
+// visibleAddrs returns the set of fmsg addresses whose messages the caller
+// may see — always exactly the one identity they authenticated as (owner,
+// or the sub-account named via X-FMSG-Act-As / a sub-account's own API-key
+// token). Callers never see another identity's messages in the same request.
+func (h *MessageHandler) visibleAddrs(c *gin.Context) ([]string, error) {
+	return []string{middleware.GetIdentity(c)}, nil
 }
 
 // messageListItem is the JSON shape for each message in the list response.
@@ -75,7 +85,12 @@ type messageInput struct {
 
 // List handles GET /fmsg — lists messages where the authenticated user is a recipient.
 func (h *MessageHandler) List(c *gin.Context) {
-	identity := middleware.GetIdentity(c)
+	addrs, err := h.visibleAddrs(c)
+	if err != nil {
+		log.Printf("list messages: resolve visible addrs: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
+		return
+	}
 
 	limit, offset, ok := parseLimitOffset(c)
 	if !ok {
@@ -87,15 +102,15 @@ func (h *MessageHandler) List(c *gin.Context) {
 	rows, err := h.DB.Pool.Query(ctx,
 		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
 		        COALESCE(
-		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1),
-		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
+		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = ANY($1)),
+		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = ANY($1))
 		        ) AS time_read
 		 FROM msg m
-		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = $1)
-		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = $1)
+		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = ANY($1))
+		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = ANY($1))
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
-		identity, limit, offset,
+		addrs, limit, offset,
 	)
 	if err != nil {
 		log.Printf("list messages: %v", err)
@@ -184,6 +199,12 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
+	addrs, err := h.visibleAddrs(c)
+	if err != nil {
+		log.Printf("list sent messages: resolve visible addrs: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
+		return
+	}
 
 	limit, offset, ok := parseLimitOffset(c)
 	if !ok {
@@ -195,10 +216,10 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	rows, err := h.DB.Pool.Query(ctx,
 		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
-		 WHERE m.from_addr = $1
+		 WHERE m.from_addr = ANY($1)
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
-		identity, limit, offset,
+		addrs, limit, offset,
 	)
 	if err != nil {
 		log.Printf("list sent messages: %v", err)
@@ -382,7 +403,12 @@ func (h *MessageHandler) Create(c *gin.Context) {
 
 // Get handles GET /fmsg/:id — retrieves a message.
 func (h *MessageHandler) Get(c *gin.Context) {
-	identity := middleware.GetIdentity(c)
+	addrs, err := h.visibleAddrs(c)
+	if err != nil {
+		log.Printf("get message: resolve visible addrs: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
 	msgID, ok := parseID(c)
 	if !ok {
 		return
@@ -400,8 +426,9 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		return
 	}
 
-	// Authorization: owner or recipient (to or add_to).
-	if msg.From != identity && !isRecipient(msg.To, identity) && !addToContains(msg.AddTo, identity) {
+	// Authorization: owner or recipient (to or add_to), across all visible addrs.
+	isSender := isRecipient(addrs, msg.From)
+	if !isSender && !anyRecipient(addrs, msg.To) && !anyAddToContains(addrs, msg.AddTo) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
@@ -411,14 +438,14 @@ func (h *MessageHandler) Get(c *gin.Context) {
 
 	// Populate per-recipient read state for the calling user. The sender
 	// has no read state of their own.
-	if msg.From != identity {
+	if !isSender {
 		var timeRead *float64
 		err := h.DB.Pool.QueryRow(ctx,
 			`SELECT COALESCE(
-			    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2),
-			    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)
+			    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = ANY($2)),
+			    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = ANY($2))
 			 )`,
-			msgID, identity,
+			msgID, addrs,
 		).Scan(&timeRead)
 		if err == nil {
 			msg.TimeRead = timeRead
@@ -431,7 +458,12 @@ func (h *MessageHandler) Get(c *gin.Context) {
 
 // DownloadData handles GET /fmsg/:id/data — downloads the message body as a file.
 func (h *MessageHandler) DownloadData(c *gin.Context) {
-	identity := middleware.GetIdentity(c)
+	addrs, err := h.visibleAddrs(c)
+	if err != nil {
+		log.Printf("download data: resolve visible addrs: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
 	msgID, ok := parseID(c)
 	if !ok {
 		return
@@ -442,7 +474,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	// Fetch message metadata for auth check and file path.
 	var fromAddr string
 	var dataPath string
-	err := h.DB.Pool.QueryRow(ctx,
+	err = h.DB.Pool.QueryRow(ctx,
 		"SELECT from_addr, filepath FROM msg WHERE id = $1", msgID,
 	).Scan(&fromAddr, &dataPath)
 	if err != nil {
@@ -455,15 +487,15 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 		return
 	}
 
-	// Authorize: must be owner or recipient.
-	if fromAddr != identity {
+	// Authorize: must be owner or recipient (across all visible addrs).
+	if !isRecipient(addrs, fromAddr) {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
 			`SELECT COUNT(*) FROM (
-				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = $2
+				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = ANY($2)
 				UNION ALL
-				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = $2
-			) r`, msgID, identity,
+				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = ANY($2)
+			) r`, msgID, addrs,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 			return
@@ -1135,6 +1167,26 @@ func isRecipient(to []string, addr string) bool {
 func addToContains(batches []models.AddToBatch, addr string) bool {
 	for _, b := range batches {
 		if isRecipient(b.To, addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyRecipient reports whether any of addrs appears in the to list.
+func anyRecipient(addrs, to []string) bool {
+	for _, a := range addrs {
+		if isRecipient(to, a) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyAddToContains reports whether any of addrs is a recipient in any add-to batch.
+func anyAddToContains(addrs []string, batches []models.AddToBatch) bool {
+	for _, a := range addrs {
+		if addToContains(batches, a) {
 			return true
 		}
 	}
