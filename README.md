@@ -336,7 +336,9 @@ EdDSA owner authentication.
 ```
 
 The derived address is `@user_bot@domain`. `agent` may contain letters, digits,
-dots, and hyphens, but not underscores.
+dots, and hyphens, but not underscores. The derived address is automatically
+registered with fmsgid (with default quotas) if it doesn't already exist there
+— no manual fmsgid step is needed for derived sub-accounts.
 
 Delegated identities such as `@sales@example.com` are not created by this
 self-service route. They are operator-created with `api-key create-delegation`
