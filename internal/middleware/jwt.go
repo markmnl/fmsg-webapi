@@ -2,8 +2,10 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -427,6 +429,30 @@ func CheckFmsgID(idURL, addr string) (int, bool, error) {
 	}
 	res := v.(fmsgIDResult)
 	return res.code, res.acceptingNew, nil
+}
+
+// RegisterFmsgID registers addr with fmsgid using default quotas, idempotently.
+// It never modifies an address that already exists there.
+func RegisterFmsgID(idURL, addr string) error {
+	payload, err := json.Marshal(struct {
+		Address string `json:"address"`
+	}{Address: addr})
+	if err != nil {
+		return err
+	}
+
+	url := strings.TrimRight(idURL, "/") + "/fmsgid"
+	resp, err := fmsgIDClient.Post(url, "application/json", bytes.NewReader(payload)) //nolint:gosec // URL constructed from trusted config
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
+	}
+	fmsgIDCache.Delete(addr)
+	return nil
 }
 
 func fetchFmsgID(idURL, addr string) (fmsgIDResult, error) {

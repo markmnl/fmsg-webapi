@@ -125,6 +125,14 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "agent must be 1-64 letters/digits/dots/hyphens and contain no underscores"})
 		return
 	}
+	// Derived sub-accounts belong to an already-verified owner, so register
+	// them in fmsgid automatically rather than requiring a manual step.
+	// RegisterFmsgID never touches an address that already exists there.
+	if err := middleware.RegisterFmsgID(h.idURL, subAddr); err != nil {
+		log.Printf("sub-account create: fmsgid registration: addr=%s: %v", subAddr, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
+		return
+	}
 	if !checkAcceptingFmsgID(c, h.idURL, subAddr) {
 		return
 	}
