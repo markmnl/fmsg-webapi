@@ -89,36 +89,6 @@ func (s *Store) List(ctx context.Context, ownerAddr string) (int, []SubAccount, 
 	return max, out, nil
 }
 
-// ListDerivedAddrs returns the derived sub-account addresses (@owner_agent@domain)
-// belonging to ownerAddr, for expanding an owner's message visibility to
-// include their sub-accounts'. Delegated identities are excluded: they are
-// operator-granted access to an otherwise unrelated address, not something
-// that "belongs" to the owner.
-func (s *Store) ListDerivedAddrs(ctx context.Context, ownerAddr string) ([]string, error) {
-	rows, err := s.DB.Pool.Query(ctx,
-		`SELECT sub_addr
-		   FROM fmsg_api_sub_account
-		  WHERE lower(owner_addr) = lower($1) AND agent <> '' AND grant_type = $2`,
-		ownerAddr, GrantTypeDerivedSubAccount)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []string
-	for rows.Next() {
-		var addr string
-		if err := rows.Scan(&addr); err != nil {
-			return nil, err
-		}
-		out = append(out, addr)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (s *Store) MaxSubAccounts(ctx context.Context, ownerAddr string) (int, error) {
 	var max int
 	err := s.DB.Pool.QueryRow(ctx,
@@ -197,24 +167,14 @@ func (s *Store) createGrant(ctx context.Context, ownerAddr, agent, subAddr, gran
 	return tx.Commit(ctx)
 }
 
-func (s *Store) RotateKey(ctx context.Context, ownerAddr, agent, keyID string, keyHash []byte, keyExpiresAt time.Time, allowedCIDRs []string, replaceCIDRs bool) (string, error) {
+func (s *Store) RotateKey(ctx context.Context, ownerAddr, agent, keyID string, keyHash []byte, keyExpiresAt time.Time) (string, error) {
 	var subAddr string
-	var err error
-	if replaceCIDRs {
-		err = s.DB.Pool.QueryRow(ctx,
-			`UPDATE fmsg_api_sub_account
-			    SET key_id = $3, key_hash = $4, key_expires_at = $5, allowed_cidrs = $6::cidr[], updated_at = now()
-			  WHERE lower(owner_addr) = lower($1) AND agent = $2 AND agent <> ''
-			  RETURNING sub_addr`,
-			ownerAddr, agent, keyID, keyHash, keyExpiresAt, allowedCIDRs).Scan(&subAddr)
-	} else {
-		err = s.DB.Pool.QueryRow(ctx,
-			`UPDATE fmsg_api_sub_account
-			    SET key_id = $3, key_hash = $4, key_expires_at = $5, updated_at = now()
-			  WHERE lower(owner_addr) = lower($1) AND agent = $2 AND agent <> ''
-			  RETURNING sub_addr`,
-			ownerAddr, agent, keyID, keyHash, keyExpiresAt).Scan(&subAddr)
-	}
+	err := s.DB.Pool.QueryRow(ctx,
+		`UPDATE fmsg_api_sub_account
+		    SET key_id = $3, key_hash = $4, key_expires_at = $5, updated_at = now()
+		  WHERE lower(owner_addr) = lower($1) AND agent = $2 AND agent <> ''
+		  RETURNING sub_addr`,
+		ownerAddr, agent, keyID, keyHash, keyExpiresAt).Scan(&subAddr)
 	if isUniqueViolation(err) {
 		return "", ErrAlreadyExists
 	}
@@ -225,6 +185,28 @@ func (s *Store) RotateKey(ctx context.Context, ownerAddr, agent, keyID string, k
 		return "", err
 	}
 	return subAddr, nil
+}
+
+// UpdateCIDRs replaces the allowed source CIDRs for a sub-account without
+// touching its API key, returning the updated account.
+func (s *Store) UpdateCIDRs(ctx context.Context, ownerAddr, agent string, allowedCIDRs []string) (SubAccount, error) {
+	var a SubAccount
+	err := s.DB.Pool.QueryRow(ctx,
+		`UPDATE fmsg_api_sub_account
+		    SET allowed_cidrs = $3::cidr[], updated_at = now()
+		  WHERE lower(owner_addr) = lower($1) AND agent = $2 AND agent <> ''
+		  RETURNING owner_addr, agent, sub_addr, grant_type, COALESCE(display_name, ''), key_id,
+		            ARRAY(SELECT cidr_value::text FROM unnest(allowed_cidrs) AS x(cidr_value)),
+		            key_expires_at, max_sub_accounts`,
+		ownerAddr, agent, allowedCIDRs).
+		Scan(&a.OwnerAddr, &a.Agent, &a.Addr, &a.GrantType, &a.DisplayName, &a.KeyID, &a.AllowedCIDRs, &a.KeyExpiresAt, &a.MaxSubAccounts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SubAccount{}, ErrNotFound
+	}
+	if err != nil {
+		return SubAccount{}, err
+	}
+	return a, nil
 }
 
 func (s *Store) Delete(ctx context.Context, ownerAddr, agent string) error {

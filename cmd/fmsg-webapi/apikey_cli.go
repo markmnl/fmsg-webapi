@@ -85,13 +85,17 @@ func runAPIKeyRotate(ctx context.Context, args []string) error {
 	defer database.Close()
 
 	store := apiauth.NewStore(database)
-	replaceCIDRs := strings.TrimSpace(*cidrs) != ""
-	gotSubAddr, err := store.RotateKey(ctx, *owner, *agent, key.ID, hash, expires, allowed, replaceCIDRs)
+	gotSubAddr, err := store.RotateKey(ctx, *owner, *agent, key.ID, hash, expires)
 	if err != nil {
 		return err
 	}
 	if !strings.EqualFold(gotSubAddr, subAddr) {
 		return fmt.Errorf("stored sub-account address %s does not match derived address %s", gotSubAddr, subAddr)
+	}
+	if strings.TrimSpace(*cidrs) != "" {
+		if _, err := store.UpdateCIDRs(ctx, *owner, *agent, allowed); err != nil {
+			return err
+		}
 	}
 	printCLIKey(*owner, *agent, subAddr, key)
 	return nil
@@ -156,10 +160,14 @@ func runAPIKeyRotateDelegation(ctx context.Context, args []string) error {
 	defer database.Close()
 
 	store := apiauth.NewStore(database)
-	replaceCIDRs := strings.TrimSpace(*cidrs) != ""
-	subAddr, err := store.RotateKey(ctx, *owner, *agent, key.ID, hash, expires, allowed, replaceCIDRs)
+	subAddr, err := store.RotateKey(ctx, *owner, *agent, key.ID, hash, expires)
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(*cidrs) != "" {
+		if _, err := store.UpdateCIDRs(ctx, *owner, *agent, allowed); err != nil {
+			return err
+		}
 	}
 	printCLIKey(*owner, *agent, subAddr, key)
 	return nil

@@ -24,8 +24,8 @@ const (
 	OwnerIdentityKey = "owner"
 	AuthTypeKey      = "auth_type"
 
-	AuthTypeRS256 = "rs256"
-	AuthTypeAPI   = "api_token"
+	AuthTypeIdP = "idp"
+	AuthTypeAPI = "api_token"
 )
 
 // DefaultClockSkew is the leeway applied to iat/nbf/exp validation to tolerate
@@ -70,8 +70,8 @@ type authResult struct {
 // Verifier verifies fmsg bearer tokens. It is safe for concurrent use and is
 // shared by Gin middleware and the WebSocket handler.
 type Verifier struct {
-	rsParser     *jwt.Parser
-	rsKeyFunc    jwt.Keyfunc
+	idpParser    *jwt.Parser
+	idpKeyFunc   jwt.Keyfunc
 	issuer       string
 	audience     string
 	addressClaim string
@@ -95,7 +95,7 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 		if cfg.AddressClaim == "" {
 			return nil, errors.New("middleware: EdDSA mode requires an AddressClaim")
 		}
-		v.rsKeyFunc = func(t *jwt.Token) (interface{}, error) {
+		v.idpKeyFunc = func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 			}
@@ -111,7 +111,7 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 		if cfg.Audience != "" {
 			parserOpts = append(parserOpts, jwt.WithAudience(cfg.Audience))
 		}
-		v.rsParser = jwt.NewParser(parserOpts...)
+		v.idpParser = jwt.NewParser(parserOpts...)
 		v.issuer = cfg.Issuer
 		v.audience = cfg.Audience
 		v.addressClaim = cfg.AddressClaim
@@ -139,7 +139,7 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 		)
 	}
 
-	if v.rsParser == nil && v.apiParser == nil {
+	if v.idpParser == nil && v.apiParser == nil {
 		return nil, errors.New("middleware: at least one auth mode must be configured")
 	}
 	return v, nil
@@ -154,8 +154,8 @@ func (v *Verifier) Authenticate(tokenStr string) (addr string, status int, msg s
 }
 
 func (v *Verifier) AuthenticateRequest(ctx context.Context, tokenStr, remoteAddr, actAs string) (authResult, int, string) {
-	if v.rsParser != nil {
-		res, err := v.authenticateRS256(ctx, tokenStr, actAs)
+	if v.idpParser != nil {
+		res, err := v.authenticateIdP(ctx, tokenStr, actAs)
 		if err == nil {
 			return res, http.StatusOK, ""
 		}
@@ -176,9 +176,9 @@ func (v *Verifier) AuthenticateRequest(ctx context.Context, tokenStr, remoteAddr
 	return authResult{}, http.StatusUnauthorized, "invalid token"
 }
 
-func (v *Verifier) authenticateRS256(ctx context.Context, tokenStr, actAs string) (authResult, error) {
+func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) (authResult, error) {
 	claims := jwt.MapClaims{}
-	if _, err := v.rsParser.ParseWithClaims(tokenStr, claims, v.rsKeyFunc); err != nil {
+	if _, err := v.idpParser.ParseWithClaims(tokenStr, claims, v.idpKeyFunc); err != nil {
 		return authResult{}, err
 	}
 
@@ -191,7 +191,7 @@ func (v *Verifier) authenticateRS256(ctx context.Context, tokenStr, actAs string
 	if status, msg := validateIdentity(owner, v.idURL); status != http.StatusOK {
 		return authResult{}, authError{status: status, msg: msg}
 	}
-	res := authResult{Addr: owner, OwnerAddr: owner, AuthType: AuthTypeRS256}
+	res := authResult{Addr: owner, OwnerAddr: owner, AuthType: AuthTypeIdP}
 
 	if strings.TrimSpace(actAs) == "" {
 		return res, nil
@@ -215,7 +215,7 @@ func (v *Verifier) authenticateRS256(ctx context.Context, tokenStr, actAs string
 
 func (v *Verifier) authenticateAPIToken(ctx context.Context, tokenStr, remoteAddr, actAs string) (authResult, error) {
 	if strings.TrimSpace(actAs) != "" {
-		return authResult{}, authError{status: http.StatusForbidden, msg: "act-as is only available with RS256 authentication"}
+		return authResult{}, authError{status: http.StatusForbidden, msg: "act-as is only available with identity-provider authentication"}
 	}
 	claims := &apiauth.TokenClaims{}
 	_, err := v.apiParser.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {

@@ -174,6 +174,8 @@ func main() {
 			subAccountHandler := handlers.NewSubAccountHandler(apiStore, idURL)
 			fmsg.GET("/sub-accounts", subAccountHandler.List)
 			fmsg.POST("/sub-accounts", subAccountHandler.Create)
+			fmsg.GET("/sub-accounts/:agent", subAccountHandler.Get)
+			fmsg.PATCH("/sub-accounts/:agent", subAccountHandler.UpdateCIDRs)
 			fmsg.POST("/sub-accounts/:agent/rotate-key", subAccountHandler.RotateKey)
 			fmsg.DELETE("/sub-accounts/:agent", subAccountHandler.Delete)
 		}

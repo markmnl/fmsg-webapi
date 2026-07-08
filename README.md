@@ -146,14 +146,14 @@ Delegated identity:
 
 ```bash
 go run ./cmd/fmsg-webapi api-key create-delegation \
-  -owner @mark@fmsg.io \
+  -owner @alice@example.com \
   -agent sales \
-  -addr @sales@fmsg.io \
+  -addr @sales@example.com \
   -cidr 203.0.113.0/24 \
   -expires 2026-12-31T00:00:00Z
 
 go run ./cmd/fmsg-webapi api-key rotate-delegation \
-  -owner @mark@fmsg.io \
+  -owner @alice@example.com \
   -agent sales \
   -expires 2027-03-31T00:00:00Z
 ```
@@ -238,12 +238,14 @@ the application.
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
-| `GET`    | `/fmsg`                          | List messages for user (and their sub-accounts) |
-| `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts, and sub-accounts') |
+| `GET`    | `/fmsg`                          | List messages for the authenticated identity |
+| `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
 | `GET`    | `/fmsg/sub-accounts`             | List owned API-access grants |
 | `POST`   | `/fmsg/sub-accounts`             | Create a derived sub-account API key |
+| `GET`    | `/fmsg/sub-accounts/:agent`      | Retrieve a grant |
+| `PATCH`  | `/fmsg/sub-accounts/:agent`      | Replace a grant's allowed CIDRs |
 | `POST`   | `/fmsg/sub-accounts/:agent/rotate-key` | Rotate a grant API key |
 | `DELETE` | `/fmsg/sub-accounts/:agent`      | Delete a grant |
 | `POST`   | `/fmsg`                          | Create a draft message   |
@@ -341,11 +343,28 @@ self-service route. They are operator-created with `api-key create-delegation`
 after the operator has confirmed the owner is allowed to manage the delegated
 address.
 
+### GET `/fmsg/sub-accounts/:agent`
+
+Retrieves a single grant owned by the EdDSA-authenticated user. Same response
+shape as one entry from `GET /fmsg/sub-accounts`.
+
+### PATCH `/fmsg/sub-accounts/:agent`
+
+Replaces a grant's allowed CIDRs without rotating its API key.
+
+```json
+{
+  "allowed_cidrs": ["203.0.113.0/24"]
+}
+```
+
+**Response:** the updated grant, same shape as `GET /fmsg/sub-accounts/:agent`.
+
 ### POST `/fmsg/sub-accounts/:agent/rotate-key`
 
 Rotates any grant API key owned by the EdDSA-authenticated user and returns the
-new plaintext key once. Requires `key_expires_at`; `allowed_cidrs` may be
-supplied to replace the existing ranges.
+new plaintext key once. Requires `key_expires_at`. Does not touch
+`allowed_cidrs` — use `PATCH /fmsg/sub-accounts/:agent` for that.
 
 ### DELETE `/fmsg/sub-accounts/:agent`
 
@@ -394,13 +413,12 @@ ws.onmessage = (e) => {
 
 Returns messages where the authenticated identity is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
 
-An owner authenticated as themselves (not acting as a sub-account) also sees
-messages addressed to any of their `derived_sub_account` addresses
-(`@user_agent@domain`). A sub-account, whether authenticated via its own
-API-key token or via the owner's `X-FMSG-Act-As` header, sees only its own
-messages — visibility does not expand in that direction. The `read`/`time_read`
-fields reflect whether any of the caller's visible addresses has read the
-message.
+Visibility is always scoped to exactly the one identity the caller
+authenticated as — the owner, or (via a sub-account's own API-key token or
+the owner's `X-FMSG-Act-As` header) a single sub-account. A request never
+sees another identity's messages, including an owner's own sub-accounts', in
+the same call. The `read`/`time_read` field reflects whether that identity
+has read the message.
 
 **Query parameters:**
 
@@ -413,7 +431,7 @@ message.
 
 ### GET `/fmsg/sent`
 
-Returns messages authored by the authenticated identity (`msg.from_addr`), ordered by message ID descending. Subject to the same owner/sub-account visibility rules as `GET /fmsg`.
+Returns messages authored by the authenticated identity (`msg.from_addr`), ordered by message ID descending.
 
 This includes both sent messages and drafts (`time_sent` may be `NULL`).
 
@@ -458,7 +476,7 @@ Add-to recipients are not part of this body — they are added later via `POST /
 
 ### GET `/fmsg/:id`
 
-Retrieves a single message by ID. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`) — considering any of the caller's visible addresses (self plus derived sub-accounts, per `GET /fmsg`).
+Retrieves a single message by ID. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
 
 **Response:** JSON message object:
 
@@ -594,7 +612,7 @@ New addresses must be distinct among themselves (case-insensitive).
 
 ### GET `/fmsg/:id/data`
 
-Downloads the binary body of a message. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`) — considering any of the caller's visible addresses (self plus derived sub-accounts, per `GET /fmsg`).
+Downloads the binary body of a message. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
 
 **Response:** The raw message body file with `Content-Disposition: attachment` header. The `Content-Type` is inferred from the stored file extension.
 

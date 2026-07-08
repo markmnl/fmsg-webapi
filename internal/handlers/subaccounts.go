@@ -28,8 +28,11 @@ type subAccountInput struct {
 }
 
 type rotateKeyInput struct {
+	KeyExpiresAt string `json:"key_expires_at"`
+}
+
+type updateCIDRsInput struct {
 	AllowedCIDRs []string `json:"allowed_cidrs"`
-	KeyExpiresAt string   `json:"key_expires_at"`
 }
 
 type subAccountResponse struct {
@@ -44,7 +47,7 @@ type subAccountResponse struct {
 }
 
 func (h *SubAccountHandler) List(c *gin.Context) {
-	owner, ok := requireRS256Owner(c)
+	owner, ok := requireIdPOwner(c)
 	if !ok {
 		return
 	}
@@ -71,8 +74,34 @@ func (h *SubAccountHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"max_sub_accounts": max, "sub_accounts": out})
 }
 
+func (h *SubAccountHandler) Get(c *gin.Context) {
+	owner, ok := requireIdPOwner(c)
+	if !ok {
+		return
+	}
+	agent := c.Param("agent")
+	if err := apiauth.ValidateAgent(agent); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agent"})
+		return
+	}
+	account, err := h.store.Get(c.Request.Context(), owner, agent)
+	if err != nil {
+		respondSubAccountStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, subAccountResponse{
+		Agent:        account.Agent,
+		Addr:         account.Addr,
+		GrantType:    account.GrantType,
+		DisplayName:  account.DisplayName,
+		KeyID:        account.KeyID,
+		AllowedCIDRs: account.AllowedCIDRs,
+		KeyExpiresAt: account.KeyExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
 func (h *SubAccountHandler) Create(c *gin.Context) {
-	owner, ok := requireRS256Owner(c)
+	owner, ok := requireIdPOwner(c)
 	if !ok {
 		return
 	}
@@ -122,7 +151,7 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 }
 
 func (h *SubAccountHandler) RotateKey(c *gin.Context) {
-	owner, ok := requireRS256Owner(c)
+	owner, ok := requireIdPOwner(c)
 	if !ok {
 		return
 	}
@@ -150,13 +179,6 @@ func (h *SubAccountHandler) RotateKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "key_expires_at must be a future RFC3339 timestamp"})
 		return
 	}
-	replaceCIDRs := in.AllowedCIDRs != nil
-	if replaceCIDRs {
-		if err := apiauth.ValidateCIDRs(in.AllowedCIDRs); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "allowed_cidrs must contain valid CIDR ranges"})
-			return
-		}
-	}
 
 	key, hash, err := newPlaintextKey()
 	if err != nil {
@@ -164,7 +186,7 @@ func (h *SubAccountHandler) RotateKey(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate api key"})
 		return
 	}
-	subAddr, err := h.store.RotateKey(c.Request.Context(), owner, agent, key.ID, hash, expires, in.AllowedCIDRs, replaceCIDRs)
+	subAddr, err := h.store.RotateKey(c.Request.Context(), owner, agent, key.ID, hash, expires)
 	if err != nil {
 		respondSubAccountStoreError(c, err)
 		return
@@ -179,8 +201,45 @@ func (h *SubAccountHandler) RotateKey(c *gin.Context) {
 	})
 }
 
+func (h *SubAccountHandler) UpdateCIDRs(c *gin.Context) {
+	owner, ok := requireIdPOwner(c)
+	if !ok {
+		return
+	}
+	agent := c.Param("agent")
+	if err := apiauth.ValidateAgent(agent); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agent"})
+		return
+	}
+
+	var in updateCIDRsInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := apiauth.ValidateCIDRs(in.AllowedCIDRs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "allowed_cidrs must contain valid CIDR ranges"})
+		return
+	}
+
+	account, err := h.store.UpdateCIDRs(c.Request.Context(), owner, agent, in.AllowedCIDRs)
+	if err != nil {
+		respondSubAccountStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, subAccountResponse{
+		Agent:        account.Agent,
+		Addr:         account.Addr,
+		GrantType:    account.GrantType,
+		DisplayName:  account.DisplayName,
+		KeyID:        account.KeyID,
+		AllowedCIDRs: account.AllowedCIDRs,
+		KeyExpiresAt: account.KeyExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
 func (h *SubAccountHandler) Delete(c *gin.Context) {
-	owner, ok := requireRS256Owner(c)
+	owner, ok := requireIdPOwner(c)
 	if !ok {
 		return
 	}
@@ -196,9 +255,9 @@ func (h *SubAccountHandler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-func requireRS256Owner(c *gin.Context) (string, bool) {
-	if middleware.GetAuthType(c) != middleware.AuthTypeRS256 || middleware.GetIdentity(c) != middleware.GetOwnerIdentity(c) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "RS256 owner authentication is required"})
+func requireIdPOwner(c *gin.Context) (string, bool) {
+	if middleware.GetAuthType(c) != middleware.AuthTypeIdP || middleware.GetIdentity(c) != middleware.GetOwnerIdentity(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "identity-provider owner authentication is required"})
 		return "", false
 	}
 	return middleware.GetOwnerIdentity(c), true

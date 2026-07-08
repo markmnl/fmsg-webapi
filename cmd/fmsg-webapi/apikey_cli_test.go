@@ -8,7 +8,7 @@ import (
 
 func TestPrepareCLIGrantInputsAllowsArbitraryDelegatedAddressFlow(t *testing.T) {
 	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	allowed, gotExpires, key, hash, err := prepareCLIGrantInputs("@mark@fmsg.io", "sales", "203.0.113.0/24", expires)
+	allowed, gotExpires, key, hash, err := prepareCLIGrantInputs("@mark@example.com", "sales", "203.0.113.0/24", expires)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,18 +25,18 @@ func TestPrepareCLIGrantInputsAllowsArbitraryDelegatedAddressFlow(t *testing.T) 
 
 func TestPrepareCLIKeyInputsStillDerivesSubAccountAddress(t *testing.T) {
 	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	subAddr, _, _, _, _, err := prepareCLIKeyInputs("@mark@fmsg.io", "bot", "203.0.113.0/24", expires)
+	subAddr, _, _, _, _, err := prepareCLIKeyInputs("@mark@example.com", "bot", "203.0.113.0/24", expires)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if subAddr != "@mark_bot@fmsg.io" {
+	if subAddr != "@mark_bot@example.com" {
 		t.Fatalf("subAddr = %q", subAddr)
 	}
 }
 
 func TestPrepareCLIGrantInputsRejectsInvalidAgent(t *testing.T) {
 	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	_, _, _, _, err := prepareCLIGrantInputs("@mark@fmsg.io", "sales_team", "203.0.113.0/24", expires)
+	_, _, _, _, err := prepareCLIGrantInputs("@mark@example.com", "sales_team", "203.0.113.0/24", expires)
 	if err == nil || !strings.Contains(err.Error(), "invalid agent") {
 		t.Fatalf("err = %v", err)
 	}

@@ -41,21 +41,11 @@ func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize 
 }
 
 // visibleAddrs returns the set of fmsg addresses whose messages the caller
-// may see. An owner authenticated as themselves (not acting as a sub-account
-// via X-FMSG-Act-As, and not a sub-account's own API-key token) sees their
-// own address plus all their derived sub-accounts'. Anyone else sees only
-// the exact address they authenticated as — no expansion.
+// may see — always exactly the one identity they authenticated as (owner,
+// or the sub-account named via X-FMSG-Act-As / a sub-account's own API-key
+// token). Callers never see another identity's messages in the same request.
 func (h *MessageHandler) visibleAddrs(c *gin.Context) ([]string, error) {
-	identity := middleware.GetIdentity(c)
-	owner := middleware.GetOwnerIdentity(c)
-	if identity != owner {
-		return []string{identity}, nil
-	}
-	subs, err := h.SubAccounts.ListDerivedAddrs(c.Request.Context(), identity)
-	if err != nil {
-		return nil, err
-	}
-	return append([]string{identity}, subs...), nil
+	return []string{middleware.GetIdentity(c)}, nil
 }
 
 // messageListItem is the JSON shape for each message in the list response.
