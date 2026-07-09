@@ -25,12 +25,12 @@ type CORSConfig struct {
 }
 
 // DefaultCORSConfig returns a CORSConfig populated with values appropriate for
-// this API: GET/POST/PUT/DELETE/OPTIONS plus Authorization and Content-Type
-// request headers, with a 10 minute preflight cache. Callers must still set
-// AllowedOrigins.
+// this API: GET/POST/PUT/PATCH/DELETE/OPTIONS plus Authorization and
+// Content-Type request headers, with a 10 minute preflight cache. Callers must
+// still set AllowedOrigins.
 func DefaultCORSConfig() CORSConfig {
 	return CORSConfig{
-		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders: []string{"Authorization", "Content-Type", "X-FMSG-Act-As"},
 		MaxAge:         10 * time.Minute,
 	}

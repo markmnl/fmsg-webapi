@@ -69,9 +69,21 @@ func NewWSHandler(verifier *middleware.Verifier, hub *Hub, allowedOrigins []stri
 	}
 }
 
+// actAsParam returns the requested act-as address: the X-FMSG-Act-As header
+// when present, else the act_as query parameter. The query parameter exists
+// because browsers cannot set custom headers on a WebSocket upgrade; it is
+// validated identically to the header.
+func actAsParam(c *gin.Context) string {
+	if v := c.GetHeader("X-FMSG-Act-As"); v != "" {
+		return v
+	}
+	return c.Query("act_as")
+}
+
 // Connect handles GET /fmsg/ws. It authenticates the request (via the
-// access_token query parameter or an Authorization header), upgrades the
-// connection, and runs it until either side closes.
+// access_token query parameter or an Authorization header, optionally acting
+// as a sub-account via the X-FMSG-Act-As header or act_as query parameter),
+// upgrades the connection, and runs it until either side closes.
 func (h *WSHandler) Connect(c *gin.Context) {
 	token := c.Query("access_token")
 	if token == "" {
@@ -82,7 +94,7 @@ func (h *WSHandler) Connect(c *gin.Context) {
 		return
 	}
 
-	res, status, msg := h.verifier.AuthenticateRequest(c.Request.Context(), token, c.ClientIP(), c.GetHeader("X-FMSG-Act-As"))
+	res, status, msg := h.verifier.AuthenticateRequest(c.Request.Context(), token, c.ClientIP(), actAsParam(c))
 	if status != http.StatusOK {
 		c.JSON(status, gin.H{"error": msg})
 		return
