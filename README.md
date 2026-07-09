@@ -387,6 +387,11 @@ an `access_token` query parameter (browsers, which cannot set headers on a
 WebSocket). The handshake fails with `401`/`400`/`403`/`503` — the same statuses
 as the REST middleware — before the connection is upgraded.
 
+An EdDSA-authenticated owner may act as one of their granted identities by
+supplying either the `X-FMSG-Act-As` header or an `act_as` query parameter
+(again for browsers, which cannot set headers on a WebSocket); the header wins
+when both are present, and validation is identical to the REST routes.
+
 **Events:** every frame is a JSON envelope with a `type` discriminator so new
 event types can be added without breaking clients:
 
