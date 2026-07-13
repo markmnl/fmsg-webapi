@@ -4,6 +4,24 @@
 
 HTTP API providing user/client message handling for an fmsg host. Exposes CRUD operations for a messaging datastore backed by PostgreSQL. Authentication is delegated to an external system — this service validates JWT tokens and enforces fine-grained authorisation rules based on the user identity they contain.
 
+## Contents
+
+- [Environment Variables](#environment-variables)
+- [Authentication](#authentication)
+  - [EdDSA (production, JWKS-backed JWTs)](#eddsa-production-jwks-backed-jwts)
+  - [API Keys And First-Party JWTs](#api-keys-and-first-party-jwts)
+- [Building](#building)
+- [Testing](#testing)
+- [Running](#running)
+  - [TLS mode (production)](#tls-mode-production)
+  - [Plain HTTP mode (development / reverse proxy)](#plain-http-mode-development--reverse-proxy)
+- [API Routes](#api-routes)
+  - [Token and sub-account routes](#post-fmsgtoken)
+  - [WebSocket route](#get-fmsgws)
+  - [Message and attachment routes](#get-fmsg)
+  - [Web Push subscription routes](#post-fmsgpushsubscribe)
+- [Web Push](#web-push)
+
 ## Environment Variables
 
 | Variable            | Default                  | Description                                             |
