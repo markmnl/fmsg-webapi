@@ -33,11 +33,12 @@ type MessageHandler struct {
 	MaxMsgSize    int64
 	ShortTextSize int
 	SubAccounts   *apiauth.Store
+	IDURL         string
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int, subAccounts *apiauth.Store) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize, SubAccounts: subAccounts}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int, subAccounts *apiauth.Store, idURL string) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize, SubAccounts: subAccounts, IDURL: idURL}
 }
 
 // visibleAddrs returns the set of fmsg addresses whose messages the caller
@@ -83,6 +84,50 @@ func formatDeliveredISO(t *float64) *string {
 	nsec := int64((*t - float64(sec)) * 1e9)
 	s := time.Unix(sec, nsec).UTC().Format(time.RFC3339)
 	return &s
+}
+
+// resolveLocalDelivery determines and persists delivery status for recipients
+// in addrs whose domain matches localDomain, in the given table ("msg_to" or
+// "msg_add_to"). This exists because fmsgd's outbound sender deliberately
+// skips the local domain (no network hop is needed), so it never sets
+// time_delivered/response_code for same-domain recipients — fmsg-webapi has
+// to resolve that status itself via fmsgid, the same source fmsgd would have
+// consulted. Errors talking to fmsgid are logged and left pending (no status
+// written) rather than treated as a delivery failure.
+func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string, msgID int64, localDomain string, addrs []string) {
+	now := float64(time.Now().UnixMicro()) / 1e6
+	query := "UPDATE " + table + " SET time_delivered = $1, response_code = $2 WHERE msg_id = $3 AND addr = $4 AND time_delivered IS NULL AND response_code IS NULL"
+	for _, addr := range addrs {
+		_, domain := parseAddr(addr)
+		if !strings.EqualFold(domain, localDomain) {
+			continue // remote — fmsgd handles this
+		}
+		code, accepting, err := middleware.CheckFmsgID(h.IDURL, addr)
+		if err != nil {
+			log.Printf("resolve local delivery: fmsgid check %s: %v", addr, err)
+			continue
+		}
+		var delivered *float64
+		var responseCode *int
+		switch {
+		case code == http.StatusNotFound:
+			rc := 100 // user unknown
+			responseCode = &rc
+		case code == http.StatusOK && !accepting:
+			rc := 102 // user not accepting
+			responseCode = &rc
+		case code == http.StatusOK && accepting:
+			rc := 200 // accept
+			responseCode = &rc
+			delivered = &now
+		default:
+			log.Printf("resolve local delivery: unexpected fmsgid status %d for %s", code, addr)
+			continue
+		}
+		if _, err := h.DB.Pool.Exec(ctx, query, delivered, responseCode, msgID, addr); err != nil {
+			log.Printf("resolve local delivery: update %s msg %d addr %s: %v", table, msgID, addr, err)
+		}
+	}
 }
 
 // messageInput is used for JSON binding on Create/Update — includes Data for the message body.
@@ -718,6 +763,14 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
+	// fmsgd's outbound sender skips the local domain entirely, so local
+	// recipients need their delivery status resolved here instead.
+	_, localDomain := parseAddr(identity)
+	h.resolveLocalDelivery(ctx, "msg_to", msgID, localDomain, existing.To)
+	for _, b := range existing.AddTo {
+		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, localDomain, b.To)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "time": now})
 }
 
@@ -827,9 +880,10 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	// of the outgoing fmsg messages sent to the new recipients, so the message's
 	// own pid is irrelevant here and need not be looked up.
 	var fromAddr string
+	var timeSent *float64
 	err := h.DB.Pool.QueryRow(ctx,
-		"SELECT from_addr FROM msg WHERE id = $1", msgID,
-	).Scan(&fromAddr)
+		"SELECT from_addr, time_sent FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &timeSent)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -896,6 +950,14 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		log.Printf("add recipients: commit tx for msg %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
 		return
+	}
+
+	// fmsgd only delivers add_to batches once the parent message is sent
+	// (mirroring its own m.time_sent IS NOT NULL gate), and skips the local
+	// domain entirely — so resolve local recipients here for sent messages.
+	if timeSent != nil {
+		_, localDomain := parseAddr(identity)
+		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, localDomain, input.AddTo)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})

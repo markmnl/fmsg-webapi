@@ -137,7 +137,7 @@ func main() {
 	// Global rate limiting is handled by nftables at the host level.
 
 	// Instantiate handlers.
-	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize, apiStore)
+	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize, apiStore, idURL)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Web Push handler: stores subscriptions and delivers VAPID pushes for
