@@ -517,10 +517,17 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   "pid": null,
   "from": "@alice@example.com",
   "to": ["@bob@example.com"],
+  "to_delivery": [
+    {"addr": "@bob@example.com", "time_delivered": "2024-06-04T00:00:00Z", "response_code": null}
+  ],
   "add_to": [
     {
       "add_to_from": "@bob@example.com",
       "to": ["@carol@example.com", "@dave@example.com"],
+      "to_delivery": [
+        {"addr": "@carol@example.com", "time_delivered": null, "response_code": 100},
+        {"addr": "@dave@example.com", "time_delivered": "2024-06-04T00:05:00Z", "response_code": null}
+      ],
       "time": 1717459200.123
     }
   ],
@@ -539,6 +546,16 @@ Retrieves a single message by ID. The authenticated identity must be a participa
 Each batch records who added the recipients (`add_to_from`), the recipients
 added (`to`), and when the add-to happened (`time`, seconds since the Unix
 epoch). `has_add_to` is `true` when the array is non-empty.
+
+`to_delivery` gives each recipient's delivery status, one entry per address in
+`to` (and similarly nested inside each `add_to` batch, one entry per address in
+that batch's `to`). `time_delivered` is an RFC3339 UTC timestamp set once the
+sending host receives delivery confirmation (or, for a locally-hosted
+recipient, once the message is stored for them); it is `null` while delivery
+is pending or has failed. `response_code` is the fmsg wire-protocol
+per-recipient response code (see the fmsg spec) and is only set when a
+delivery attempt has failed; it is `null` once delivered or while still
+pending.
 
 The `read` and `time_read` fields reflect the calling user's per-recipient
 read state (set by `POST /fmsg/:id/read`). For the sender's own messages

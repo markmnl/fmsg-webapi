@@ -51,25 +51,38 @@ func (h *MessageHandler) visibleAddrs(c *gin.Context) ([]string, error) {
 // messageListItem is the JSON shape for each message in the list response.
 // It mirrors the single-message response (including an id).
 type messageListItem struct {
-	ID          int64               `json:"id"`
-	Version     int                 `json:"version"`
-	HasPid      bool                `json:"has_pid"`
-	HasAddTo    bool                `json:"has_add_to"`
-	Important   bool                `json:"important"`
-	NoReply     bool                `json:"no_reply"`
-	Deflate     bool                `json:"deflate"`
-	PID         *int64              `json:"pid"`
-	From        string              `json:"from"`
-	To          []string            `json:"to"`
-	AddTo       []models.AddToBatch `json:"add_to"`
-	Time        *float64            `json:"time"`
-	Topic       string              `json:"topic"`
-	Type        string              `json:"type"`
-	Size        int                 `json:"size"`
-	ShortText   string              `json:"short_text,omitempty"`
-	Read        bool                `json:"read"`
-	TimeRead    *float64            `json:"time_read"`
-	Attachments []models.Attachment `json:"attachments"`
+	ID          int64                      `json:"id"`
+	Version     int                        `json:"version"`
+	HasPid      bool                       `json:"has_pid"`
+	HasAddTo    bool                       `json:"has_add_to"`
+	Important   bool                       `json:"important"`
+	NoReply     bool                       `json:"no_reply"`
+	Deflate     bool                       `json:"deflate"`
+	PID         *int64                     `json:"pid"`
+	From        string                     `json:"from"`
+	To          []string                   `json:"to"`
+	ToDelivery  []models.RecipientDelivery `json:"to_delivery"`
+	AddTo       []models.AddToBatch        `json:"add_to"`
+	Time        *float64                   `json:"time"`
+	Topic       string                     `json:"topic"`
+	Type        string                     `json:"type"`
+	Size        int                        `json:"size"`
+	ShortText   string                     `json:"short_text,omitempty"`
+	Read        bool                       `json:"read"`
+	TimeRead    *float64                   `json:"time_read"`
+	Attachments []models.Attachment        `json:"attachments"`
+}
+
+// formatDeliveredISO converts a nullable Unix-epoch-seconds timestamp (as
+// stored in msg_to/msg_add_to.time_delivered) to an RFC3339 UTC string.
+func formatDeliveredISO(t *float64) *string {
+	if t == nil {
+		return nil
+	}
+	sec := int64(*t)
+	nsec := int64((*t - float64(sec)) * 1e9)
+	s := time.Unix(sec, nsec).UTC().Format(time.RFC3339)
+	return &s
 }
 
 // messageInput is used for JSON binding on Create/Update — includes Data for the message body.
@@ -142,23 +155,10 @@ func (h *MessageHandler) List(c *gin.Context) {
 	}
 
 	// Batch-load recipients.
-	toRows, err := h.DB.Pool.Query(ctx,
-		"SELECT msg_id, addr FROM msg_to WHERE msg_id = ANY($1)",
-		msgIDs,
-	)
-	if err == nil {
-		toMap := make(map[int64][]string)
-		for toRows.Next() {
-			var id int64
-			var addr string
-			if scanErr := toRows.Scan(&id, &addr); scanErr == nil {
-				toMap[id] = append(toMap[id], addr)
-			}
-		}
-		toRows.Close()
-		for i := range messages {
-			messages[i].To = toMap[messages[i].ID]
-		}
+	toMap, toDeliveryMap := h.loadRecipients(ctx, msgIDs)
+	for i := range messages {
+		messages[i].To = toMap[messages[i].ID]
+		messages[i].ToDelivery = toDeliveryMap[messages[i].ID]
 	}
 
 	// Batch-load add_to batches.
@@ -250,23 +250,10 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	}
 
 	// Batch-load recipients.
-	toRows, err := h.DB.Pool.Query(ctx,
-		"SELECT msg_id, addr FROM msg_to WHERE msg_id = ANY($1)",
-		msgIDs,
-	)
-	if err == nil {
-		toMap := make(map[int64][]string)
-		for toRows.Next() {
-			var id int64
-			var addr string
-			if scanErr := toRows.Scan(&id, &addr); scanErr == nil {
-				toMap[id] = append(toMap[id], addr)
-			}
-		}
-		toRows.Close()
-		for i := range messages {
-			messages[i].To = toMap[messages[i].ID]
-		}
+	toMap, toDeliveryMap := h.loadRecipients(ctx, msgIDs)
+	for i := range messages {
+		messages[i].To = toMap[messages[i].ID]
+		messages[i].ToDelivery = toDeliveryMap[messages[i].ID]
 	}
 
 	// Batch-load add_to batches.
@@ -914,15 +901,59 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
 }
 
+// loadRecipients loads the direct (msg_to) recipients for the given messages,
+// keyed by msg_id, along with each recipient's delivery status.
+func (h *MessageHandler) loadRecipients(ctx context.Context, msgIDs []int64) (map[int64][]string, map[int64][]models.RecipientDelivery) {
+	toMap := make(map[int64][]string)
+	deliveryMap := make(map[int64][]models.RecipientDelivery)
+	rows, err := h.DB.Pool.Query(ctx,
+		"SELECT msg_id, addr, time_delivered, response_code FROM msg_to WHERE msg_id = ANY($1)",
+		msgIDs,
+	)
+	if err != nil {
+		log.Printf("load recipients: %v", err)
+		return toMap, deliveryMap
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var addr string
+		var timeDelivered *float64
+		var responseCode *int16
+		if scanErr := rows.Scan(&id, &addr, &timeDelivered, &responseCode); scanErr != nil {
+			log.Printf("load recipients scan: %v", scanErr)
+			continue
+		}
+		toMap[id] = append(toMap[id], addr)
+		deliveryMap[id] = append(deliveryMap[id], models.RecipientDelivery{
+			Addr:          addr,
+			TimeDelivered: formatDeliveredISO(timeDelivered),
+			ResponseCode:  int16PtrToIntPtr(responseCode),
+		})
+	}
+	return toMap, deliveryMap
+}
+
+// int16PtrToIntPtr converts a nullable Postgres smallint scan target to *int
+// for JSON encoding.
+func int16PtrToIntPtr(v *int16) *int {
+	if v == nil {
+		return nil
+	}
+	i := int(*v)
+	return &i
+}
+
 // loadAddToBatches loads the add-to batches for the given messages, keyed by
 // msg_id. Each batch carries who added the recipients (add_to_from), when
-// (time_added), and the recipients themselves. A LEFT JOIN is used so a batch
-// whose addresses were all already present still records the provenance of the
-// add-to. Batches are ordered by their insertion order (batch id).
+// (time_added), and the recipients themselves along with their delivery
+// status. A LEFT JOIN is used so a batch whose addresses were all already
+// present still records the provenance of the add-to. Batches are ordered by
+// their insertion order (batch id).
 func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) map[int64][]models.AddToBatch {
 	result := make(map[int64][]models.AddToBatch)
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT b.msg_id, b.id, b.add_to_from, b.time_added, mat.addr
+		`SELECT b.msg_id, b.id, b.add_to_from, b.time_added, mat.addr, mat.time_delivered, mat.response_code
 		 FROM msg_add_to_batch b
 		 LEFT JOIN msg_add_to mat ON mat.batch_id = b.id
 		 WHERE b.msg_id = ANY($1)
@@ -942,7 +973,9 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 		var addToFrom string
 		var timeAdded float64
 		var addr *string
-		if err := rows.Scan(&msgID, &batchID, &addToFrom, &timeAdded, &addr); err != nil {
+		var timeDelivered *float64
+		var responseCode *int16
+		if err := rows.Scan(&msgID, &batchID, &addToFrom, &timeAdded, &addr, &timeDelivered, &responseCode); err != nil {
 			log.Printf("load add_to batches scan: %v", err)
 			continue
 		}
@@ -954,6 +987,11 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 		}
 		if addr != nil {
 			result[msgID][i].To = append(result[msgID][i].To, *addr)
+			result[msgID][i].ToDelivery = append(result[msgID][i].ToDelivery, models.RecipientDelivery{
+				Addr:          *addr,
+				TimeDelivered: formatDeliveredISO(timeDelivered),
+				ResponseCode:  int16PtrToIntPtr(responseCode),
+			})
 		}
 	}
 	return result
@@ -980,16 +1018,9 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	msg.HasPid = pid != nil
 
 	// Load recipients.
-	rows, err := h.DB.Pool.Query(ctx, "SELECT addr FROM msg_to WHERE msg_id = $1", msgID)
-	if err == nil {
-		for rows.Next() {
-			var addr string
-			if scanErr := rows.Scan(&addr); scanErr == nil {
-				msg.To = append(msg.To, addr)
-			}
-		}
-		rows.Close()
-	}
+	toMap, toDeliveryMap := h.loadRecipients(ctx, []int64{msgID})
+	msg.To = toMap[msgID]
+	msg.ToDelivery = toDeliveryMap[msgID]
 
 	// Load add_to batches.
 	msg.AddTo = h.loadAddToBatches(ctx, []int64{msgID})[msgID]
@@ -1031,6 +1062,7 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 		PID:         msg.PID,
 		From:        msg.From,
 		To:          msg.To,
+		ToDelivery:  msg.ToDelivery,
 		AddTo:       msg.AddTo,
 		Time:        msg.Time,
 		Topic:       msg.Topic,
