@@ -15,7 +15,8 @@ import (
 // Event type discriminators for the WebSocket envelope. Adding a new event
 // type means adding a constant here and a producer that dispatches it.
 const (
-	eventNewMsg = "new_msg"
+	eventNewMsg    = "new_msg"
+	eventDelivered = "delivered"
 )
 
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
@@ -108,9 +109,10 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// listen opens a dedicated connection, LISTENs on new_msg, and dispatches
-// every notification until the connection fails or ctx is cancelled. onConnected
-// is invoked once the LISTEN has succeeded so the caller can reset its backoff.
+// listen opens a dedicated connection, LISTENs on new_msg and delivered, and
+// dispatches every notification until the connection fails or ctx is
+// cancelled. onConnected is invoked once both LISTENs have succeeded so the
+// caller can reset its backoff.
 func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	// An empty connection string makes pgx read the standard PG* environment
 	// variables, exactly as the pgxpool in db.New does.
@@ -123,7 +125,10 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	if _, err := conn.Exec(ctx, "LISTEN new_msg"); err != nil {
 		return err
 	}
-	log.Println("ws hub: listening on new_msg")
+	if _, err := conn.Exec(ctx, "LISTEN delivered"); err != nil {
+		return err
+	}
+	log.Println("ws hub: listening on new_msg, delivered")
 	onConnected()
 
 	for {
@@ -136,14 +141,23 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 			log.Printf("ws hub: ignoring malformed notification payload %q", n.Payload)
 			continue
 		}
-		// Web Push runs in its own goroutine: it is network I/O to many
-		// endpoints and must not stall the single listener. It is dispatched
-		// here, alongside (not inside) dispatch, so a push is sent even when
-		// the recipient has no live WebSocket.
-		if h.notifyPush != nil {
-			go h.notifyPush(ctx, msgID, addr)
+		switch n.Channel {
+		case "new_msg":
+			// Web Push runs in its own goroutine: it is network I/O to many
+			// endpoints and must not stall the single listener. It is
+			// dispatched here, alongside (not inside) dispatch, so a push is
+			// sent even when the recipient has no live WebSocket.
+			if h.notifyPush != nil {
+				go h.notifyPush(ctx, msgID, addr)
+			}
+			h.dispatch(ctx, msgID, addr, eventNewMsg)
+		case "delivered":
+			// addr here is the message's sender (see notify_delivered in
+			// dd.sql), not a recipient -- no Web Push for this event yet.
+			h.dispatch(ctx, msgID, addr, eventDelivered)
+		default:
+			log.Printf("ws hub: ignoring notification on unknown channel %q", n.Channel)
 		}
-		h.dispatch(ctx, msgID, addr)
 	}
 }
 
@@ -164,12 +178,15 @@ func parseNotifyPayload(payload string) (msgID int64, addr string, ok bool) {
 	return id, addr, true
 }
 
-// dispatch pushes message msgID to every client connected as addr. The message
-// is fetched and marshalled only when at least one such client is connected, so
-// notifications for addresses with no live WebSocket cost nothing beyond a map
-// lookup. addr originates from a msg_to/msg_add_to row, so any client connected
-// as addr is by definition a participant of the message.
-func (h *Hub) dispatch(ctx context.Context, msgID int64, addr string) {
+// dispatch pushes message msgID to every client connected as addr, tagged
+// with eventType. The message is fetched and marshalled only when at least
+// one such client is connected, so notifications for addresses with no live
+// WebSocket cost nothing beyond a map lookup. For eventNewMsg, addr
+// originates from a msg_to/msg_add_to row (a recipient); for eventDelivered,
+// addr is the message's sender (see notify_delivered in dd.sql). Either way,
+// buildItem accepts any participant address and produces the full message
+// item, so no special-casing is needed here.
+func (h *Hub) dispatch(ctx context.Context, msgID int64, addr string, eventType string) {
 	h.mu.RLock()
 	set := h.registry[strings.ToLower(addr)]
 	clients := make([]*wsClient, 0, len(set))
@@ -186,7 +203,7 @@ func (h *Hub) dispatch(ctx context.Context, msgID int64, addr string) {
 		log.Printf("ws hub: build message %d for %s: %v", msgID, addr, err)
 		return
 	}
-	payload, err := json.Marshal(wsEnvelope{Type: eventNewMsg, Data: item})
+	payload, err := json.Marshal(wsEnvelope{Type: eventType, Data: item})
 	if err != nil {
 		log.Printf("ws hub: marshal message %d: %v", msgID, err)
 		return

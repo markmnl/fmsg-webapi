@@ -31,7 +31,7 @@ func TestHubDispatch_RoutesOnlyToParticipant(t *testing.T) {
 	hub.Register(bob)
 
 	// Mixed-case payload address must still route to the lower-cased registry.
-	hub.dispatch(context.Background(), 42, "@Alice@x")
+	hub.dispatch(context.Background(), 42, "@Alice@x", eventNewMsg)
 
 	select {
 	case payload := <-alice.send:
@@ -62,9 +62,30 @@ func TestHubDispatch_NoClientsSkipsBuild(t *testing.T) {
 		},
 		registry: make(map[string]map[*wsClient]struct{}),
 	}
-	hub.dispatch(context.Background(), 1, "@nobody@x")
+	hub.dispatch(context.Background(), 1, "@nobody@x", eventNewMsg)
 	if built {
 		t.Fatal("buildItem must not be called when no client is connected")
+	}
+}
+
+func TestHubDispatch_UsesGivenEventType(t *testing.T) {
+	hub := newTestHub()
+	alice := newTestClient("@alice@x")
+	hub.Register(alice)
+
+	hub.dispatch(context.Background(), 42, "@alice@x", eventDelivered)
+
+	select {
+	case payload := <-alice.send:
+		var env wsEnvelope
+		if err := json.Unmarshal(payload, &env); err != nil {
+			t.Fatalf("unmarshal envelope: %v", err)
+		}
+		if env.Type != eventDelivered {
+			t.Fatalf("envelope type = %q, want %q", env.Type, eventDelivered)
+		}
+	default:
+		t.Fatal("alice should have received the dispatched message")
 	}
 }
 
