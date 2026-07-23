@@ -522,6 +522,7 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   ],
   "add_to": [
     {
+      "batch_id": 42,
       "add_to_from": "@bob@example.com",
       "to": ["@carol@example.com", "@dave@example.com"],
       "to_delivery": [
@@ -543,9 +544,10 @@ Retrieves a single message by ID. The authenticated identity must be a participa
 ```
 
 `add_to` is an array of add-to batches, one per `POST /fmsg/:id/add-to` call.
-Each batch records who added the recipients (`add_to_from`), the recipients
-added (`to`), and when the add-to happened (`time`, seconds since the Unix
-epoch). `has_add_to` is `true` when the array is non-empty.
+Each batch has a stable `batch_id` (unique within the database and referenced
+with the message ID), records who added the recipients (`add_to_from`), the
+recipients added (`to`), and when the add-to happened (`time`, seconds since
+the Unix epoch). `has_add_to` is `true` when the array is non-empty.
 
 `to_delivery` gives each recipient's delivery status, one entry per address in
 `to` (and similarly nested inside each `add_to` batch, one entry per address in

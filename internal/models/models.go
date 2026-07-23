@@ -14,9 +14,11 @@ type RecipientDelivery struct {
 	ResponseCode  *int    `json:"response_code"`  // nil unless a delivery attempt failed
 }
 
-// AddToBatch represents a single add-to delivery: the recipients added in one
-// POST /fmsg/:id/add-to call, who added them (add_to_from), and when (time).
+// AddToBatch represents a single add-to delivery: its stable batch identifier,
+// the recipients added in one POST /fmsg/:id/add-to call, who added them
+// (add_to_from), and when (time).
 type AddToBatch struct {
+	BatchID    int64               `json:"batch_id"`
 	AddToFrom  string              `json:"add_to_from"`
 	To         []string            `json:"to"`
 	ToDelivery []RecipientDelivery `json:"to_delivery"`

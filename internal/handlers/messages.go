@@ -1043,7 +1043,11 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 		}
 		i, ok := idx[batchID]
 		if !ok {
-			result[msgID] = append(result[msgID], models.AddToBatch{AddToFrom: addToFrom, Time: timeAdded})
+			result[msgID] = append(result[msgID], models.AddToBatch{
+				BatchID:   batchID,
+				AddToFrom: addToFrom,
+				Time:      timeAdded,
+			})
 			i = len(result[msgID]) - 1
 			idx[batchID] = i
 		}
