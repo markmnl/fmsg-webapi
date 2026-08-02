@@ -27,6 +27,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | Variable            | Default                  | Description                                             |
 | ------------------- | ------------------------ | ------------------------------------------------------- |
 | `FMSG_DATA_DIR`     | *(required)*             | Path where message data files are stored, e.g. `/var/lib/fmsgd/` |
+| `FMSG_DOMAIN`       | *(required)*             | The fmsg domain this instance serves, e.g. `example.com`. Used to tell local recipients (resolved directly via fmsgid) from federated ones (left to fmsgd), independent of which participant's identity happens to be making the request. |
 | `FMSG_JWT_JWKS_URL` | *(prod)*                 | JWKS endpoint for the configured identity provider (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies EdDSA (Ed25519) JWTs. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
 | `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com/`). Tokens with a different issuer are rejected. This must exactly match the token issuer. |
 | `FMSG_JWT_AUDIENCE` | *(optional)* | When set, tokens must include this value in their `aud` claim. Leave unset if your identity provider does not issue an `aud` claim. |
@@ -199,6 +200,7 @@ by default; override with `FMSG_API_PORT`.
 
 ```bash
 export FMSG_DATA_DIR=/opt/fmsg/data
+export FMSG_DOMAIN=example.com
 export FMSG_JWT_JWKS_URL=https://idp.example.com/.well-known/jwks.json
 export FMSG_JWT_ISSUER=https://idp.example.com/
 export FMSG_JWT_ADDRESS_CLAIM=sub
@@ -227,6 +229,7 @@ proxying `https://fmsgapi.example.com/` to `http://127.0.0.1:8000/`).
 
 ```bash
 export FMSG_DATA_DIR=/var/lib/fmsgd/
+export FMSG_DOMAIN=example.com
 export FMSG_API_TOKEN_ED25519_PRIVATE_KEY=$(openssl rand -base64 32)
 export PGHOST=localhost
 export PGUSER=fmsg
