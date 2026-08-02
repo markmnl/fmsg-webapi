@@ -34,6 +34,9 @@ func main() {
 
 	// Required configuration.
 	dataDir := mustEnv("FMSG_DATA_DIR")
+	// The domain this instance serves, e.g. "example.com" — used to tell local
+	// recipients (resolved via fmsgid here) from federated ones (left to fmsgd).
+	localDomain := mustEnv("FMSG_DOMAIN")
 
 	// JWT configuration. EdDSA provider JWTs and first-party Ed25519 API
 	// tokens can be enabled independently.
@@ -137,7 +140,7 @@ func main() {
 	// Global rate limiting is handled by nftables at the host level.
 
 	// Instantiate handlers.
-	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize, apiStore, idURL)
+	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize, apiStore, idURL, localDomain)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Web Push handler: stores subscriptions and delivers VAPID pushes for

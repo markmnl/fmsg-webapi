@@ -34,11 +34,18 @@ type MessageHandler struct {
 	ShortTextSize int
 	SubAccounts   *apiauth.Store
 	IDURL         string
+	// LocalDomain is the domain this webapi instance serves (e.g. "example.com"),
+	// used to decide which recipients are local vs. federated. It must NOT be
+	// derived from the authenticated caller's own address — a federated
+	// participant (e.g. @alice@other.example acting on a thread hosted here)
+	// has a different domain than this instance, but that has no bearing on
+	// which recipients are local to it. See resolveLocalDelivery.
+	LocalDomain string
 }
 
 // NewMessageHandler creates a MessageHandler.
-func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int, subAccounts *apiauth.Store, idURL string) *MessageHandler {
-	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize, SubAccounts: subAccounts, IDURL: idURL}
+func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize int64, shortTextSize int, subAccounts *apiauth.Store, idURL, localDomain string) *MessageHandler {
+	return &MessageHandler{DB: database, DataDir: dataDir, MaxDataSize: maxDataSize, MaxMsgSize: maxMsgSize, ShortTextSize: shortTextSize, SubAccounts: subAccounts, IDURL: idURL, LocalDomain: localDomain}
 }
 
 // visibleAddrs returns the set of fmsg addresses whose messages the caller
@@ -765,10 +772,9 @@ func (h *MessageHandler) Send(c *gin.Context) {
 
 	// fmsgd's outbound sender skips the local domain entirely, so local
 	// recipients need their delivery status resolved here instead.
-	_, localDomain := parseAddr(identity)
-	h.resolveLocalDelivery(ctx, "msg_to", msgID, localDomain, existing.To)
+	h.resolveLocalDelivery(ctx, "msg_to", msgID, h.LocalDomain, existing.To)
 	for _, b := range existing.AddTo {
-		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, localDomain, b.To)
+		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, b.To)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "time": now})
@@ -955,9 +961,11 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	// fmsgd only delivers add_to batches once the parent message is sent
 	// (mirroring its own m.time_sent IS NOT NULL gate), and skips the local
 	// domain entirely — so resolve local recipients here for sent messages.
+	// Note: this must use this instance's own local domain, not the domain of
+	// whoever called this endpoint — the caller adding recipients may be a
+	// federated participant on a different domain than the recipients they add.
 	if timeSent != nil {
-		_, localDomain := parseAddr(identity)
-		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, localDomain, input.AddTo)
+		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, input.AddTo)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
