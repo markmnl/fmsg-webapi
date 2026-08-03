@@ -917,6 +917,30 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		return
 	}
 
+	// Reject addresses already added to this message: msg_add_to is unique per
+	// (msg, addr), so re-adding would silently no-op and could leave a batch
+	// with no recipients — which fmsgd would then deliver as an invalid add-to
+	// message. Re-adding an original to recipient stays allowed (SPEC §10.3
+	// NOTE II — it re-sends the message to a recipient who may no longer have
+	// it).
+	loweredAddTo := make([]string, len(input.AddTo))
+	for i, addr := range input.AddTo {
+		loweredAddTo[i] = strings.ToLower(addr)
+	}
+	var alreadyAdded int
+	if err = h.DB.Pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = ANY($2)",
+		msgID, loweredAddTo,
+	).Scan(&alreadyAdded); err != nil {
+		log.Printf("add recipients: check existing for msg %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+		return
+	}
+	if alreadyAdded > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "address(es) already added to this message"})
+		return
+	}
+
 	// Insert the new add_to recipients and record who added them. Both run in a
 	// single transaction so a partial failure leaves the message unchanged.
 	tx, err := h.DB.Pool.Begin(ctx)
@@ -950,6 +974,33 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
 			return
 		}
+	}
+
+	// SPEC §10.2: an add-to message is delivered to every participant domain
+	// of the message being added to — the domains of from and every to address
+	// — not only the domains hosting the new recipients, so all existing
+	// participants learn recipients were added. Domains hosting one of this
+	// batch's new recipients learn through normal delivery, and the local
+	// domain's record is this database itself, so neither needs a notify row.
+	newDomains := make([]string, 0, len(input.AddTo))
+	for _, addr := range input.AddTo {
+		_, domain := parseAddr(addr)
+		newDomains = append(newDomains, strings.ToLower(domain))
+	}
+	if _, err = tx.Exec(ctx, `
+		INSERT INTO msg_add_to_notify (batch_id, domain)
+		SELECT DISTINCT $1::bigint, lower(split_part(p.addr, '@', 3))
+		FROM (
+			SELECT from_addr AS addr FROM msg WHERE id = $2
+			UNION
+			SELECT addr FROM msg_to WHERE msg_id = $2
+		) p
+		WHERE lower(split_part(p.addr, '@', 3)) <> lower($3)
+		  AND NOT (lower(split_part(p.addr, '@', 3)) = ANY($4))
+	`, batchID, msgID, h.LocalDomain, newDomains); err != nil {
+		log.Printf("add recipients: insert notify rows for msg %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
+		return
 	}
 
 	if err = tx.Commit(ctx); err != nil {
