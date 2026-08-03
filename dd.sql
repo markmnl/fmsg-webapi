@@ -5,6 +5,16 @@
 --
 -- fmsg-webapi assumes fmsgd is the fmsg host implementation and uses the same
 -- PostgreSQL database.
+--
+-- This script is IDEMPOTENT: every statement is safe to re-run (CREATE ... IF
+-- NOT EXISTS, ALTER TABLE ... ADD COLUMN IF NOT EXISTS, DROP CONSTRAINT IF
+-- EXISTS, guarded DO blocks). Migrating an existing database is therefore
+-- just re-running the whole script, e.g.:
+--
+--   psql -d fmsgd -v ON_ERROR_STOP=1 -f dd.sql
+--
+-- Keep it that way: add new objects and columns only with idempotent
+-- statements.
 
 CREATE TABLE IF NOT EXISTS fmsg_api_sub_account (
     owner_addr varchar(255) NOT NULL,
