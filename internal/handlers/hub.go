@@ -15,8 +15,9 @@ import (
 // Event type discriminators for the WebSocket envelope. Adding a new event
 // type means adding a constant here and a producer that dispatches it.
 const (
-	eventNewMsg    = "new_msg"
-	eventDelivered = "delivered"
+	eventNewMsg          = "new_msg"
+	eventDelivered       = "delivered"
+	eventRecipientsAdded = "recipients_added"
 )
 
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
@@ -128,7 +129,10 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	if _, err := conn.Exec(ctx, "LISTEN delivered"); err != nil {
 		return err
 	}
-	log.Println("ws hub: listening on new_msg, delivered")
+	if _, err := conn.Exec(ctx, "LISTEN recipients_added"); err != nil {
+		return err
+	}
+	log.Println("ws hub: listening on new_msg, delivered, recipients_added")
 	onConnected()
 
 	for {
@@ -155,6 +159,12 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 			// addr here is the message's sender (see notify_delivered in
 			// dd.sql), not a recipient -- no Web Push for this event yet.
 			h.dispatch(ctx, msgID, addr, eventDelivered)
+		case "recipients_added":
+			// An add-to batch was recorded against the message; addr is one
+			// of its participants (see notify_recipients_added in fmsgd's
+			// dd.sql). Pushes the refreshed message so clients can show the
+			// updated recipient list.
+			h.dispatch(ctx, msgID, addr, eventRecipientsAdded)
 		default:
 			log.Printf("ws hub: ignoring notification on unknown channel %q", n.Channel)
 		}
