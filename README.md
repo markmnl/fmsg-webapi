@@ -609,6 +609,16 @@ Deletes a draft message and all its attachments from the database and disk. Only
 
 Marks a draft message as sent by setting `time_sent` to the current timestamp. Only the owner may send.
 
+For a reply (a draft with `pid`), the route first verifies that every remote
+recipient domain can actually accept it: per the fmsg spec a host rejects a
+reply whose parent it has not stored (response code 6), so if the parent was
+never addressed to a recipient's domain — or every delivery attempt of the
+parent to that domain concluded in rejection — the send is refused with `409`
+naming the domain(s) and the remedy (add the recipients to the parent via
+add-to, or start a new thread). Domains where the parent's delivery is still
+in flight are allowed; the reply's parent's own originating domain always
+passes (it retains its outgoing messages). Local recipients are unaffected.
+
 **Response:** `200 OK` with `{"id": <int>, "time": <float64>}`.
 
 **Errors:**
@@ -618,6 +628,7 @@ Marks a draft message as sent by setting `time_sent` to the current timestamp. O
 | `403`  | Not the owner |
 | `404`  | Message not found |
 | `409`  | Message already sent |
+| `409`  | Reply can never be accepted by one or more remote recipient domains (parent never addressed there, or its delivery there failed) |
 
 ### POST `/fmsg/:id/read`
 

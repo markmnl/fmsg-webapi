@@ -137,6 +137,109 @@ func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string,
 	}
 }
 
+// parentDomainDelivery summarizes the parent message's recorded delivery for
+// one recipient domain.
+type parentDomainDelivery struct {
+	delivered bool  // at least one recipient there was delivered (parent is stored)
+	pending   bool  // at least one recipient there has no outcome recorded yet
+	codes     []int // failure response codes recorded for the domain
+}
+
+// undeliverableReplyDomains returns, for each remote recipient domain of a
+// reply, the reason the reply can never be accepted there: the parent message
+// was never addressed to the domain, or every delivery attempt there
+// concluded in rejection. Per the fmsg spec a host rejects a reply whose
+// parent it has not stored (code 6), so sending such a reply is a client
+// error worth immediate feedback — the remedy is add-to on the parent or a
+// resend, not a retry. Domains where the parent is merely still in flight are
+// allowed: sequencing in-flight chains is the host's outbound concern, not
+// the client's.
+func undeliverableReplyDomains(replyDomains []string, parentFromDomain string, byDomain map[string]parentDomainDelivery) []string {
+	var blocked []string
+	for _, d := range replyDomains {
+		if strings.EqualFold(d, parentFromDomain) {
+			continue // the originating host retains its own outgoing messages
+		}
+		s, ok := byDomain[strings.ToLower(d)]
+		switch {
+		case !ok:
+			blocked = append(blocked, fmt.Sprintf("%s: the message being replied to was never addressed to this domain", d))
+		case s.delivered || s.pending:
+			// stored there, or still in flight
+		default:
+			blocked = append(blocked, fmt.Sprintf("%s: delivery of the message being replied to failed there (response code(s) %v)", d, s.codes))
+		}
+	}
+	return blocked
+}
+
+// remoteRecipientDomains returns the reply's recipient domains excluding the
+// local domain, deduplicated case-insensitively.
+func remoteRecipientDomains(msg *models.Message, localDomain string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(addr string) {
+		_, domain := parseAddr(addr)
+		key := strings.ToLower(domain)
+		if domain == "" || strings.EqualFold(domain, localDomain) || seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, domain)
+	}
+	for _, a := range msg.To {
+		add(a)
+	}
+	for _, b := range msg.AddTo {
+		for _, a := range b.To {
+			add(a)
+		}
+	}
+	return out
+}
+
+// parentDeliveryByDomain loads the parent's sender domain and a per-domain
+// summary of its recorded recipient delivery outcomes.
+func (h *MessageHandler) parentDeliveryByDomain(ctx context.Context, parentID int64) (string, map[string]parentDomainDelivery, error) {
+	var fromAddr string
+	if err := h.DB.Pool.QueryRow(ctx, "SELECT from_addr FROM msg WHERE id = $1", parentID).Scan(&fromAddr); err != nil {
+		return "", nil, err
+	}
+	rows, err := h.DB.Pool.Query(ctx, `
+		SELECT addr, time_delivered IS NOT NULL, response_code FROM (
+			SELECT addr, time_delivered, response_code FROM msg_to WHERE msg_id = $1
+			UNION ALL
+			SELECT addr, time_delivered, response_code FROM msg_add_to WHERE msg_id = $1
+		) r`, parentID)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+	byDomain := map[string]parentDomainDelivery{}
+	for rows.Next() {
+		var addr string
+		var delivered bool
+		var code *int
+		if err := rows.Scan(&addr, &delivered, &code); err != nil {
+			return "", nil, err
+		}
+		_, domain := parseAddr(addr)
+		key := strings.ToLower(domain)
+		s := byDomain[key]
+		switch {
+		case delivered:
+			s.delivered = true
+		case code != nil:
+			s.codes = append(s.codes, *code)
+		default:
+			s.pending = true
+		}
+		byDomain[key] = s
+	}
+	_, fromDomain := parseAddr(fromAddr)
+	return fromDomain, byDomain, rows.Err()
+}
+
 // messageInput is used for JSON binding on Create/Update — includes Data for the message body.
 // The outer AddTo field shadows models.Message.AddTo (same JSON name, shallower
 // depth wins), capturing any add_to in the body into an ignored value of any
@@ -761,6 +864,28 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	if existing.Time != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "message already sent"})
 		return
+	}
+
+	// A reply can only be accepted by hosts that store its parent (SPEC
+	// §10.3, reject code 6). Refuse now — with the reason — when a remote
+	// recipient domain can never accept it, rather than letting the reply
+	// bounce there later. Domains where the parent is still in flight pass:
+	// sequencing those is the host's outbound concern.
+	if existing.PID != nil {
+		if replyDomains := remoteRecipientDomains(existing, h.LocalDomain); len(replyDomains) > 0 {
+			parentFromDomain, byDomain, derr := h.parentDeliveryByDomain(ctx, *existing.PID)
+			if derr != nil {
+				log.Printf("send message %d: verify parent %d delivery: %v", msgID, *existing.PID, derr)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify parent delivery"})
+				return
+			}
+			if blocked := undeliverableReplyDomains(replyDomains, parentFromDomain, byDomain); len(blocked) > 0 {
+				c.JSON(http.StatusConflict, gin.H{"error": "reply cannot be accepted by recipient host(s): " +
+					strings.Join(blocked, "; ") +
+					" — add the recipients to the parent message (add-to) or start a new thread with them"})
+				return
+			}
+		}
 	}
 
 	now := float64(time.Now().UnixMicro()) / 1e6
