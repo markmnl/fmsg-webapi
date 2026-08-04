@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"github.com/markmnl/fmsg-webapi/internal/models"
 	"os"
 	"path/filepath"
 	"strings"
@@ -281,4 +282,51 @@ func TestExtractShortText(t *testing.T) {
 			t.Errorf("got %q, want empty", got)
 		}
 	})
+}
+
+func TestUndeliverableReplyDomains(t *testing.T) {
+	byDomain := map[string]parentDomainDelivery{
+		"delivered.example": {delivered: true},
+		"pending.example":   {pending: true},
+		"failed.example":    {codes: []int{6}},
+		"mixed.example":     {delivered: true, codes: []int{100}},
+		"partfail.example":  {pending: true, codes: []int{6}},
+	}
+	cases := []struct {
+		name         string
+		replyDomains []string
+		fromDomain   string
+		wantBlocked  int
+	}{
+		{"delivered parent passes", []string{"delivered.example"}, "origin.example", 0},
+		{"in-flight parent passes", []string{"pending.example"}, "origin.example", 0},
+		{"partially failed but still pending passes", []string{"partfail.example"}, "origin.example", 0},
+		{"delivered outweighs a failed sibling", []string{"mixed.example"}, "origin.example", 0},
+		{"originating domain always passes", []string{"origin.example"}, "origin.example", 0},
+		{"originating domain passes case-insensitively", []string{"Origin.Example"}, "origin.example", 0},
+		{"never-addressed domain blocked", []string{"stranger.example"}, "origin.example", 1},
+		{"permanently failed domain blocked", []string{"failed.example"}, "origin.example", 1},
+		{"mixed reply blocks only the bad domains", []string{"delivered.example", "failed.example", "stranger.example"}, "origin.example", 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := undeliverableReplyDomains(tc.replyDomains, tc.fromDomain, byDomain)
+			if len(got) != tc.wantBlocked {
+				t.Fatalf("blocked = %v, want %d entries", got, tc.wantBlocked)
+			}
+		})
+	}
+}
+
+func TestRemoteRecipientDomains(t *testing.T) {
+	msg := &models.Message{
+		To: []string{"@a@remote.example", "@b@Remote.Example", "@c@local.example"},
+		AddTo: []models.AddToBatch{
+			{To: []string{"@d@other.example", "@e@local.example"}},
+		},
+	}
+	got := remoteRecipientDomains(msg, "local.example")
+	if len(got) != 2 || !strings.EqualFold(got[0], "remote.example") || !strings.EqualFold(got[1], "other.example") {
+		t.Fatalf("domains = %v", got)
+	}
 }
