@@ -330,3 +330,44 @@ func TestRemoteRecipientDomains(t *testing.T) {
 		t.Fatalf("domains = %v", got)
 	}
 }
+
+func TestSendableProblems(t *testing.T) {
+	valid := func() *models.Message {
+		return &models.Message{
+			Version: 1,
+			To:      []string{"@bob@remote.example"},
+			Type:    "text/markdown",
+		}
+	}
+
+	if got := sendableProblems(valid()); len(got) != 0 {
+		t.Fatalf("valid draft flagged: %v", got)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*models.Message)
+		want   string
+	}{
+		{"no recipients", func(m *models.Message) { m.To = nil }, "no recipients"},
+		{"invalid recipient", func(m *models.Message) { m.To = []string{"bob@remote.example"} }, "invalid recipient"},
+		{"no type", func(m *models.Message) { m.Type = "" }, "no type"},
+		{"bad version", func(m *models.Message) { m.Version = 0 }, "unsupported version"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := valid()
+			tc.mutate(m)
+			got := sendableProblems(m)
+			if len(got) != 1 || !strings.Contains(got[0], tc.want) {
+				t.Fatalf("problems = %v, want one containing %q", got, tc.want)
+			}
+		})
+	}
+
+	// Everything wrong at once: every problem reported, not just the first.
+	m := &models.Message{Version: 0}
+	if got := sendableProblems(m); len(got) != 3 {
+		t.Fatalf("problems = %v, want 3", got)
+	}
+}
