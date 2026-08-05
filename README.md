@@ -681,6 +681,29 @@ Downloads the binary body of a message. The authenticated identity must be a par
 | `404`  | Message not found or data file not available |
 | `403`  | Authenticated user is not a participant |
 
+### GET `/fmsg/:id/thread`
+
+Returns the message's thread as plain text: the direct ancestor lineage
+(each message's `pid` followed to the root) plus the message itself, root
+first. Intended for "copy thread" UI actions and for feeding a whole thread
+to an agent as context.
+
+The authenticated identity must be a participant of the *requested*
+message. Each message is preceded by a one-line separator with its sender
+and send time. Ancestors the caller is not a participant of appear as
+`[message not visible to you]` (a recipient added mid-thread cannot read
+what came before); non-text bodies appear as a `[non-text message: <type>,
+<size> bytes]` placeholder. The walk is capped at 100 hops.
+
+**Response:** `200 OK`, `text/plain; charset=utf-8`.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `404`  | Message not found |
+| `403`  | Authenticated user is not a participant of the requested message |
+
 ### POST `/fmsg/:id/attach`
 
 Uploads a file attachment for a draft message. Only the owner may upload, and the message must not have been sent.
