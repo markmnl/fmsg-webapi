@@ -139,9 +139,19 @@ func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string,
 
 // parentDomainDelivery summarizes the parent message's recorded delivery for
 // one recipient domain.
+// Local sentinels fmsgd records in response_code (see fmsgd dd.sql):
+// -1 marks a delivery attempt that got no response (retryable), -2 marks a
+// recipient recorded from a received exchange — that delivery was another
+// host's responsibility and this host has no knowledge of its outcome.
+const (
+	localResponseCodeNoResponse     = -1
+	localResponseCodeNotOurDelivery = -2
+)
+
 type parentDomainDelivery struct {
 	delivered bool  // at least one recipient there was delivered (parent is stored)
 	pending   bool  // at least one recipient there has no outcome recorded yet
+	otherHost bool  // delivery there was another host's responsibility (parent was received)
 	codes     []int // failure response codes recorded for the domain
 }
 
@@ -164,8 +174,12 @@ func undeliverableReplyDomains(replyDomains []string, parentFromDomain string, b
 		switch {
 		case !ok:
 			blocked = append(blocked, fmt.Sprintf("%s: the message being replied to was never addressed to this domain", d))
-		case s.delivered || s.pending:
-			// stored there, or still in flight
+		case s.delivered || s.pending || s.otherHost:
+			// Stored there, still in flight, or another host's delivery
+			// (a received parent): this host cannot know a third-party
+			// delivery's outcome, so the reply is attempted — the wire's
+			// "parent not found" rejection (code 6) remains the arbiter
+			// in the rare case the originating host in fact failed.
 		default:
 			blocked = append(blocked, fmt.Sprintf("%s: delivery of the message being replied to failed there (response code(s) %v)", d, s.codes))
 		}
@@ -229,6 +243,10 @@ func (h *MessageHandler) parentDeliveryByDomain(ctx context.Context, parentID in
 		switch {
 		case delivered:
 			s.delivered = true
+		case code != nil && *code == localResponseCodeNotOurDelivery:
+			s.otherHost = true
+		case code != nil && *code == localResponseCodeNoResponse:
+			s.pending = true // retryable: the sender will attempt again
 		case code != nil:
 			s.codes = append(s.codes, *code)
 		default:
