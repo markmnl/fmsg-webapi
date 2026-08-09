@@ -613,11 +613,15 @@ For a reply (a draft with `pid`), the route first verifies that every remote
 recipient domain can actually accept it: per the fmsg spec a host rejects a
 reply whose parent it has not stored (response code 6), so if the parent was
 never addressed to a recipient's domain — or every delivery attempt of the
-parent to that domain concluded in rejection — the send is refused with `409`
-naming the domain(s) and the remedy (add the recipients to the parent via
-add-to, or start a new thread). Domains where the parent's delivery is still
-in flight are allowed; the reply's parent's own originating domain always
-passes (it retains its outgoing messages). Local recipients are unaffected.
+parent to that domain by this host concluded in rejection — the send is
+refused with `409` naming the domain(s) and the remedy (add the recipients to
+the parent via add-to, or start a new thread). Domains where the parent's
+delivery is still in flight are allowed, as are domains whose delivery was
+another host's responsibility (a received parent): this host cannot know a
+third-party delivery's outcome, so the reply is attempted and the wire's
+"parent not found" rejection remains the arbiter. The reply's parent's own
+originating domain always passes (it retains its outgoing messages). Local
+recipients are unaffected.
 
 **Response:** `200 OK` with `{"id": <int>, "time": <float64>}`.
 
