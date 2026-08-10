@@ -144,7 +144,9 @@ DO UPDATE SET max_sub_accounts = EXCLUDED.max_sub_accounts;
 
 Operators can bootstrap or rotate keys without EdDSA by using the built-in CLI
 command. It uses the standard `PG*` connection environment variables and prints
-the plaintext API key once.
+the plaintext API key once. Creation verifies that the owner and delegated
+address are present and accepting new messages in fmsgid; derived sub-accounts
+are registered in fmsgid automatically.
 
 Derived sub-account:
 

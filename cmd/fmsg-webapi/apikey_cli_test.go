@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +22,32 @@ func TestPrepareCLIGrantInputsAllowsArbitraryDelegatedAddressFlow(t *testing.T) 
 	}
 	if key.Value == "" || len(hash) == 0 {
 		t.Fatalf("key/hash not generated")
+	}
+}
+
+func TestRequireAcceptingCLIAddress(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fmsgid/@alice@exists.test":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"acceptingNew":true}`))
+		case "/fmsgid/@alice@disabled.test":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"acceptingNew":false}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	if err := requireAcceptingCLIAddress(server.URL, "@alice@exists.test", "owner"); err != nil {
+		t.Fatalf("existing accepting address: %v", err)
+	}
+	if err := requireAcceptingCLIAddress(server.URL, "@alice@missing.test", "owner"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing address error = %v", err)
+	}
+	if err := requireAcceptingCLIAddress(server.URL, "@alice@disabled.test", "owner"); err == nil || !strings.Contains(err.Error(), "not accepting") {
+		t.Fatalf("disabled address error = %v", err)
 	}
 }
 
