@@ -277,6 +277,8 @@ the application.
 | `POST`   | `/fmsg/:id/read`                 | Mark a message as read   |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
+| `GET`    | `/fmsg/:id/thread`               | Render direct ancestry as plain text |
+| `GET`    | `/fmsg/:id/thread/messages`      | Load direct ancestry as structured JSON |
 | `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
 | `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
 | `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
@@ -707,6 +709,60 @@ what came before); non-text bodies appear as a `[non-text message: <type>,
 | ------ | --------- |
 | `404`  | Message not found |
 | `403`  | Authenticated user is not a participant of the requested message |
+
+### GET `/fmsg/:id/thread/messages`
+
+Returns the requested message and its direct `pid` ancestors as structured
+JSON, ordered from the root to the requested message. Sibling branches are not
+included. Valid UTF-8 `text/*`, `application/json`, and `application/*+json`
+bodies are included inline. Binary bodies and attachments are represented by
+authenticated download paths so clients can fetch them concurrently.
+
+Each visible message includes its normal protocol metadata, a body descriptor,
+attachment descriptors, and the canonical message SHA-256 when available.
+Because that digest covers the complete message including attachment data,
+clients may use the supplied per-part `cache_key` values for content-addressed
+caching. Locally delivered messages without a persisted canonical digest are
+returned with `cacheable: false`.
+
+The authenticated identity must be a participant of the requested message.
+Ancestors it cannot read appear only as `{"id": ..., "visible": false}` and
+make the top-level `complete` field false. The walk is capped at 100 messages
+and textual bodies are capped at 32 MiB in aggregate; neither limit is silently
+truncated.
+
+**Response:** `200 OK`, `application/json`:
+
+```json
+{
+  "root_id": 41,
+  "trigger_id": 43,
+  "complete": true,
+  "messages": [
+    {
+      "id": 41,
+      "visible": true,
+      "pid": null,
+      "from": "@alice@example.com",
+      "to": ["@agent@example.net"],
+      "type": "text/plain",
+      "size": 5,
+      "message_sha256": "0123456789abcdef",
+      "body": {"type": "text/plain", "size": 5, "text": "hello", "cache_key": "sha256:0123456789abcdef:body", "cacheable": true},
+      "attachments": []
+    }
+  ]
+}
+```
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `403`  | Authenticated user is not a participant of the requested message |
+| `404`  | Requested message does not exist |
+| `413`  | Aggregate inline text exceeds 32 MiB (`thread_too_large`) |
+| `422`  | Direct ancestry exceeds 100 messages (`thread_too_deep`) |
 
 ### POST `/fmsg/:id/attach`
 

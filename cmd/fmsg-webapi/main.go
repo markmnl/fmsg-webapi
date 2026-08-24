@@ -194,6 +194,7 @@ func main() {
 		fmsg.POST("/:id/add-to", msgHandler.AddRecipients)
 		fmsg.GET("/:id/data", msgHandler.DownloadData)
 		fmsg.GET("/:id/thread", msgHandler.ThreadText)
+		fmsg.GET("/:id/thread/messages", msgHandler.ThreadMessages)
 
 		fmsg.POST("/:id/attach", attHandler.Upload)
 		fmsg.GET("/:id/attach/:filename", attHandler.Download)
