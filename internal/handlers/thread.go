@@ -72,14 +72,14 @@ type threadMessagesResponse struct {
 	Messages  []threadMessage `json:"messages"`
 }
 
-func partCacheKey(messageHash, kind string, position int) string {
+func partCacheKey(messageHash, kind string, position int, filename string) string {
 	if messageHash == "" {
 		return ""
 	}
 	if kind == "body" {
 		return "sha256:" + messageHash + ":body"
 	}
-	return "sha256:" + messageHash + ":attachment:" + strconv.Itoa(position)
+	return "sha256:" + messageHash + ":attachment:" + strconv.Itoa(position) + ":" + url.PathEscape(filename)
 }
 
 func threadDownloadPath(id int64, filename string) string {
@@ -96,7 +96,7 @@ func populateThreadBodies(messages []threadMessage, dataDir string, maxTextBytes
 		if !m.Visible {
 			continue
 		}
-		key := partCacheKey(m.MessageSHA256, "body", 0)
+		key := partCacheKey(m.MessageSHA256, "body", 0, "")
 		m.Body = &threadBody{Type: m.Type, Size: m.Size, Download: threadDownloadPath(m.ID, ""), CacheKey: key, Cacheable: key != ""}
 		if !isTextType(m.Type) {
 			continue
@@ -203,7 +203,7 @@ func loadThreadRelations(ctx context.Context, tx pgx.Tx, messages []threadMessag
 		}
 		m := byID[msgID]
 		a.Download = threadDownloadPath(msgID, a.Filename)
-		a.CacheKey = partCacheKey(m.MessageSHA256, "attachment", a.Position)
+		a.CacheKey = partCacheKey(m.MessageSHA256, "attachment", a.Position, a.Filename)
 		a.Cacheable = a.CacheKey != ""
 		m.Attachments = append(m.Attachments, a)
 	}

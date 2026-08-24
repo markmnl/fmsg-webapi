@@ -85,10 +85,10 @@ func TestThreadMessagesJSONDoesNotExposeInternalPath(t *testing.T) {
 }
 
 func TestThreadAttachmentCacheKey(t *testing.T) {
-	if got := partCacheKey("deadbeef", "attachment", 4); got != "sha256:deadbeef:attachment:4" {
+	if got := partCacheKey("deadbeef", "attachment", 4, "report final.pdf"); got != "sha256:deadbeef:attachment:4:report%20final.pdf" {
 		t.Fatalf("got %q", got)
 	}
-	if got := partCacheKey("", "attachment", 4); got != "" {
+	if got := partCacheKey("", "attachment", 4, "report.pdf"); got != "" {
 		t.Fatalf("hashless message must not be cacheable: %q", got)
 	}
 }
