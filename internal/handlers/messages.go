@@ -884,6 +884,13 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
+	// Drafts are a workspace — create/update accept incomplete messages by
+	// design. Send is the gate: only a complete, valid message may leave.
+	if problems := sendableProblems(existing); len(problems) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "message is not sendable: " + strings.Join(problems, "; ")})
+		return
+	}
+
 	// A reply can only be accepted by hosts that store its parent (SPEC
 	// §10.3, reject code 6). Refuse now — with the reason — when a remote
 	// recipient domain can never accept it, rather than letting the reply
@@ -1581,6 +1588,30 @@ func (h *MessageHandler) extractShortText(dataPath, mimeType string) string {
 		return ""
 	}
 	return string(buf)
+}
+
+// sendableProblems lists everything preventing a draft from being sent as a
+// valid fmsg message. Create/update deliberately accept incomplete drafts
+// (a draft is a workspace); completeness is enforced only here, at send.
+// Address *form* is still validated on create/update, but old rows predate
+// that, so it is re-checked defensively.
+func sendableProblems(m *models.Message) []string {
+	var problems []string
+	if m.Version != 1 {
+		problems = append(problems, fmt.Sprintf("unsupported version %d", m.Version))
+	}
+	if len(m.To) == 0 {
+		problems = append(problems, "no recipients")
+	}
+	for _, addr := range m.To {
+		if !middleware.IsValidAddr(addr) {
+			problems = append(problems, fmt.Sprintf("invalid recipient address %q", addr))
+		}
+	}
+	if m.Type == "" {
+		problems = append(problems, "no type")
+	}
+	return problems
 }
 
 // validateAddresses returns an error if the from address or any to address is
