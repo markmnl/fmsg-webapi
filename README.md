@@ -637,6 +637,12 @@ Deletes a draft message and all its attachments from the database and disk. Only
 
 Marks a draft message as sent by setting `time_sent` to the current timestamp. Only the owner may send.
 
+**Send is the validation gate.** Drafts are a workspace: create/update accept
+incomplete messages (no recipients, no type) by design, but a draft may only
+be *sent* when it is a complete, valid fmsg message — at least one
+well-formed recipient, a `type`, and a supported `version`. An incomplete
+draft is refused with `400` listing every problem.
+
 For a reply (a draft with `pid`), the route first verifies that every remote
 recipient domain can actually accept it: per the fmsg spec a host rejects a
 reply whose parent it has not stored (response code 6), so if the parent was
@@ -657,6 +663,7 @@ recipients are unaffected.
 
 | Status | Condition |
 | ------ | --------- |
+| `400`  | Message is not sendable (no recipients, invalid recipient address, no type, unsupported version) |
 | `403`  | Not the owner |
 | `404`  | Message not found |
 | `409`  | Message already sent |
