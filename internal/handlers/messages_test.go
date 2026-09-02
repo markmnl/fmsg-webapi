@@ -291,6 +291,8 @@ func TestUndeliverableReplyDomains(t *testing.T) {
 		"failed.example":    {codes: []int{6}},
 		"mixed.example":     {delivered: true, codes: []int{100}},
 		"partfail.example":  {pending: true, codes: []int{6}},
+		"otherhost.example": {otherHost: true},
+		"otherfail.example": {otherHost: true, codes: []int{4}},
 	}
 	cases := []struct {
 		name         string
@@ -302,6 +304,8 @@ func TestUndeliverableReplyDomains(t *testing.T) {
 		{"in-flight parent passes", []string{"pending.example"}, "origin.example", 0},
 		{"partially failed but still pending passes", []string{"partfail.example"}, "origin.example", 0},
 		{"delivered outweighs a failed sibling", []string{"mixed.example"}, "origin.example", 0},
+		{"another host's delivery passes", []string{"otherhost.example"}, "origin.example", 0},
+		{"another host's delivery outweighs a failed sibling", []string{"otherfail.example"}, "origin.example", 0},
 		{"originating domain always passes", []string{"origin.example"}, "origin.example", 0},
 		{"originating domain passes case-insensitively", []string{"Origin.Example"}, "origin.example", 0},
 		{"never-addressed domain blocked", []string{"stranger.example"}, "origin.example", 1},

@@ -277,6 +277,8 @@ the application.
 | `POST`   | `/fmsg/:id/read`                 | Mark a message as read   |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
+| `GET`    | `/fmsg/:id/thread`               | Render direct ancestry as plain text |
+| `GET`    | `/fmsg/:id/thread/messages`      | Load direct ancestry as structured JSON |
 | `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
 | `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
 | `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
@@ -619,11 +621,15 @@ For a reply (a draft with `pid`), the route first verifies that every remote
 recipient domain can actually accept it: per the fmsg spec a host rejects a
 reply whose parent it has not stored (response code 6), so if the parent was
 never addressed to a recipient's domain — or every delivery attempt of the
-parent to that domain concluded in rejection — the send is refused with `409`
-naming the domain(s) and the remedy (add the recipients to the parent via
-add-to, or start a new thread). Domains where the parent's delivery is still
-in flight are allowed; the reply's parent's own originating domain always
-passes (it retains its outgoing messages). Local recipients are unaffected.
+parent to that domain by this host concluded in rejection — the send is
+refused with `409` naming the domain(s) and the remedy (add the recipients to
+the parent via add-to, or start a new thread). Domains where the parent's
+delivery is still in flight are allowed, as are domains whose delivery was
+another host's responsibility (a received parent): this host cannot know a
+third-party delivery's outcome, so the reply is attempted and the wire's
+"parent not found" rejection remains the arbiter. The reply's parent's own
+originating domain always passes (it retains its outgoing messages). Local
+recipients are unaffected.
 
 **Response:** `200 OK` with `{"id": <int>, "time": <float64>}`.
 
@@ -687,6 +693,83 @@ Downloads the binary body of a message. The authenticated identity must be a par
 | ------ | --------- |
 | `404`  | Message not found or data file not available |
 | `403`  | Authenticated user is not a participant |
+
+### GET `/fmsg/:id/thread`
+
+Returns the message's thread as plain text: the direct ancestor lineage
+(each message's `pid` followed to the root) plus the message itself, root
+first. Intended for "copy thread" UI actions and for feeding a whole thread
+to an agent as context.
+
+The authenticated identity must be a participant of the *requested*
+message. Each message is preceded by a one-line separator with its sender
+and send time. Ancestors the caller is not a participant of appear as
+`[message not visible to you]` (a recipient added mid-thread cannot read
+what came before); non-text bodies appear as a `[non-text message: <type>,
+<size> bytes]` placeholder. The walk is capped at 100 hops.
+
+**Response:** `200 OK`, `text/plain; charset=utf-8`.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `404`  | Message not found |
+| `403`  | Authenticated user is not a participant of the requested message |
+
+### GET `/fmsg/:id/thread/messages`
+
+Returns the requested message and its direct `pid` ancestors as structured
+JSON, ordered from the root to the requested message. Sibling branches are not
+included. Valid UTF-8 `text/*`, `application/json`, and `application/*+json`
+bodies are included inline. Binary bodies and attachments are represented by
+authenticated download paths so clients can fetch them concurrently.
+
+Each visible message includes its normal protocol metadata, a body descriptor,
+attachment descriptors, and the canonical message SHA-256 when available.
+Because that digest covers the complete message including attachment data,
+clients may use the supplied per-part `cache_key` values for content-addressed
+caching. Locally delivered messages without a persisted canonical digest are
+returned with `cacheable: false`.
+
+The authenticated identity must be a participant of the requested message.
+Ancestors it cannot read appear only as `{"id": ..., "visible": false}` and
+make the top-level `complete` field false. The walk is capped at 100 messages
+and textual bodies are capped at 32 MiB in aggregate; neither limit is silently
+truncated.
+
+**Response:** `200 OK`, `application/json`:
+
+```json
+{
+  "root_id": 41,
+  "trigger_id": 43,
+  "complete": true,
+  "messages": [
+    {
+      "id": 41,
+      "visible": true,
+      "pid": null,
+      "from": "@alice@example.com",
+      "to": ["@agent@example.net"],
+      "type": "text/plain",
+      "size": 5,
+      "message_sha256": "0123456789abcdef",
+      "body": {"type": "text/plain", "size": 5, "text": "hello", "cache_key": "sha256:0123456789abcdef:body", "cacheable": true},
+      "attachments": []
+    }
+  ]
+}
+```
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `403`  | Authenticated user is not a participant of the requested message |
+| `404`  | Requested message does not exist |
+| `413`  | Aggregate inline text exceeds 32 MiB (`thread_too_large`) |
+| `422`  | Direct ancestry exceeds 100 messages (`thread_too_deep`) |
 
 ### POST `/fmsg/:id/attach`
 
