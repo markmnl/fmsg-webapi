@@ -18,6 +18,7 @@ const (
 	eventNewMsg          = "new_msg"
 	eventDelivered       = "delivered"
 	eventRecipientsAdded = "recipients_added"
+	eventReaction        = "reaction"
 )
 
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
@@ -42,6 +43,12 @@ type Hub struct {
 	// delivered even when the recipient has no live WebSocket.
 	notifyPush func(ctx context.Context, msgID int64, addr string)
 
+	// reactionSubject, when non-nil, reports the subject message of msgID
+	// when msgID is an FMSG-005 reaction. A reaction is pushed to its
+	// recipients as a reaction event carrying the refreshed subject, never
+	// as new_msg.
+	reactionSubject func(ctx context.Context, msgID int64) (int64, bool)
+
 	mu sync.RWMutex
 	// registry maps a lower-cased user address to the set of that user's
 	// currently connected clients (a user may have several connections).
@@ -57,8 +64,9 @@ func (h *Hub) SetPushNotifier(fn func(ctx context.Context, msgID int64, addr str
 // NewHub creates a Hub that builds pushed message payloads via msgs.
 func NewHub(msgs *MessageHandler) *Hub {
 	return &Hub{
-		buildItem: msgs.messageItemFor,
-		registry:  make(map[string]map[*wsClient]struct{}),
+		buildItem:       msgs.messageItemFor,
+		reactionSubject: msgs.reactionSubject,
+		registry:        make(map[string]map[*wsClient]struct{}),
 	}
 }
 
@@ -147,6 +155,14 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 		}
 		switch n.Channel {
 		case "new_msg":
+			if h.reactionSubject != nil {
+				if subject, ok := h.reactionSubject(ctx, msgID); ok {
+					// FMSG-005: a reaction is a low-priority event on its
+					// subject, not a new message. No Web Push is sent.
+					h.dispatch(ctx, subject, addr, eventReaction)
+					continue
+				}
+			}
 			// Web Push runs in its own goroutine: it is network I/O to many
 			// endpoints and must not stall the single listener. It is
 			// dispatched here, alongside (not inside) dispatch, so a push is

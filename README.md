@@ -278,7 +278,10 @@ the application.
 | `POST`   | `/fmsg/:id/send`                 | Send a message           |
 | `POST`   | `/fmsg/:id/read`                 | Mark a message as read   |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
+| `POST`   | `/fmsg/:id/react`                | Set or clear an emoji reaction (FMSG-005) |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
+| `GET`    | `/fmsg/:id/thread`               | Render direct ancestry as plain text |
+| `GET`    | `/fmsg/:id/thread/messages`      | Load direct ancestry as structured JSON |
 | `POST`   | `/fmsg/:id/attach`          | Upload an attachment     |
 | `GET`    | `/fmsg/:id/attach/:filename`| Download an attachment   |
 | `DELETE` | `/fmsg/:id/attach/:filename`| Delete an attachment     |
@@ -424,7 +427,10 @@ event types can be added without breaking clients:
 
 | `type`     | `data` | Sent when |
 | ---------- | ------ | --------- |
-| `new_msg`  | A message object, same shape as an item in the `GET /fmsg` list response (includes `id`). | A new message arrives for the authenticated user. |
+| `new_msg`  | A message object, same shape as an item in the `GET /fmsg` list response (includes `id`). | A new message arrives for the authenticated user. Not sent for reactions. |
+| `delivered` | The refreshed message object. | A recipient's delivery state changed on a message the user sent. |
+| `recipients_added` | The refreshed message object. | An add-to batch was recorded on a message the user participates in. |
+| `reaction` | The refreshed **subject** message object, with its `reactions` up to date. | A reaction (FMSG-005) on a message the user participates in arrives. The reaction message itself is not pushed as `new_msg` and triggers no Web Push. |
 
 A client only ever receives events for messages it is a participant on. The
 server sends periodic WebSocket pings; clients should respond with pongs (most
@@ -493,6 +499,7 @@ Add-to recipients are not part of this body — they are added later via `POST /
 | `size`      | `int`      | yes      | Data size in bytes |
 | `important` | `bool`     | no       | Mark message as important |
 | `no_reply`  | `bool`     | no       | Indicate replies will be discarded |
+| `terminal`  | `bool`     | no       | Mark the message terminal: a leaf nobody can reply to or add recipients to (fmsg Specification v0.6.0 flag bit 6, enforced by every host) |
 | `data`      | `string`   | no       | Message body content |
 
 **Response:** `201 Created` with `{"id": <int>}`.
@@ -501,8 +508,9 @@ Add-to recipients are not part of this body — they are added later via `POST /
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Missing/invalid fields, empty `to`, or `topic` set together with `pid` |
+| `400`  | Missing/invalid fields, empty `to`, `topic` set together with `pid`, or `pid` not found |
 | `403`  | `from` does not match authenticated user |
+| `409`  | `pid` references a terminal message, which cannot be replied to |
 
 ### GET `/fmsg/:id`
 
@@ -519,6 +527,7 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   "important": false,
   "no_reply": false,
   "deflate": false,
+  "terminal": false,
   "pid": null,
   "from": "@alice@example.com",
   "to": ["@bob@example.com"],
@@ -544,9 +553,27 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   "short_text": "hello world",
   "read": false,
   "time_read": null,
-  "attachments": []
+  "attachments": [],
+  "reaction": null,
+  "reactions": [
+    { "emoji": "👍", "from": ["@bob@example.com", "@carol@example.com"] }
+  ]
 }
 ```
+
+`terminal` is the fmsg _terminal_ flag: the message is a leaf of its thread
+and no host will accept a reply to it or an add-to on it.
+
+`reaction` and `reactions` implement
+[FMSG-005 Reactions](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-005-reactions.md).
+A reaction is an ordinary message recognised by its shape — a reply with
+`no_reply` and `terminal` set, type `text/plain;charset=UTF-8`, no attachments,
+and a body that is a single emoji (or empty to clear). `reaction` is the emoji
+such a message carries (`""` for a clearing reaction) and `null` for every
+other message, so clients can hide reaction messages from message lists.
+`reactions` lists the effective reactions on this message: each participant's
+latest reaction, grouped by emoji in order of first reaction, with the
+reactors of each. It is `[]` when there are none.
 
 `add_to` is an array of add-to batches, one per `POST /fmsg/:id/add-to` call.
 Each batch has a stable `batch_id` (unique within the database and referenced
@@ -590,9 +617,10 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 
 | Status | Condition |
 | ------ | --------- |
-| `400`  | Invalid fields, or `topic` set together with `pid` |
+| `400`  | Invalid fields, `topic` set together with `pid`, or `pid` not found |
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
+| `409`  | `pid` references a terminal message, which cannot be replied to |
 
 ### DELETE `/fmsg/:id`
 
@@ -610,6 +638,12 @@ Deletes a draft message and all its attachments from the database and disk. Only
 ### POST `/fmsg/:id/send`
 
 Marks a draft message as sent by setting `time_sent` to the current timestamp. Only the owner may send.
+
+**Send is the validation gate.** Drafts are a workspace: create/update accept
+incomplete messages (no recipients, no type) by design, but a draft may only
+be *sent* when it is a complete, valid fmsg message — at least one
+well-formed recipient, a `type`, and a supported `version`. An incomplete
+draft is refused with `400` listing every problem.
 
 For a reply (a draft with `pid`), the route first verifies that every remote
 recipient domain can actually accept it: per the fmsg spec a host rejects a
@@ -631,6 +665,7 @@ recipients are unaffected.
 
 | Status | Condition |
 | ------ | --------- |
+| `400`  | Message is not sendable (no recipients, invalid recipient address, no type, unsupported version) |
 | `403`  | Not the owner |
 | `404`  | Message not found |
 | `409`  | Message already sent |
@@ -673,6 +708,41 @@ New addresses must be distinct among themselves (case-insensitive).
 | `400`  | Empty `add_to` or duplicate addresses |
 | `403`  | Authenticated user is not an existing participant (sender or `to` recipient) |
 | `404`  | Message not found |
+| `409`  | Message is terminal; recipients cannot be added to it |
+
+### POST `/fmsg/:id/react`
+
+Sets or clears the authenticated identity's reaction on a message, per
+[FMSG-005 Reactions](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-005-reactions.md).
+The identity must be a participant of the message — the sender or a recipient
+in `to` or `add_to` — and the message must be sent and not terminal.
+
+The reaction is sent immediately as a reaction message: a reply to `:id` with
+`no_reply` and `terminal` set, type `text/plain;charset=UTF-8`, body the emoji,
+addressed to every other participant of the message. Delivery then proceeds
+exactly as for any sent message. A reaction message cannot be replied to,
+reacted to, or have recipients added.
+
+**Request body (JSON):**
+
+| Field   | Type     | Required | Description |
+| ------- | -------- | -------- | ----------- |
+| `emoji` | `string` | no       | A single emoji (a Unicode `RGI_Emoji` sequence, or any single well-formed emoji sequence). `""` or `null` clears the caller's reaction. |
+
+Setting the same reaction the caller already has is idempotent: nothing is
+sent and the existing reaction message is returned with `200 OK`. Clearing when
+the caller has no reaction returns `200 OK` with `null` values.
+
+**Response:** `201 Created` with the reaction message's `{"id": <int>, "time": <number>}`.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `400`  | `emoji` is not a single emoji |
+| `403`  | Authenticated identity is not a participant |
+| `404`  | Message not found |
+| `409`  | Message is a draft, is terminal, has no other participants, or a remote recipient host cannot accept the reaction because it does not hold the message |
 
 ### GET `/fmsg/:id/data`
 
@@ -709,6 +779,60 @@ what came before); non-text bodies appear as a `[non-text message: <type>,
 | ------ | --------- |
 | `404`  | Message not found |
 | `403`  | Authenticated user is not a participant of the requested message |
+
+### GET `/fmsg/:id/thread/messages`
+
+Returns the requested message and its direct `pid` ancestors as structured
+JSON, ordered from the root to the requested message. Sibling branches are not
+included. Valid UTF-8 `text/*`, `application/json`, and `application/*+json`
+bodies are included inline. Binary bodies and attachments are represented by
+authenticated download paths so clients can fetch them concurrently.
+
+Each visible message includes its normal protocol metadata, a body descriptor,
+attachment descriptors, and the canonical message SHA-256 when available.
+Because that digest covers the complete message including attachment data,
+clients may use the supplied per-part `cache_key` values for content-addressed
+caching. Locally delivered messages without a persisted canonical digest are
+returned with `cacheable: false`.
+
+The authenticated identity must be a participant of the requested message.
+Ancestors it cannot read appear only as `{"id": ..., "visible": false}` and
+make the top-level `complete` field false. The walk is capped at 100 messages
+and textual bodies are capped at 32 MiB in aggregate; neither limit is silently
+truncated.
+
+**Response:** `200 OK`, `application/json`:
+
+```json
+{
+  "root_id": 41,
+  "trigger_id": 43,
+  "complete": true,
+  "messages": [
+    {
+      "id": 41,
+      "visible": true,
+      "pid": null,
+      "from": "@alice@example.com",
+      "to": ["@agent@example.net"],
+      "type": "text/plain",
+      "size": 5,
+      "message_sha256": "0123456789abcdef",
+      "body": {"type": "text/plain", "size": 5, "text": "hello", "cache_key": "sha256:0123456789abcdef:body", "cacheable": true},
+      "attachments": []
+    }
+  ]
+}
+```
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `403`  | Authenticated user is not a participant of the requested message |
+| `404`  | Requested message does not exist |
+| `413`  | Aggregate inline text exceeds 32 MiB (`thread_too_large`) |
+| `422`  | Direct ancestry exceeds 100 messages (`thread_too_deep`) |
 
 ### POST `/fmsg/:id/attach`
 

@@ -178,6 +178,9 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 		log.Printf("push notify: build message %d for %s: %v", msgID, addr, err)
 		return
 	}
+	if item.Reaction != nil {
+		return // FMSG-005: a reaction does not warrant a notification
+	}
 
 	payload, err := json.Marshal(buildPushPayload(item, rootID, h.iconURL))
 	if err != nil {

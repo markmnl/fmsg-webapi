@@ -33,6 +33,7 @@ type Message struct {
 	Important   bool                `json:"important"`
 	NoReply     bool                `json:"no_reply"`
 	Deflate     bool                `json:"deflate"`
+	Terminal    bool                `json:"terminal"`
 	PID         *int64              `json:"pid"`
 	From        string              `json:"from"`
 	To          []string            `json:"to"`
@@ -46,4 +47,13 @@ type Message struct {
 	Read        bool                `json:"read"`
 	TimeRead    *float64            `json:"time_read"`
 	Attachments []Attachment        `json:"attachments"`
+	Reaction    *string             `json:"reaction"`  // FMSG-005: the emoji this message carries when it is a reaction ("" clears); nil otherwise
+	Reactions   []Reaction          `json:"reactions"` // FMSG-005: effective reactions on this message
+}
+
+// Reaction is one emoji currently reacted on a message and the participants
+// whose effective reaction it is (FMSG-005).
+type Reaction struct {
+	Emoji string   `json:"emoji"`
+	From  []string `json:"from"`
 }
