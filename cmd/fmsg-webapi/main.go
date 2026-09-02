@@ -192,6 +192,7 @@ func main() {
 		fmsg.POST("/:id/send", msgHandler.Send)
 		fmsg.POST("/:id/read", msgHandler.MarkRead)
 		fmsg.POST("/:id/add-to", msgHandler.AddRecipients)
+		fmsg.POST("/:id/react", msgHandler.React)
 		fmsg.GET("/:id/data", msgHandler.DownloadData)
 		fmsg.GET("/:id/thread", msgHandler.ThreadText)
 		fmsg.GET("/:id/thread/messages", msgHandler.ThreadMessages)

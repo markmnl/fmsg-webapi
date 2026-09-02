@@ -66,6 +66,7 @@ type messageListItem struct {
 	Important   bool                       `json:"important"`
 	NoReply     bool                       `json:"no_reply"`
 	Deflate     bool                       `json:"deflate"`
+	Terminal    bool                       `json:"terminal"`
 	PID         *int64                     `json:"pid"`
 	From        string                     `json:"from"`
 	To          []string                   `json:"to"`
@@ -79,6 +80,10 @@ type messageListItem struct {
 	Read        bool                       `json:"read"`
 	TimeRead    *float64                   `json:"time_read"`
 	Attachments []models.Attachment        `json:"attachments"`
+	Reaction    *string                    `json:"reaction"`
+	Reactions   []models.Reaction          `json:"reactions"`
+
+	dataPath string // stored body path, for reaction recognition; never serialised
 }
 
 // formatDeliveredISO converts a nullable Unix-epoch-seconds timestamp (as
@@ -286,7 +291,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
 		        COALESCE(
 		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = ANY($1)),
 		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = ANY($1))
@@ -310,13 +315,14 @@ func (h *MessageHandler) List(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
 		m.Read = m.TimeRead != nil
+		m.dataPath = dataPath
 		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
@@ -360,6 +366,8 @@ func (h *MessageHandler) List(c *gin.Context) {
 			messages[i].Attachments = attMap[messages[i].ID]
 		}
 	}
+
+	h.populateListReactions(ctx, messages)
 
 	c.JSON(http.StatusOK, messages)
 }
@@ -387,7 +395,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
 		 WHERE m.from_addr = ANY($1)
 		 ORDER BY m.id DESC
@@ -406,12 +414,13 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
 			log.Printf("list sent messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
 			return
 		}
 		m.HasPid = m.PID != nil
+		m.dataPath = dataPath
 		m.ShortText = h.extractShortText(dataPath, m.Type)
 		messages = append(messages, m)
 		msgIDs = append(msgIDs, m.ID)
@@ -455,6 +464,8 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 			messages[i].Attachments = attMap[messages[i].ID]
 		}
 	}
+
+	h.populateListReactions(ctx, messages)
 
 	c.JSON(http.StatusOK, messages)
 }
@@ -497,19 +508,9 @@ func (h *MessageHandler) Create(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Validate PID references an existing message.
-	if msg.PID != nil {
-		var exists bool
-		err := h.DB.Pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM msg WHERE id = $1)", *msg.PID).Scan(&exists)
-		if err != nil {
-			log.Printf("create message: validate pid: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate pid"})
-			return
-		}
-		if !exists {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("PID %d not found", *msg.PID)})
-			return
-		}
+	// Validate PID references an existing, non-terminal message.
+	if !h.validateParent(c, msg.PID) {
+		return
 	}
 
 	// Detect zip (deflate) content by checking for the zip magic bytes.
@@ -522,10 +523,10 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	dataSize := len(msg.Data)
 	var msgID int64
 	err := h.DB.Pool.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, from_addr, topic, type, size, filepath, time_sent)
- VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NULL)
+		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, is_terminal, from_addr, topic, type, size, filepath, time_sent)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.From, msg.Topic, msg.Type, dataSize,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Terminal, msg.From, msg.Topic, msg.Type, dataSize,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -595,6 +596,11 @@ func (h *MessageHandler) Get(c *gin.Context) {
 
 	// Compute ShortText only after authorization has been confirmed.
 	msg.ShortText = h.extractShortText(dataPath, msg.Type)
+	msg.Reaction = h.reactionOf(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, msg.Size, len(msg.Attachments), dataPath)
+	msg.Reactions = h.loadReactions(ctx, []int64{msgID})[msgID]
+	if msg.Reactions == nil {
+		msg.Reactions = []models.Reaction{}
+	}
 
 	// Populate per-recipient read state for the calling user. The sender
 	// has no read state of their own.
@@ -727,6 +733,10 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if !h.validateParent(c, msg.PID) {
+		return
+	}
+
 	if int64(len(msg.Data)) > h.MaxDataSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
 		return
@@ -758,8 +768,8 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 
 	_, err = h.DB.Pool.Exec(ctx,
-		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, topic=$6, type=$7, size=$8, filepath=$9 WHERE id=$10`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Topic, msg.Type, len(msg.Data), dataPath, msgID,
+		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, is_terminal=$6, topic=$7, type=$8, size=$9, filepath=$10 WHERE id=$11`,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Terminal, msg.Topic, msg.Type, len(msg.Data), dataPath, msgID,
 	)
 	if err != nil {
 		log.Printf("update message %d: %v", msgID, err)
@@ -1030,9 +1040,10 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	// own pid is irrelevant here and need not be looked up.
 	var fromAddr string
 	var timeSent *float64
+	var terminal bool
 	err := h.DB.Pool.QueryRow(ctx,
-		"SELECT from_addr, time_sent FROM msg WHERE id = $1", msgID,
-	).Scan(&fromAddr, &timeSent)
+		"SELECT from_addr, time_sent, is_terminal FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &timeSent, &terminal)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -1040,6 +1051,12 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 			log.Printf("add recipients: fetch msg %d: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		}
+		return
+	}
+	// A terminal message is a leaf: recipients cannot be added to it (fmsg
+	// Specification v0.6.0 §12).
+	if terminal {
+		c.JSON(http.StatusConflict, gin.H{"error": "message is terminal; recipients cannot be added to it"})
 		return
 	}
 
@@ -1270,7 +1287,7 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 // after performing their own authorization checks.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, string, error) {
 	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
+		`SELECT version, pid, no_reply, is_important, is_deflate, is_terminal, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
 		msgID,
 	)
 
@@ -1278,7 +1295,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	var pid *int64
 	var timeSent *float64
 	var dataPath string
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &msg.Terminal, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
 		return nil, "", err
 	}
 	msg.PID = pid
@@ -1327,6 +1344,7 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 		Important:   msg.Important,
 		NoReply:     msg.NoReply,
 		Deflate:     msg.Deflate,
+		Terminal:    msg.Terminal,
 		PID:         msg.PID,
 		From:        msg.From,
 		To:          msg.To,
@@ -1338,6 +1356,12 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 		Size:        msg.Size,
 		ShortText:   h.extractShortText(dataPath, msg.Type),
 		Attachments: msg.Attachments,
+		dataPath:    dataPath,
+	}
+	item.Reaction = h.reactionOf(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, item.Size, len(item.Attachments), dataPath)
+	item.Reactions = h.loadReactions(ctx, []int64{msgID})[msgID]
+	if item.Reactions == nil {
+		item.Reactions = []models.Reaction{}
 	}
 
 	// Populate the recipient's per-recipient read state, mirroring Get.
@@ -1605,6 +1629,33 @@ func validatePidRelations(pid *int64, topic string) error {
 		return fmt.Errorf("topic must be empty when pid is supplied")
 	}
 	return nil
+}
+
+// validateParent checks a draft's pid, when set, references an existing
+// message that is not terminal, writing the error response and returning
+// false otherwise. A terminal message is a leaf: no message may reference it
+// via pid (fmsg Specification v0.6.0 §3), and the database refuses such a row
+// too; checking here gives the caller a clear answer instead.
+func (h *MessageHandler) validateParent(c *gin.Context, pid *int64) bool {
+	if pid == nil {
+		return true
+	}
+	var terminal bool
+	err := h.DB.Pool.QueryRow(c.Request.Context(), "SELECT is_terminal FROM msg WHERE id = $1", *pid).Scan(&terminal)
+	if errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("PID %d not found", *pid)})
+		return false
+	}
+	if err != nil {
+		log.Printf("validate pid %d: %v", *pid, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate pid"})
+		return false
+	}
+	if terminal {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("PID %d is terminal; it cannot be replied to", *pid)})
+		return false
+	}
+	return true
 }
 
 // checkDistinctRecipients returns an error if any address in to or addTo

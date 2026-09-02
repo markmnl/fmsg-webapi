@@ -52,6 +52,7 @@ type threadMessage struct {
 	NoReply       bool                `json:"no_reply,omitempty"`
 	Important     bool                `json:"important,omitempty"`
 	Deflate       bool                `json:"deflate,omitempty"`
+	Terminal      bool                `json:"terminal,omitempty"`
 	From          string              `json:"from,omitempty"`
 	To            []string            `json:"to,omitempty"`
 	AddTo         []models.AddToBatch `json:"add_to,omitempty"`
@@ -377,18 +378,18 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE chain AS (
-			SELECT id, version, pid, no_reply, is_important, is_deflate, time_sent,
+			SELECT id, version, pid, no_reply, is_important, is_deflate, is_terminal, time_sent,
 			       from_addr, topic, type, size, filepath, sha256, 0 AS depth
 			FROM msg WHERE id = $1
 			UNION ALL
 			SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate,
-			       m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
+			       m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
 			       m.sha256, c.depth + 1
 			FROM msg m JOIN chain c ON m.id = c.pid
 			WHERE c.depth + 1 < $3
 		)
 		SELECT c.id, c.version, c.pid, c.no_reply, c.is_important, c.is_deflate,
-		       c.time_sent, c.from_addr, c.topic, c.type, c.size, c.filepath,
+		       c.is_terminal, c.time_sent, c.from_addr, c.topic, c.type, c.size, c.filepath,
 		       encode(c.sha256, 'hex'),
 		       (c.from_addr = ANY($2)
 		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND t.addr = ANY($2))
@@ -404,7 +405,7 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		var m threadMessage
 		var hash *string
 		if err = rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important,
-			&m.Deflate, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &m.dataPath,
+			&m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &m.dataPath,
 			&hash, &m.Visible); err != nil {
 			rows.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
