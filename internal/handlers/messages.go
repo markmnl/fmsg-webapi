@@ -481,7 +481,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	}
 
 	// Enforce ownership: from must match the JWT identity.
-	if msg.From != identity {
+	if !sameAddr(msg.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "from address must match authenticated user"})
 		return
 	}
@@ -704,7 +704,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if existing.From != identity {
+	if !sameAddr(existing.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may update a message"})
 		return
 	}
@@ -718,7 +718,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if msg.From != identity {
+	if !sameAddr(msg.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "from address must match authenticated user"})
 		return
 	}
@@ -813,7 +813,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if existing.From != identity {
+	if !sameAddr(existing.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may delete a message"})
 		return
 	}
@@ -885,7 +885,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
-	if existing.From != identity {
+	if !sameAddr(existing.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may send a message"})
 		return
 	}
@@ -1068,7 +1068,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	}
 
 	// Verify the requester is an existing participant (from or msg_to).
-	if fromAddr != identity {
+	if !sameAddr(fromAddr, identity) {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
 			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND addr = $2", msgID, identity,
@@ -1484,6 +1484,14 @@ func parseLimitOffset(c *gin.Context) (int, int, bool) {
 }
 
 // isRecipient checks whether addr appears in the to list (case-insensitive).
+// sameAddr reports whether two fmsg addresses are equal. Addresses are
+// case-insensitive (SPECIFICATION.md: case folding), and the identity in a
+// first-party token keeps the case the sub-account was created with, so
+// ownership checks must never compare bytes.
+func sameAddr(a, b string) bool {
+	return strings.EqualFold(a, b)
+}
+
 func isRecipient(to []string, addr string) bool {
 	for _, a := range to {
 		if strings.EqualFold(a, addr) {
