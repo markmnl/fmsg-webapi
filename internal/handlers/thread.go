@@ -285,9 +285,9 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 			WHERE c.depth < $3
 		)
 		SELECT c.id, c.from_addr, c.time_sent, c.type, c.size, c.filepath,
-		       (c.from_addr = ANY($2)
-		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND t.addr = ANY($2))
-		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND a.addr = ANY($2))) AS readable
+		       (lower(c.from_addr) = ANY($2)
+		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
+		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2))) AS readable
 		FROM chain c ORDER BY c.depth DESC`,
 		msgID, addrs, threadMaxHops,
 	)
@@ -391,9 +391,9 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		SELECT c.id, c.version, c.pid, c.no_reply, c.is_important, c.is_deflate,
 		       c.is_terminal, c.time_sent, c.from_addr, c.topic, c.type, c.size, c.filepath,
 		       encode(c.sha256, 'hex'),
-		       (c.from_addr = ANY($2)
-		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND t.addr = ANY($2))
-		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND a.addr = ANY($2)))
+		       (lower(c.from_addr) = ANY($2)
+		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
+		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2)))
 		FROM chain c ORDER BY c.depth DESC`, msgID, addrs, threadMaxHops)
 	if err != nil {
 		log.Printf("thread messages: walk %d: %v", msgID, err)

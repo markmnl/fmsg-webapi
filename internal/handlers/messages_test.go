@@ -32,6 +32,24 @@ func TestParseAddr(t *testing.T) {
 	}
 }
 
+func TestSameAddr(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"@alice@example.com", "@alice@example.com", true},
+		{"@alice_ChatGPT@example.com", "@alice_chatgpt@example.com", true},
+		{"@Alice@Example.COM", "@alice@example.com", true},
+		{"@alice@example.com", "@alice@example.org", false},
+		{"@alice@example.com", "@alicia@example.com", false},
+	}
+	for _, tc := range cases {
+		if got := sameAddr(tc.a, tc.b); got != tc.want {
+			t.Errorf("sameAddr(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
 func TestIsRecipient(t *testing.T) {
 	list := []string{"@alice@example.com", "@bob@example.com"}
 	if !isRecipient(list, "@ALICE@example.com") {

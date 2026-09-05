@@ -201,9 +201,9 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
 			`SELECT COUNT(*) FROM (
-				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = $2
+				SELECT 1 FROM msg_to WHERE msg_id = $1 AND lower(addr) = lower($2)
 				UNION ALL
-				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = $2
+				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = lower($2)
 			) r`, msgID, identity,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})

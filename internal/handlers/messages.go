@@ -53,7 +53,9 @@ func NewMessageHandler(database *db.DB, dataDir string, maxDataSize, maxMsgSize 
 // or the sub-account named via X-FMSG-Act-As / a sub-account's own API-key
 // token). Callers never see another identity's messages in the same request.
 func (h *MessageHandler) visibleAddrs(c *gin.Context) ([]string, error) {
-	return []string{middleware.GetIdentity(c)}, nil
+	// Lower-cased: fmsg addresses are case-insensitive and the msg tables carry
+	// lower(addr) expression indexes, so queries compare lower(col) = ANY(addrs).
+	return []string{strings.ToLower(middleware.GetIdentity(c))}, nil
 }
 
 // messageListItem is the JSON shape for each message in the list response.
@@ -293,12 +295,12 @@ func (h *MessageHandler) List(c *gin.Context) {
 	rows, err := h.DB.Pool.Query(ctx,
 		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
 		        COALESCE(
-		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = ANY($1)),
-		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = ANY($1))
+		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1)),
+		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
 		        ) AS time_read
 		 FROM msg m
-		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND mt.addr = ANY($1))
-		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND mat.addr = ANY($1))
+		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1))
+		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
 		addrs, limit, offset,
@@ -397,7 +399,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	rows, err := h.DB.Pool.Query(ctx,
 		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
-		 WHERE m.from_addr = ANY($1)
+		 WHERE lower(m.from_addr) = ANY($1)
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
 		addrs, limit, offset,
@@ -481,7 +483,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	}
 
 	// Enforce ownership: from must match the JWT identity.
-	if msg.From != identity {
+	if !sameAddr(msg.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "from address must match authenticated user"})
 		return
 	}
@@ -608,8 +610,8 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		var timeRead *float64
 		err := h.DB.Pool.QueryRow(ctx,
 			`SELECT COALESCE(
-			    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = ANY($2)),
-			    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = ANY($2))
+			    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = ANY($2)),
+			    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = ANY($2))
 			 )`,
 			msgID, addrs,
 		).Scan(&timeRead)
@@ -658,9 +660,9 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
 			`SELECT COUNT(*) FROM (
-				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = ANY($2)
+				SELECT 1 FROM msg_to WHERE msg_id = $1 AND lower(addr) = ANY($2)
 				UNION ALL
-				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = ANY($2)
+				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = ANY($2)
 			) r`, msgID, addrs,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
@@ -704,7 +706,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if existing.From != identity {
+	if !sameAddr(existing.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may update a message"})
 		return
 	}
@@ -718,7 +720,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if msg.From != identity {
+	if !sameAddr(msg.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "from address must match authenticated user"})
 		return
 	}
@@ -813,7 +815,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if existing.From != identity {
+	if !sameAddr(existing.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may delete a message"})
 		return
 	}
@@ -885,7 +887,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
-	if existing.From != identity {
+	if !sameAddr(existing.From, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may send a message"})
 		return
 	}
@@ -961,11 +963,11 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 	err := h.DB.Pool.QueryRow(ctx,
 		`SELECT
 		    COALESCE(
-		        (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2),
-		        (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)
+		        (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2)),
+		        (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2))
 		    ),
-		    EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2)
-		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)`,
+		    EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2))
+		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2))`,
 		msgID, identity,
 	).Scan(&existing, &recipient)
 	if err != nil {
@@ -989,7 +991,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 	// each table.
 	if _, err = h.DB.Pool.Exec(ctx,
 		`UPDATE msg_to SET time_read = $1
-		 WHERE msg_id = $2 AND addr = $3 AND time_read IS NULL`,
+		 WHERE msg_id = $2 AND lower(addr) = lower($3) AND time_read IS NULL`,
 		now, msgID, identity,
 	); err != nil {
 		log.Printf("mark read %d: update msg_to: %v", msgID, err)
@@ -998,7 +1000,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 	}
 	if _, err = h.DB.Pool.Exec(ctx,
 		`UPDATE msg_add_to SET time_read = $1
-		 WHERE msg_id = $2 AND addr = $3 AND time_read IS NULL`,
+		 WHERE msg_id = $2 AND lower(addr) = lower($3) AND time_read IS NULL`,
 		now, msgID, identity,
 	); err != nil {
 		log.Printf("mark read %d: update msg_add_to: %v", msgID, err)
@@ -1068,10 +1070,10 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	}
 
 	// Verify the requester is an existing participant (from or msg_to).
-	if fromAddr != identity {
+	if !sameAddr(fromAddr, identity) {
 		var recipientCount int
 		if err = h.DB.Pool.QueryRow(ctx,
-			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND addr = $2", msgID, identity,
+			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND lower(addr) = lower($2)", msgID, identity,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only existing participants may add recipients"})
 			return
@@ -1375,8 +1377,8 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 	var timeRead *float64
 	if err := h.DB.Pool.QueryRow(ctx,
 		`SELECT COALESCE(
-		    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND mt.addr = $2),
-		    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND mat.addr = $2)
+		    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2)),
+		    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2))
 		 )`,
 		msgID, recipient,
 	).Scan(&timeRead); err == nil {
@@ -1484,6 +1486,14 @@ func parseLimitOffset(c *gin.Context) (int, int, bool) {
 }
 
 // isRecipient checks whether addr appears in the to list (case-insensitive).
+// sameAddr reports whether two fmsg addresses are equal. Addresses are
+// case-insensitive (SPECIFICATION.md: case folding), and the identity in a
+// first-party token keeps the case the sub-account was created with, so
+// ownership checks must never compare bytes.
+func sameAddr(a, b string) bool {
+	return strings.EqualFold(a, b)
+}
+
 func isRecipient(to []string, addr string) bool {
 	for _, a := range to {
 		if strings.EqualFold(a, addr) {
