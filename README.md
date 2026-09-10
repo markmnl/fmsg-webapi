@@ -721,7 +721,7 @@ This endpoint records the add-to as a new `msg_add_to_batch` row (capturing the 
 
 New addresses must be distinct among themselves (case-insensitive).
 
-**Response:** `200 OK` with `{"id": <int>, "added": <int>, "batch_id": <int>, "sha256": "<64 hex characters>"}`.
+**Response:** `200 OK` with `{"id": <int>, "added": <int>, "batch_id": <int>, "sha256": "<64 hex characters>"}`. On a draft, the batch hash is `null` until send finalizes it.
 
 **Errors:**
 
@@ -755,7 +755,7 @@ Setting the same reaction the caller already has is idempotent: nothing is
 sent and the existing reaction message is returned with `200 OK`. Clearing when
 the caller has no reaction returns `200 OK` with `null` values.
 
-**Response:** `201 Created` with the reaction message's `{"id": <int>, "time": <number>}`.
+**Response:** `201 Created` with the reaction message's `{"id": <int>, "time": <number>, "sha256": "<64 hex characters>"}`.
 
 **Errors:**
 
@@ -839,8 +839,8 @@ truncated.
       "to": ["@agent@example.net"],
       "type": "text/plain",
       "size": 5,
-      "message_sha256": "0123456789abcdef",
-      "body": {"type": "text/plain", "size": 5, "text": "hello", "cache_key": "sha256:0123456789abcdef:body", "cacheable": true},
+      "message_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "body": {"type": "text/plain", "size": 5, "text": "hello", "cache_key": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:body", "cacheable": true},
       "attachments": []
     }
   ]

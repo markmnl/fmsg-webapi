@@ -318,3 +318,22 @@ func TestFinalizationRollbackAndConcurrentSend(t *testing.T) {
 		}
 	}
 }
+
+func TestFinalizationCommitFailureDoesNotReturnSuccess(t *testing.T) {
+	a := newFinalizationAPI(t)
+	id := a.draft(t, "@alice@example.com", "commit failure", nil)
+	_, err := a.pool.Exec(context.Background(), `CREATE FUNCTION reject_test_send() RETURNS trigger AS $$ BEGIN
+	 IF NEW.time_sent IS NOT NULL THEN RAISE EXCEPTION 'test commit rejection'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql;
+	 CREATE CONSTRAINT TRIGGER reject_test_send AFTER UPDATE ON msg DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_test_send()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := a.request("@alice@example.com", "POST", "/fmsg/"+id+"/send", nil)
+	if response.Code != 500 || strings.Contains(response.Body.String(), "sha256") {
+		t.Fatalf("success escaped before commit: %d %s", response.Code, response.Body)
+	}
+	got := jsonResponse(t, a.request("@alice@example.com", "GET", "/fmsg/"+id, nil), 200)
+	if got["time"] != nil || got["sha256"] != nil {
+		t.Fatal("rejected commit changed draft", got)
+	}
+}

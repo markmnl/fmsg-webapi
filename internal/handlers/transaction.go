@@ -99,8 +99,9 @@ func atomic(c *gin.Context, database *db.DB, next func(pgx.Tx)) {
 	files := &transactionFiles{}
 	c.Set("messageTransactionFiles", files)
 	committed := false
+	commitAttempted := false
 	defer func() {
-		if !committed {
+		if !committed && !commitAttempted {
 			for _, f := range files.rollback {
 				f()
 			}
@@ -113,6 +114,9 @@ func atomic(c *gin.Context, database *db.DB, next func(pgx.Tx)) {
 	next(tx)
 	c.Writer = original
 	if buffer.status < 400 {
+		// A lost commit acknowledgement cannot prove rollback. Retain files
+		// rather than risk deleting payloads referenced by a committed row.
+		commitAttempted = true
 		if err = tx.Commit(ctx); err != nil {
 			log.Printf("commit message mutation: %v", err)
 			c.JSON(500, gin.H{"error": "failed to commit message mutation"})
