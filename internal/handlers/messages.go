@@ -3,8 +3,11 @@ package handlers
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/markmnl/fmsgd/pkg/message"
 	"io"
 	"log"
 	"mime"
@@ -27,6 +30,7 @@ import (
 
 // MessageHandler holds dependencies for message routes.
 type MessageHandler struct {
+	query         queries
 	DB            *db.DB
 	DataDir       string
 	MaxDataSize   int64
@@ -61,6 +65,8 @@ func (h *MessageHandler) visibleAddrs(c *gin.Context) ([]string, error) {
 // messageListItem is the JSON shape for each message in the list response.
 // It mirrors the single-message response (including an id).
 type messageListItem struct {
+	SHA256      *string                    `json:"sha256"`
+	PSHA256     *string                    `json:"psha256"`
 	ID          int64                      `json:"id"`
 	Version     int                        `json:"version"`
 	HasPid      bool                       `json:"has_pid"`
@@ -138,7 +144,7 @@ func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string,
 			log.Printf("resolve local delivery: unexpected fmsgid status %d for %s", code, addr)
 			continue
 		}
-		if _, err := h.DB.Pool.Exec(ctx, query, delivered, responseCode, msgID, addr); err != nil {
+		if _, err := h.q().Exec(ctx, query, delivered, responseCode, msgID, addr); err != nil {
 			log.Printf("resolve local delivery: update %s msg %d addr %s: %v", table, msgID, addr, err)
 		}
 	}
@@ -223,10 +229,10 @@ func remoteRecipientDomains(msg *models.Message, localDomain string) []string {
 // summary of its recorded recipient delivery outcomes.
 func (h *MessageHandler) parentDeliveryByDomain(ctx context.Context, parentID int64) (string, map[string]parentDomainDelivery, error) {
 	var fromAddr string
-	if err := h.DB.Pool.QueryRow(ctx, "SELECT from_addr FROM msg WHERE id = $1", parentID).Scan(&fromAddr); err != nil {
+	if err := h.q().QueryRow(ctx, "SELECT from_addr FROM msg WHERE id = $1", parentID).Scan(&fromAddr); err != nil {
 		return "", nil, err
 	}
-	rows, err := h.DB.Pool.Query(ctx, `
+	rows, err := h.q().Query(ctx, `
 		SELECT addr, time_delivered IS NOT NULL, response_code FROM (
 			SELECT addr, time_delivered, response_code FROM msg_to WHERE msg_id = $1
 			UNION ALL
@@ -272,8 +278,9 @@ func (h *MessageHandler) parentDeliveryByDomain(ctx context.Context, parentID in
 // create/update, so add_to here is intentionally discarded.
 type messageInput struct {
 	models.Message
-	AddTo any    `json:"add_to"`
-	Data  string `json:"data"`
+	Parent json.RawMessage `json:"pid"`
+	AddTo  any             `json:"add_to"`
+	Data   string          `json:"data"`
 }
 
 // List handles GET /fmsg — lists messages where the authenticated user is a recipient.
@@ -292,8 +299,8 @@ func (h *MessageHandler) List(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
+	rows, err := h.q().Query(ctx,
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, encode(m.sha256,'hex'), encode(m.psha256,'hex'), m.from_addr, m.topic, m.type, m.size, m.filepath,
 		        COALESCE(
 		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1)),
 		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
@@ -317,7 +324,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.SHA256, &m.PSHA256, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
@@ -350,7 +357,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	}
 
 	// Batch-load attachments.
-	attRows, err := h.DB.Pool.Query(ctx,
+	attRows, err := h.q().Query(ctx,
 		"SELECT msg_id, filename, filesize FROM msg_attachment WHERE msg_id = ANY($1)",
 		msgIDs,
 	)
@@ -396,8 +403,8 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath
+	rows, err := h.q().Query(ctx,
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, encode(m.sha256,'hex'), encode(m.psha256,'hex'), m.from_addr, m.topic, m.type, m.size, m.filepath
 		 FROM msg m
 		 WHERE lower(m.from_addr) = ANY($1)
 		 ORDER BY m.id DESC
@@ -416,7 +423,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.SHA256, &m.PSHA256, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
 			log.Printf("list sent messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
 			return
@@ -448,7 +455,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	}
 
 	// Batch-load attachments.
-	attRows, err := h.DB.Pool.Query(ctx,
+	attRows, err := h.q().Query(ctx,
 		"SELECT msg_id, filename, filesize FROM msg_attachment WHERE msg_id = ANY($1)",
 		msgIDs,
 	)
@@ -498,6 +505,9 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
+	if !h.resolveParent(c, &msg) {
+		return
+	}
 	if err := validatePidRelations(msg.PID, msg.Topic); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -516,7 +526,7 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	}
 
 	// Detect zip (deflate) content by checking for the zip magic bytes.
-	msg.Deflate = isZip([]byte(msg.Data))
+	msg.Deflate = false // wire compression is chosen only at finalization
 
 	// Parse extension from MIME type.
 	ext := mimeToExt(msg.Type)
@@ -524,11 +534,11 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	// Insert message row with empty filepath; update after we know the ID.
 	dataSize := len(msg.Data)
 	var msgID int64
-	err := h.DB.Pool.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, is_terminal, from_addr, topic, type, size, filepath, time_sent)
- VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', NULL)
+	err := h.q().QueryRow(ctx,
+		`INSERT INTO msg (version, pid, psha256, no_reply, is_important, is_deflate, is_terminal, from_addr, topic, type, size, filepath, time_sent)
+ VALUES ($1, $2, decode($11,'hex'), $3, $4, $5, $6, $7, $8, $9, $10, '', NULL)
  RETURNING id`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Terminal, msg.From, msg.Topic, msg.Type, dataSize,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Terminal, msg.From, msg.Topic, msg.Type, dataSize, msg.PSHA256,
 	).Scan(&msgID)
 	if err != nil {
 		log.Printf("create message: insert: %v", err)
@@ -541,23 +551,28 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	if err != nil {
 		log.Printf("create message: save data: %v", err)
 		// Attempt rollback.
-		_, _ = h.DB.Pool.Exec(ctx, "DELETE FROM msg WHERE id = $1", msgID)
+		_, _ = h.q().Exec(ctx, "DELETE FROM msg WHERE id = $1", msgID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save message data"})
 		return
 	}
 
+	createdFile(c, dataPath)
 	// Update filepath in the database.
-	if _, err = h.DB.Pool.Exec(ctx, "UPDATE msg SET filepath = $1 WHERE id = $2", dataPath, msgID); err != nil {
+	if _, err = h.q().Exec(ctx, "UPDATE msg SET filepath = $1 WHERE id = $2", dataPath, msgID); err != nil {
 		log.Printf("create message: update filepath: %v", err)
+		c.JSON(500, gin.H{"error": "failed to save message"})
+		return
 	}
 
 	// Insert recipients.
 	for _, addr := range msg.To {
-		if _, err = h.DB.Pool.Exec(ctx,
+		if _, err = h.q().Exec(ctx,
 			"INSERT INTO msg_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
 			msgID, addr,
 		); err != nil {
 			log.Printf("create message: insert recipient %s: %v", addr, err)
+			c.JSON(500, gin.H{"error": "failed to save recipients"})
+			return
 		}
 	}
 
@@ -572,7 +587,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		return
 	}
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -608,7 +623,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	// has no read state of their own.
 	if !isSender {
 		var timeRead *float64
-		err := h.DB.Pool.QueryRow(ctx,
+		err := h.q().QueryRow(ctx,
 			`SELECT COALESCE(
 			    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = ANY($2)),
 			    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = ANY($2))
@@ -632,7 +647,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		return
 	}
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -642,7 +657,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	// Fetch message metadata for auth check and file path.
 	var fromAddr string
 	var dataPath string
-	err = h.DB.Pool.QueryRow(ctx,
+	err = h.q().QueryRow(ctx,
 		"SELECT from_addr, filepath FROM msg WHERE id = $1", msgID,
 	).Scan(&fromAddr, &dataPath)
 	if err != nil {
@@ -658,7 +673,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	// Authorize: must be owner or recipient (across all visible addrs).
 	if !isRecipient(addrs, fromAddr) {
 		var recipientCount int
-		if err = h.DB.Pool.QueryRow(ctx,
+		if err = h.q().QueryRow(ctx,
 			`SELECT COUNT(*) FROM (
 				SELECT 1 FROM msg_to WHERE msg_id = $1 AND lower(addr) = ANY($2)
 				UNION ALL
@@ -689,13 +704,13 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 // Update handles PUT /fmsg/:id — updates a draft message.
 func (h *MessageHandler) Update(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
 
 	ctx := c.Request.Context()
-	existing, _, err := h.fetchMessage(ctx, msgID)
+	existing, oldDataPath, err := h.fetchMessage(ctx, msgID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -730,6 +745,9 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if !h.resolveParent(c, &msg) {
+		return
+	}
 	if err := validatePidRelations(msg.PID, msg.Topic); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -746,7 +764,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 
 	// Check total message size (data + existing attachments).
 	var attachTotal int64
-	if err := h.DB.Pool.QueryRow(ctx,
+	if err := h.q().QueryRow(ctx,
 		"SELECT COALESCE(SUM(filesize), 0) FROM msg_attachment WHERE msg_id = $1",
 		msgID,
 	).Scan(&attachTotal); err != nil {
@@ -759,7 +777,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	msg.Deflate = isZip([]byte(msg.Data))
+	msg.Deflate = false // wire compression is chosen only at finalization
 	ext := mimeToExt(msg.Type)
 
 	dataPath, err := h.saveMessageData(msg.From, msgID, ext, msg.Data)
@@ -769,9 +787,10 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	_, err = h.DB.Pool.Exec(ctx,
-		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, is_terminal=$6, topic=$7, type=$8, size=$9, filepath=$10 WHERE id=$11`,
-		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Terminal, msg.Topic, msg.Type, len(msg.Data), dataPath, msgID,
+	createdFile(c, dataPath)
+	_, err = h.q().Exec(ctx,
+		`UPDATE msg SET version=$1, pid=$2, no_reply=$3, is_important=$4, is_deflate=$5, is_terminal=$6, topic=$7, type=$8, size=$9, filepath=$10, psha256=decode($12,'hex') WHERE id=$11`,
+		msg.Version, msg.PID, msg.NoReply, msg.Important, msg.Deflate, msg.Terminal, msg.Topic, msg.Type, len(msg.Data), dataPath, msgID, msg.PSHA256,
 	)
 	if err != nil {
 		log.Printf("update message %d: %v", msgID, err)
@@ -780,25 +799,34 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	}
 
 	// Replace recipients.
-	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_to WHERE msg_id = $1", msgID); err != nil {
+	if _, err = h.q().Exec(ctx, "DELETE FROM msg_to WHERE msg_id = $1", msgID); err != nil {
 		log.Printf("update message %d delete recipients: %v", msgID, err)
+		c.JSON(500, gin.H{"error": "failed to update recipients"})
+		return
 	}
 	for _, addr := range msg.To {
-		if _, err = h.DB.Pool.Exec(ctx,
+		if _, err = h.q().Exec(ctx,
 			"INSERT INTO msg_to (msg_id, addr) VALUES ($1, $2) ON CONFLICT DO NOTHING",
 			msgID, addr,
 		); err != nil {
 			log.Printf("update message %d insert recipient %s: %v", msgID, addr, err)
+			c.JSON(500, gin.H{"error": "failed to update recipients"})
+			return
 		}
 	}
 
+	afterCommit(c, func() {
+		if oldDataPath != "" {
+			_ = os.Remove(oldDataPath)
+		}
+	})
 	c.JSON(http.StatusOK, gin.H{"id": msgID})
 }
 
 // Delete handles DELETE /fmsg/:id — deletes a draft message.
 func (h *MessageHandler) Delete(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -825,7 +853,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 	}
 
 	// Remove attachment files from disk.
-	rows, err := h.DB.Pool.Query(ctx, "SELECT filepath FROM msg_attachment WHERE msg_id = $1", msgID)
+	rows, err := h.q().Query(ctx, "SELECT filepath FROM msg_attachment WHERE msg_id = $1", msgID)
 	if err == nil {
 		var paths []string
 		for rows.Next() {
@@ -836,32 +864,40 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 		}
 		rows.Close()
 		for _, p := range paths {
-			_ = os.Remove(p)
+			afterCommit(c, func() { _ = os.Remove(p) })
 		}
 	}
 
-	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_attachment WHERE msg_id = $1", msgID); err != nil {
+	if _, err = h.q().Exec(ctx, "DELETE FROM msg_attachment WHERE msg_id = $1", msgID); err != nil {
 		log.Printf("delete message %d: delete attachments: %v", msgID, err)
 	}
-	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_to WHERE msg_id = $1", msgID); err != nil {
+	if _, err = h.q().Exec(ctx, "DELETE FROM msg_to WHERE msg_id = $1", msgID); err != nil {
 		log.Printf("delete message %d: delete recipients: %v", msgID, err)
 	}
-	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg_add_to WHERE msg_id = $1", msgID); err != nil {
+	if _, err = h.q().Exec(ctx, "DELETE FROM msg_add_to WHERE msg_id = $1", msgID); err != nil {
 		log.Printf("delete message %d: delete add_to recipients: %v", msgID, err)
 	}
 
+	if _, err = h.q().Exec(ctx, `DELETE FROM msg_add_to_notify WHERE batch_id IN (SELECT id FROM msg_add_to_batch WHERE msg_id=$1)`, msgID); err != nil {
+		c.JSON(500, gin.H{"error": "failed to delete notifications"})
+		return
+	}
+	if _, err = h.q().Exec(ctx, `DELETE FROM msg_add_to_batch WHERE msg_id=$1`, msgID); err != nil {
+		c.JSON(500, gin.H{"error": "failed to delete batches"})
+		return
+	}
 	// Get data filepath before deleting.
 	var dataPath string
-	_ = h.DB.Pool.QueryRow(ctx, "SELECT filepath FROM msg WHERE id = $1", msgID).Scan(&dataPath)
+	_ = h.q().QueryRow(ctx, "SELECT filepath FROM msg WHERE id = $1", msgID).Scan(&dataPath)
 
-	if _, err = h.DB.Pool.Exec(ctx, "DELETE FROM msg WHERE id = $1", msgID); err != nil {
+	if _, err = h.q().Exec(ctx, "DELETE FROM msg WHERE id = $1", msgID); err != nil {
 		log.Printf("delete message %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete message"})
 		return
 	}
 
 	if dataPath != "" {
-		_ = os.Remove(dataPath)
+		afterCommit(c, func() { _ = os.Remove(dataPath) })
 	}
 
 	c.Status(http.StatusNoContent)
@@ -870,7 +906,7 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 // Send handles POST /fmsg/:id/send — marks a message as sent.
 func (h *MessageHandler) Send(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -926,20 +962,31 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	now := float64(time.Now().UnixMicro()) / 1e6
-	if _, err = h.DB.Pool.Exec(ctx, "UPDATE msg SET time_sent = $1 WHERE id = $2", now, msgID); err != nil {
-		log.Printf("send message %d: %v", msgID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send message"})
+	tx, ok := h.query.(pgx.Tx)
+	if !ok {
+		c.JSON(500, gin.H{"error": "send requires a message transaction"})
+		return
+	}
+	var files message.Files
+	onRollback(c, func() { files.Cleanup() })
+	hash, err := message.Finalize(ctx, finalizationTx{tx}, msgID, now, &files)
+	if err != nil {
+		log.Printf("finalize message %d: %v", msgID, err)
+		c.JSON(500, gin.H{"error": "failed to finalize message"})
 		return
 	}
 
 	// fmsgd's outbound sender skips the local domain entirely, so local
 	// recipients need their delivery status resolved here instead.
-	h.resolveLocalDelivery(ctx, "msg_to", msgID, h.LocalDomain, existing.To)
-	for _, b := range existing.AddTo {
-		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, b.To)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"id": msgID, "time": now})
+	afterCommit(c, func() {
+		plain := *h
+		plain.query = nil
+		plain.resolveLocalDelivery(ctx, "msg_to", msgID, h.LocalDomain, existing.To)
+		for _, b := range existing.AddTo {
+			plain.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, b.To)
+		}
+	})
+	c.JSON(http.StatusOK, gin.H{"id": msgID, "time": now, "sha256": hex.EncodeToString(hash)})
 }
 
 // MarkRead handles POST /fmsg/:id/read — marks a message as read by the
@@ -947,7 +994,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 // the original time_read without updating it.
 func (h *MessageHandler) MarkRead(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -960,7 +1007,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 	// an EXISTS check.
 	var existing *float64
 	var recipient bool
-	err := h.DB.Pool.QueryRow(ctx,
+	err := h.q().QueryRow(ctx,
 		`SELECT
 		    COALESCE(
 		        (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2)),
@@ -989,7 +1036,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 	// Update whichever recipient row matches; only one of these will affect
 	// rows for any given (msg_id, addr) pair given the unique constraint on
 	// each table.
-	if _, err = h.DB.Pool.Exec(ctx,
+	if _, err = h.q().Exec(ctx,
 		`UPDATE msg_to SET time_read = $1
 		 WHERE msg_id = $2 AND lower(addr) = lower($3) AND time_read IS NULL`,
 		now, msgID, identity,
@@ -998,7 +1045,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark message read"})
 		return
 	}
-	if _, err = h.DB.Pool.Exec(ctx,
+	if _, err = h.q().Exec(ctx,
 		`UPDATE msg_add_to SET time_read = $1
 		 WHERE msg_id = $2 AND lower(addr) = lower($3) AND time_read IS NULL`,
 		now, msgID, identity,
@@ -1019,7 +1066,7 @@ type addToInput struct {
 // AddRecipients handles POST /fmsg/:id/add-to — adds additional recipients to a message.
 func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -1050,7 +1097,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	var fromAddr string
 	var timeSent *float64
 	var terminal bool
-	err := h.DB.Pool.QueryRow(ctx,
+	err := h.q().QueryRow(ctx,
 		"SELECT from_addr, time_sent, is_terminal FROM msg WHERE id = $1", msgID,
 	).Scan(&fromAddr, &timeSent, &terminal)
 	if err != nil {
@@ -1072,7 +1119,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	// Verify the requester is an existing participant (from or msg_to).
 	if !sameAddr(fromAddr, identity) {
 		var recipientCount int
-		if err = h.DB.Pool.QueryRow(ctx,
+		if err = h.q().QueryRow(ctx,
 			"SELECT COUNT(*) FROM msg_to WHERE msg_id = $1 AND lower(addr) = lower($2)", msgID, identity,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only existing participants may add recipients"})
@@ -1097,7 +1144,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		loweredAddTo[i] = strings.ToLower(addr)
 	}
 	var alreadyAdded int
-	if err = h.DB.Pool.QueryRow(ctx,
+	if err = h.q().QueryRow(ctx,
 		"SELECT COUNT(*) FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = ANY($2)",
 		msgID, loweredAddTo,
 	).Scan(&alreadyAdded); err != nil {
@@ -1112,7 +1159,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 
 	// Insert the new add_to recipients and record who added them. Both run in a
 	// single transaction so a partial failure leaves the message unchanged.
-	tx, err := h.DB.Pool.Begin(ctx)
+	tx, err := h.q().Begin(ctx)
 	if err != nil {
 		log.Printf("add recipients: begin tx for msg %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
@@ -1172,6 +1219,12 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		return
 	}
 
+	hash, err := message.FinalizeBatch(ctx, finalizationTx{tx}, msgID, batchID)
+	if err != nil {
+		log.Printf("finalize batch %d: %v", batchID, err)
+		c.JSON(500, gin.H{"error": "failed to finalize add-to batch"})
+		return
+	}
 	if err = tx.Commit(ctx); err != nil {
 		log.Printf("add recipients: commit tx for msg %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add recipients"})
@@ -1185,10 +1238,19 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	// whoever called this endpoint — the caller adding recipients may be a
 	// federated participant on a different domain than the recipients they add.
 	if timeSent != nil {
-		h.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, input.AddTo)
+		afterCommit(c, func() {
+			plain := *h
+			plain.query = nil
+			plain.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, input.AddTo)
+		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo)})
+	var encoded any
+	if len(hash) > 0 {
+		encoded = hex.EncodeToString(hash)
+	}
+	c.JSON(http.StatusOK, gin.H{"id": msgID, "added": len(input.AddTo), "batch_id": batchID, "sha256": encoded})
+
 }
 
 // loadRecipients loads the direct (msg_to) recipients for the given messages,
@@ -1196,7 +1258,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 func (h *MessageHandler) loadRecipients(ctx context.Context, msgIDs []int64) (map[int64][]string, map[int64][]models.RecipientDelivery) {
 	toMap := make(map[int64][]string)
 	deliveryMap := make(map[int64][]models.RecipientDelivery)
-	rows, err := h.DB.Pool.Query(ctx,
+	rows, err := h.q().Query(ctx,
 		"SELECT msg_id, addr, time_delivered, response_code FROM msg_to WHERE msg_id = ANY($1)",
 		msgIDs,
 	)
@@ -1242,8 +1304,8 @@ func int16PtrToIntPtr(v *int16) *int {
 // their insertion order (batch id).
 func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) map[int64][]models.AddToBatch {
 	result := make(map[int64][]models.AddToBatch)
-	rows, err := h.DB.Pool.Query(ctx,
-		`SELECT b.msg_id, b.id, b.add_to_from, b.time_added, mat.addr, mat.time_delivered, mat.response_code
+	rows, err := h.q().Query(ctx,
+		`SELECT b.msg_id, b.id, b.add_to_from, b.time_added, encode(b.sha256,'hex'), mat.addr, mat.time_delivered, mat.response_code
 		 FROM msg_add_to_batch b
 		 LEFT JOIN msg_add_to mat ON mat.batch_id = b.id
 		 WHERE b.msg_id = ANY($1)
@@ -1262,10 +1324,11 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 		var msgID, batchID int64
 		var addToFrom string
 		var timeAdded float64
+		var hash *string
 		var addr *string
 		var timeDelivered *float64
 		var responseCode *int16
-		if err := rows.Scan(&msgID, &batchID, &addToFrom, &timeAdded, &addr, &timeDelivered, &responseCode); err != nil {
+		if err := rows.Scan(&msgID, &batchID, &addToFrom, &timeAdded, &hash, &addr, &timeDelivered, &responseCode); err != nil {
 			log.Printf("load add_to batches scan: %v", err)
 			continue
 		}
@@ -1273,6 +1336,7 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 		if !ok {
 			result[msgID] = append(result[msgID], models.AddToBatch{
 				BatchID:   batchID,
+				SHA256:    hash,
 				AddToFrom: addToFrom,
 				Time:      timeAdded,
 			})
@@ -1295,8 +1359,8 @@ func (h *MessageHandler) loadAddToBatches(ctx context.Context, msgIDs []int64) m
 // It also returns the raw filepath stored in the database so callers can use it
 // after performing their own authorization checks.
 func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models.Message, string, error) {
-	row := h.DB.Pool.QueryRow(ctx,
-		`SELECT version, pid, no_reply, is_important, is_deflate, is_terminal, time_sent, from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
+	row := h.q().QueryRow(ctx,
+		`SELECT version, pid, no_reply, is_important, is_deflate, is_terminal, time_sent, encode(sha256,'hex'), encode(psha256,'hex'), from_addr, topic, type, size, filepath FROM msg WHERE id = $1`,
 		msgID,
 	)
 
@@ -1304,7 +1368,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	var pid *int64
 	var timeSent *float64
 	var dataPath string
-	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &msg.Terminal, &timeSent, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
+	if err := row.Scan(&msg.Version, &pid, &msg.NoReply, &msg.Important, &msg.Deflate, &msg.Terminal, &timeSent, &msg.SHA256, &msg.PSHA256, &msg.From, &msg.Topic, &msg.Type, &msg.Size, &dataPath); err != nil {
 		return nil, "", err
 	}
 	msg.PID = pid
@@ -1321,7 +1385,7 @@ func (h *MessageHandler) fetchMessage(ctx context.Context, msgID int64) (*models
 	msg.HasAddTo = len(msg.AddTo) > 0
 
 	// Load attachments.
-	attRows, err := h.DB.Pool.Query(ctx, "SELECT filename, filesize FROM msg_attachment WHERE msg_id = $1", msgID)
+	attRows, err := h.q().Query(ctx, "SELECT filename, filesize FROM msg_attachment WHERE msg_id = $1", msgID)
 	if err == nil {
 		for attRows.Next() {
 			var a models.Attachment
@@ -1347,6 +1411,8 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 
 	item := &messageListItem{
 		ID:          msgID,
+		SHA256:      msg.SHA256,
+		PSHA256:     msg.PSHA256,
 		Version:     msg.Version,
 		HasPid:      msg.HasPid,
 		HasAddTo:    msg.HasAddTo,
@@ -1375,7 +1441,7 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 
 	// Populate the recipient's per-recipient read state, mirroring Get.
 	var timeRead *float64
-	if err := h.DB.Pool.QueryRow(ctx,
+	if err := h.q().QueryRow(ctx,
 		`SELECT COALESCE(
 		    (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2)),
 		    (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2))
@@ -1395,10 +1461,24 @@ func (h *MessageHandler) saveMessageData(fromAddr string, msgID int64, ext, data
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return "", fmt.Errorf("mkdir: %w", err)
 	}
-	filename := "data" + ext
-	path := filepath.Join(dir, filename)
-	if err := os.WriteFile(path, []byte(data), 0640); err != nil {
-		return "", fmt.Errorf("write: %w", err)
+	f, err := os.CreateTemp(dir, "data-*"+ext)
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if err = f.Chmod(0640); err == nil {
+		_, err = f.WriteString(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
 	}
 	return path, nil
 }
@@ -1682,7 +1762,7 @@ func (h *MessageHandler) validateParent(c *gin.Context, pid *int64) bool {
 		return true
 	}
 	var terminal bool
-	err := h.DB.Pool.QueryRow(c.Request.Context(), "SELECT is_terminal FROM msg WHERE id = $1", *pid).Scan(&terminal)
+	err := h.q().QueryRow(c.Request.Context(), "SELECT is_terminal FROM msg WHERE id = $1", *pid).Scan(&terminal)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("PID %d not found", *pid)})
 		return false
