@@ -10,7 +10,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/joho/godotenv v1.5.1
-	github.com/markmnl/fmsgd v0.5.1-0.20260910073129-cbe3412864df
+	github.com/markmnl/fmsgd v0.5.1-0.20260910073548-7c2527053674
 	golang.org/x/sync v0.20.0
 )
 
