@@ -633,9 +633,33 @@ Deletes a draft message and all its attachments from the database and disk. Only
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 
+### Message hashes and references
+
+A sent or received message includes `sha256`, a lowercase 64-character hexadecimal
+protocol hash; a draft returns `null`. `psha256` is the exact parent hash or `null`.
+Both fields appear in message detail, inbox/sent lists and WebSocket message
+payloads. Structured thread entries include them too, retaining `message_sha256`
+as an alias for existing clients. Each `add_to` batch exposes its own `sha256`.
+These hashes describe the protocol message, not the API JSON or mutable read and
+delivery state.
+
+Every message `:id` route accepts either its positive numeric ID or its 64-character
+SHA-256 (hexadecimal input is case-insensitive). This includes detail, body and
+attachment downloads, thread routes, read, react, and add-to. Hashes do not grant
+access: the same identity checks apply. Invalid references return `400`; unknown
+hashes return `404`. Drafts have no hash, and draft-only operations still reject
+sent messages.
+
+Create/update accepts `pid` as a numeric parent ID or a hexadecimal hash string.
+Response `pid` remains numeric. The hash may identify an original message or an
+add-to batch; a batch reference is retained exactly in `psha256`. A participant
+added only through a batch must use that batch's hash when replying. The parent
+must be sent and non-terminal, and the caller must participate in that specific
+original or batch. Client-provided `sha256`/`psha256` values are not trusted.
+
 ### POST `/fmsg/:id/send`
 
-Marks a draft message as sent by setting `time_sent` to the current timestamp. Only the owner may send.
+Atomically stamps `time_sent`, computes the protocol `sha256`, and retains the finalized wire representation. This happens for local-only delivery too. Only the owner may send. Compression and common media type encoding are chosen before hashing; future federation reuses that representation. A failure leaves the message a draft. Concurrent edits, attachment changes, deletion, and send are serialized; sent content is immutable.
 
 **Send is the validation gate.** Drafts are a workspace: create/update accept
 incomplete messages (no recipients, no type) by design, but a draft may only
@@ -657,7 +681,7 @@ third-party delivery's outcome, so the reply is attempted and the wire's
 originating domain always passes (it retains its outgoing messages). Local
 recipients are unaffected.
 
-**Response:** `200 OK` with `{"id": <int>, "time": <float64>}`.
+**Response:** `200 OK` with `{"id": <int>, "time": <float64>, "sha256": "<64 hex characters>"}`.
 
 **Errors:**
 
@@ -697,7 +721,7 @@ This endpoint records the add-to as a new `msg_add_to_batch` row (capturing the 
 
 New addresses must be distinct among themselves (case-insensitive).
 
-**Response:** `200 OK` with `{"id": <int>, "added": <int>}`.
+**Response:** `200 OK` with `{"id": <int>, "added": <int>, "batch_id": <int>, "sha256": "<64 hex characters>"}`.
 
 **Errors:**
 
@@ -966,4 +990,22 @@ CREATE TABLE push_subscription (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (addr, endpoint)
 );
+```
+
+### Finalization schema upgrade and PostgreSQL tests
+
+This version requires the matching `fmsgd/dd.sql` schema and finalization-capable
+daemon. Pause message writes and federation, install both services, rerun the
+schema, then run `fmsg-backfill -domain example.com -apply` before resuming. See
+[the daemon upgrade instructions](https://github.com/markmnl/fmsgd#immutable-message-finalization-and-upgrades).
+Old local-only messages may expose `null` hashes until backfilled. Existing hashes
+are preserved; the backfill reports data it cannot safely reconstruct.
+
+`go test ./...` runs the unit tests. PostgreSQL integration tests create and remove
+isolated schemas; set `FMSG_TEST_DATABASE_URL` to a disposable test database and
+`FMSG_TEST_DD` to the matching daemon schema (defaults to the sibling checkout):
+
+```sh
+FMSG_TEST_DATABASE_URL='postgres://postgres@localhost/fmsg_test?sslmode=disable' \
+FMSG_TEST_DD=/path/to/fmsgd/dd.sql go test ./...
 ```
