@@ -995,11 +995,13 @@ CREATE TABLE push_subscription (
 ### Finalization schema upgrade and PostgreSQL tests
 
 This version requires the matching `fmsgd/dd.sql` schema and finalization-capable
-daemon. Pause message writes and federation, install both services, rerun the
-schema, then run `fmsg-backfill -domain example.com -apply` before resuming. See
+daemon. For existing installations, stop both services and run the standalone
+`fmsg-backfill` binary before starting the new versions. The binary embeds the schema
+upgrade, prepares existing sent messages and batches, and backfills local-only hashes
+in one transaction. Run without `-apply` for a full dry run, then with `-apply` to commit.
+Do not rerun the daemon's bootstrap `dd.sql` on an existing database. See
 [the daemon upgrade instructions](https://github.com/markmnl/fmsgd#immutable-message-finalization-and-upgrades).
-Old local-only messages may expose `null` hashes until backfilled. Existing hashes
-are preserved; the backfill reports data it cannot safely reconstruct.
+All sent messages have hashes; only drafts expose a `null` message hash.
 
 `go test ./...` runs the unit tests. PostgreSQL integration tests create and remove
 isolated schemas; set `FMSG_TEST_DATABASE_URL` to a disposable test database and

@@ -395,7 +395,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 		}
 	}
 	if parentHash == nil {
-		c.JSON(409, gin.H{"error": "reaction parent requires hash backfill"})
+		c.JSON(500, gin.H{"error": "reaction parent has no finalized identity"})
 		return
 	}
 	now := float64(time.Now().UnixMicro()) / 1e6

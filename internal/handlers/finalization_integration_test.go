@@ -66,10 +66,6 @@ func newFinalizationAPI(t *testing.T) *finalizationAPI {
 	if _, err = pool.Exec(ctx, string(sql)); err != nil {
 		t.Fatal(err)
 	}
-	// Re-running the schema is the supported migration path.
-	if _, err = pool.Exec(ctx, string(sql)); err != nil {
-		t.Fatal(err)
-	}
 	id := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"acceptingNew":true}`)

@@ -1219,9 +1219,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		return
 	}
 
-	var files message.Files
-	onRollback(c, func() { files.Cleanup() })
-	hash, err := message.FinalizeBatch(ctx, finalizationTx{tx}, msgID, batchID, &files)
+	hash, err := message.FinalizeBatch(ctx, finalizationTx{tx}, msgID, batchID)
 	if err != nil {
 		log.Printf("finalize batch %d: %v", batchID, err)
 		c.JSON(500, gin.H{"error": "failed to finalize add-to batch"})

@@ -112,7 +112,7 @@ func (h *MessageHandler) resolveParent(c *gin.Context, in *messageInput) bool {
 		hash = canonical
 	}
 	if len(hash) != 32 {
-		c.JSON(409, gin.H{"error": "parent requires hash backfill"})
+		c.JSON(500, gin.H{"error": "parent has no finalized identity"})
 		return false
 	}
 	encoded := hex.EncodeToString(hash)
