@@ -97,7 +97,7 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 		if cfg.AddressClaim == "" {
 			return nil, errors.New("middleware: EdDSA mode requires an AddressClaim")
 		}
-		v.idpKeyFunc = func(t *jwt.Token) (interface{}, error) {
+		v.idpKeyFunc = func(t *jwt.Token) (any, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 			}
@@ -220,7 +220,7 @@ func (v *Verifier) authenticateAPIToken(ctx context.Context, tokenStr, remoteAdd
 		return authResult{}, authError{status: http.StatusForbidden, msg: "act-as is only available with identity-provider authentication"}
 	}
 	claims := &apiauth.TokenClaims{}
-	_, err := v.apiParser.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+	_, err := v.apiParser.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
 		}
@@ -252,8 +252,7 @@ func (e authError) Error() string {
 }
 
 func authFailureFromError(err error) (int, string, bool) {
-	var ae authError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[authError](err); ok {
 		return ae.status, ae.msg, true
 	}
 	switch {
@@ -415,7 +414,7 @@ func CheckFmsgID(idURL, addr string) (int, bool, error) {
 		fmsgIDCache.Delete(addr)
 	}
 
-	v, err, _ := fmsgIDGroup.Do(addr, func() (interface{}, error) {
+	v, err, _ := fmsgIDGroup.Do(addr, func() (any, error) {
 		if v, ok := fmsgIDCache.Load(addr); ok {
 			entry := v.(fmsgIDEntry)
 			if time.Now().Before(entry.expires) {
