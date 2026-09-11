@@ -18,6 +18,7 @@ type RecipientDelivery struct {
 // the recipients added in one POST /fmsg/:id/add-to call, who added them
 // (add_to_from), and when (time).
 type AddToBatch struct {
+	SHA256     *string             `json:"sha256"`
 	BatchID    int64               `json:"batch_id"`
 	AddToFrom  string              `json:"add_to_from"`
 	To         []string            `json:"to"`
@@ -27,6 +28,8 @@ type AddToBatch struct {
 
 // Message represents a fmsg message as exchanged over the HTTP API.
 type Message struct {
+	SHA256      *string             `json:"sha256"`
+	PSHA256     *string             `json:"psha256"`
 	Version     int                 `json:"version"`
 	HasPid      bool                `json:"has_pid"`
 	HasAddTo    bool                `json:"has_add_to"`

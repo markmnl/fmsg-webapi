@@ -3,7 +3,9 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"github.com/markmnl/fmsgd/pkg/message"
 	"io"
 	"log"
 	"net/http"
@@ -98,7 +100,7 @@ func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int6
 	var noReply, terminal, important, hasAddTo bool
 	var mediaType, dataPath string
 	var size, attachments int
-	err := h.DB.Pool.QueryRow(ctx, `
+	err := h.q().QueryRow(ctx, `
 		SELECT m.pid, m.no_reply, m.is_terminal, m.is_important, m.type, m.size, m.filepath,
 		       (SELECT COUNT(*) FROM msg_attachment a WHERE a.msg_id = m.id),
 		       EXISTS (SELECT 1 FROM msg_add_to_batch b WHERE b.msg_id = m.id)
@@ -192,7 +194,7 @@ func (h *MessageHandler) loadReactionRows(ctx context.Context, subjectIDs []int6
 	if len(subjectIDs) == 0 {
 		return nil, nil
 	}
-	rows, err := h.DB.Pool.Query(ctx, `
+	rows, err := h.q().Query(ctx, `
 		SELECT r.pid, r.id, r.from_addr, r.time_sent, r.sha256, r.size, r.filepath
 		FROM msg r
 		WHERE r.pid = ANY($1)
@@ -293,7 +295,7 @@ type reactInput struct {
 // idempotent and sends nothing.
 func (h *MessageHandler) React(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -360,10 +362,10 @@ func (h *MessageHandler) React(c *gin.Context) {
 	}
 	switch {
 	case current != nil && current.emoji == want:
-		c.JSON(http.StatusOK, gin.H{"id": current.msgID, "time": current.time})
+		c.JSON(http.StatusOK, gin.H{"id": current.msgID, "time": current.time, "sha256": hex.EncodeToString(current.hash)})
 		return
 	case current == nil && want == "":
-		c.JSON(http.StatusOK, gin.H{"id": nil, "time": nil})
+		c.JSON(http.StatusOK, gin.H{"id": nil, "time": nil, "sha256": nil})
 		return
 	}
 
@@ -382,8 +384,22 @@ func (h *MessageHandler) React(c *gin.Context) {
 		}
 	}
 
+	parentHash := subject.SHA256
+	if !sameAddr(subject.From, identity) && !isRecipient(subject.To, identity) {
+		parentHash = nil
+		for _, b := range subject.AddTo {
+			if isRecipient(b.To, identity) {
+				parentHash = b.SHA256
+				break
+			}
+		}
+	}
+	if parentHash == nil {
+		c.JSON(500, gin.H{"error": "reaction parent has no finalized identity"})
+		return
+	}
 	now := float64(time.Now().UnixMicro()) / 1e6
-	tx, err := h.DB.Pool.Begin(ctx)
+	tx, err := h.q().Begin(ctx)
 	if err != nil {
 		log.Printf("react to %d: begin: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
@@ -393,10 +409,10 @@ func (h *MessageHandler) React(c *gin.Context) {
 
 	var reactionID int64
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO msg (version, pid, no_reply, is_important, is_deflate, is_terminal, from_addr, topic, type, size, filepath, time_sent)
-		 VALUES (1, $1, true, false, false, true, $2, '', $3, $4, '', $5)
+		`INSERT INTO msg (version, pid, psha256, no_reply, is_important, is_deflate, is_terminal, from_addr, topic, type, size, filepath, time_sent)
+		 VALUES (1, $1, decode($5,'hex'), true, false, false, true, $2, '', $3, $4, '', NULL)
 		 RETURNING id`,
-		msgID, identity, reactionMediaType, len(want), now,
+		msgID, identity, reactionMediaType, len(want), parentHash,
 	).Scan(&reactionID); err != nil {
 		log.Printf("react to %d: insert: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
@@ -408,6 +424,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save reaction"})
 		return
 	}
+	createdFile(c, dataPath)
 	if _, err := tx.Exec(ctx, "UPDATE msg SET filepath = $1 WHERE id = $2", dataPath, reactionID); err != nil {
 		log.Printf("react to %d: update filepath: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
@@ -420,6 +437,14 @@ func (h *MessageHandler) React(c *gin.Context) {
 			return
 		}
 	}
+	var files message.Files
+	onRollback(c, func() { files.Cleanup() })
+	hash, err := message.Finalize(ctx, finalizationTx{tx}, reactionID, now, &files)
+	if err != nil {
+		log.Printf("finalize reaction: %v", err)
+		c.JSON(500, gin.H{"error": "failed to finalize reaction"})
+		return
+	}
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("react to %d: commit: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
@@ -428,7 +453,11 @@ func (h *MessageHandler) React(c *gin.Context) {
 
 	// fmsgd's outbound sender skips the local domain, so local recipients
 	// have their delivery resolved here, as Send does.
-	h.resolveLocalDelivery(ctx, "msg_to", reactionID, h.LocalDomain, recipients)
+	afterCommit(c, func() {
+		plain := *h
+		plain.query = nil
+		plain.resolveLocalDelivery(ctx, "msg_to", reactionID, h.LocalDomain, recipients)
+	})
 
-	c.JSON(http.StatusCreated, gin.H{"id": reactionID, "time": now})
+	c.JSON(http.StatusCreated, gin.H{"id": reactionID, "time": now, "sha256": hex.EncodeToString(hash)})
 }

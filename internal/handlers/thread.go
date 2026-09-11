@@ -45,6 +45,8 @@ type threadAttachment struct {
 }
 
 type threadMessage struct {
+	SHA256        *string             `json:"sha256,omitempty"`
+	PSHA256       *string             `json:"psha256,omitempty"`
 	ID            int64               `json:"id"`
 	Visible       bool                `json:"visible"`
 	Version       int                 `json:"version,omitempty"`
@@ -155,7 +157,7 @@ func loadThreadRelations(ctx context.Context, tx pgx.Tx, messages []threadMessag
 	}
 
 	rows, err = tx.Query(ctx, `
-		SELECT b.msg_id, b.id, b.add_to_from, b.time_added, a.addr
+		SELECT b.msg_id, b.id, b.add_to_from, b.time_added, encode(b.sha256,'hex'), a.addr
 		FROM msg_add_to_batch b
 		LEFT JOIN msg_add_to a ON a.batch_id = b.id
 		WHERE b.msg_id = ANY($1)
@@ -168,14 +170,15 @@ func loadThreadRelations(ctx context.Context, tx pgx.Tx, messages []threadMessag
 		var msgID, batchID int64
 		var from string
 		var added float64
+		var hash *string
 		var addr *string
-		if err = rows.Scan(&msgID, &batchID, &from, &added, &addr); err != nil {
+		if err = rows.Scan(&msgID, &batchID, &from, &added, &hash, &addr); err != nil {
 			rows.Close()
 			return err
 		}
 		idx, ok := batchIndexes[batchID]
 		if !ok {
-			byID[msgID].AddTo = append(byID[msgID].AddTo, models.AddToBatch{BatchID: batchID, AddToFrom: from, Time: added})
+			byID[msgID].AddTo = append(byID[msgID].AddTo, models.AddToBatch{BatchID: batchID, AddToFrom: from, Time: added, SHA256: hash})
 			idx = len(byID[msgID].AddTo) - 1
 			batchIndexes[batchID] = idx
 		}
@@ -269,13 +272,13 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 		return
 	}
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
 	ctx := c.Request.Context()
 
-	rows, err := h.DB.Pool.Query(ctx, `
+	rows, err := h.q().Query(ctx, `
 		WITH RECURSIVE chain AS (
 			SELECT id, pid, from_addr, time_sent, type, size, filepath, 0 AS depth
 			FROM msg WHERE id = $1
@@ -285,9 +288,9 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 			WHERE c.depth < $3
 		)
 		SELECT c.id, c.from_addr, c.time_sent, c.type, c.size, c.filepath,
-		       (c.from_addr = ANY($2)
-		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND t.addr = ANY($2))
-		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND a.addr = ANY($2))) AS readable
+		       (lower(c.from_addr) = ANY($2)
+		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
+		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2))) AS readable
 		FROM chain c ORDER BY c.depth DESC`,
 		msgID, addrs, threadMaxHops,
 	)
@@ -363,7 +366,7 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 		return
 	}
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -379,21 +382,21 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE chain AS (
 			SELECT id, version, pid, no_reply, is_important, is_deflate, is_terminal, time_sent,
-			       from_addr, topic, type, size, filepath, sha256, 0 AS depth
+			       from_addr, topic, type, size, filepath, sha256, psha256, 0 AS depth
 			FROM msg WHERE id = $1
 			UNION ALL
 			SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate,
 			       m.is_terminal, m.time_sent, m.from_addr, m.topic, m.type, m.size, m.filepath,
-			       m.sha256, c.depth + 1
+			       m.sha256, m.psha256, c.depth + 1
 			FROM msg m JOIN chain c ON m.id = c.pid
 			WHERE c.depth + 1 < $3
 		)
 		SELECT c.id, c.version, c.pid, c.no_reply, c.is_important, c.is_deflate,
 		       c.is_terminal, c.time_sent, c.from_addr, c.topic, c.type, c.size, c.filepath,
-		       encode(c.sha256, 'hex'),
-		       (c.from_addr = ANY($2)
-		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND t.addr = ANY($2))
-		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND a.addr = ANY($2)))
+		       encode(c.sha256, 'hex'), encode(c.psha256, 'hex'),
+		       (lower(c.from_addr) = ANY($2)
+		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
+		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2)))
 		FROM chain c ORDER BY c.depth DESC`, msgID, addrs, threadMaxHops)
 	if err != nil {
 		log.Printf("thread messages: walk %d: %v", msgID, err)
@@ -406,13 +409,14 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		var hash *string
 		if err = rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important,
 			&m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &m.dataPath,
-			&hash, &m.Visible); err != nil {
+			&hash, &m.PSHA256, &m.Visible); err != nil {
 			rows.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 			return
 		}
 		if hash != nil {
 			m.MessageSHA256 = *hash
+			m.SHA256 = hash
 		}
 		messages = append(messages, m)
 	}

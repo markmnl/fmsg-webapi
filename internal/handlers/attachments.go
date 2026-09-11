@@ -19,6 +19,7 @@ import (
 
 // AttachmentHandler holds dependencies for attachment routes.
 type AttachmentHandler struct {
+	query         queries
 	DB            *db.DB
 	DataDir       string
 	MaxAttachSize int64
@@ -33,7 +34,7 @@ func NewAttachmentHandler(database *db.DB, dataDir string, maxAttachSize, maxMsg
 // Upload handles POST /fmsg/:id/attachments.
 func (h *AttachmentHandler) Upload(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -43,7 +44,7 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 	// Load the message to check ownership and draft status.
 	var fromAddr string
 	var timeSent *float64
-	err := h.DB.Pool.QueryRow(ctx,
+	err := h.q().QueryRow(ctx,
 		"SELECT from_addr, time_sent FROM msg WHERE id = $1", msgID,
 	).Scan(&fromAddr, &timeSent)
 	if err != nil {
@@ -113,9 +114,10 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
+	createdFile(c, finalPath)
 	// Check total message size and persist attachment in a transaction to
 	// prevent concurrent uploads from exceeding MaxMsgSize.
-	tx, err := h.DB.Pool.Begin(ctx)
+	tx, err := h.q().Begin(ctx)
 	if err != nil {
 		_ = os.Remove(finalPath)
 		log.Printf("upload attachment: begin tx: %v", err)
@@ -169,7 +171,7 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 // Download handles GET /fmsg/:id/attachments/:filename.
 func (h *AttachmentHandler) Download(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -185,7 +187,7 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 
 	// Check ownership or recipient access.
 	var fromAddr string
-	err := h.DB.Pool.QueryRow(ctx, "SELECT from_addr FROM msg WHERE id = $1", msgID).Scan(&fromAddr)
+	err := h.q().QueryRow(ctx, "SELECT from_addr FROM msg WHERE id = $1", msgID).Scan(&fromAddr)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -199,11 +201,11 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 	// Check recipients (to or add_to) if not owner.
 	if fromAddr != identity {
 		var recipientCount int
-		if err = h.DB.Pool.QueryRow(ctx,
+		if err = h.q().QueryRow(ctx,
 			`SELECT COUNT(*) FROM (
-				SELECT 1 FROM msg_to WHERE msg_id = $1 AND addr = $2
+				SELECT 1 FROM msg_to WHERE msg_id = $1 AND lower(addr) = lower($2)
 				UNION ALL
-				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND addr = $2
+				SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND lower(addr) = lower($2)
 			) r`, msgID, identity,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
@@ -213,7 +215,7 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 
 	// Look up the attachment filepath.
 	var storedPath string
-	err = h.DB.Pool.QueryRow(ctx,
+	err = h.q().QueryRow(ctx,
 		"SELECT filepath FROM msg_attachment WHERE msg_id = $1 AND filename = $2",
 		msgID, filename,
 	).Scan(&storedPath)
@@ -242,7 +244,7 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 // DeleteAttachment handles DELETE /fmsg/:id/attachments/:filename.
 func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := parseID(c)
+	msgID, ok := resolveID(c, h.q())
 	if !ok {
 		return
 	}
@@ -257,7 +259,7 @@ func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 
 	var fromAddr string
 	var timeSent *float64
-	err := h.DB.Pool.QueryRow(ctx,
+	err := h.q().QueryRow(ctx,
 		"SELECT from_addr, time_sent FROM msg WHERE id = $1", msgID,
 	).Scan(&fromAddr, &timeSent)
 	if err != nil {
@@ -281,7 +283,7 @@ func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 
 	// Get filepath before deleting.
 	var storedPath string
-	err = h.DB.Pool.QueryRow(ctx,
+	err = h.q().QueryRow(ctx,
 		"SELECT filepath FROM msg_attachment WHERE msg_id = $1 AND filename = $2",
 		msgID, filename,
 	).Scan(&storedPath)
@@ -295,7 +297,7 @@ func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 		return
 	}
 
-	if _, err = h.DB.Pool.Exec(ctx,
+	if _, err = h.q().Exec(ctx,
 		"DELETE FROM msg_attachment WHERE msg_id = $1 AND filename = $2", msgID, filename,
 	); err != nil {
 		log.Printf("delete attachment: db: %v", err)
@@ -307,7 +309,7 @@ func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 	cleanPath := filepath.Clean(storedPath)
 	cleanDataDir := filepath.Clean(h.DataDir)
 	if strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
-		_ = os.Remove(cleanPath)
+		afterCommit(c, func() { _ = os.Remove(cleanPath) })
 	}
 
 	c.Status(http.StatusNoContent)
