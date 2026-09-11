@@ -271,9 +271,8 @@ func TestFinalizationRollbackAndConcurrentSend(t *testing.T) {
 	id = a.draft(t, alice, "race", nil)
 	var wg sync.WaitGroup
 	codes := make(chan int, 8)
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); codes <- a.request(alice, "POST", "/fmsg/"+id+"/send", nil).Code }()
+	for range 8 {
+		wg.Go(func() { codes <- a.request(alice, "POST", "/fmsg/"+id+"/send", nil).Code })
 	}
 	wg.Wait()
 	close(codes)
@@ -290,7 +289,7 @@ func TestFinalizationRollbackAndConcurrentSend(t *testing.T) {
 	}
 	// Race a full draft edit with send. Either order is valid; the committed
 	// digest must describe exactly the content that remains downloadable.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		id = a.draft(t, alice, "before", nil)
 		wg.Add(2)
 		go func(id string) { defer wg.Done(); a.request(alice, "POST", "/fmsg/"+id+"/send", nil) }(id)

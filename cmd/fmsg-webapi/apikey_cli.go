@@ -198,7 +198,7 @@ func prepareCLIGrantInputs(owner, agent, cidrsRaw, expiresRaw string) ([]string,
 	}
 	var allowed []string
 	if strings.TrimSpace(cidrsRaw) != "" {
-		for _, cidr := range strings.Split(cidrsRaw, ",") {
+		for cidr := range strings.SplitSeq(cidrsRaw, ",") {
 			allowed = append(allowed, strings.TrimSpace(cidr))
 		}
 	}

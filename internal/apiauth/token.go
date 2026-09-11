@@ -65,13 +65,11 @@ func (i *TokenIssuer) Mint(ownerAddr, subAddr, keyID string, now time.Time) (str
 	claims := TokenClaims{
 		OwnerAddr: ownerAddr,
 		APIKeyID:  keyID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    i.issuer,
-			Subject:   subAddr,
-			Audience:  jwt.ClaimStrings{i.audience},
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(expires),
-		},
+		Issuer:    i.issuer,
+		Subject:   subAddr,
+		Audience:  jwt.ClaimStrings{i.audience},
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(expires),
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
 	signed, err := tok.SignedString(i.privateKey)

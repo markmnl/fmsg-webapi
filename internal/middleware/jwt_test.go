@@ -70,7 +70,7 @@ func TestIsValidAddr(t *testing.T) {
 }
 
 func fakeJWKS(kid string, pub ed25519.PublicKey) jwt.Keyfunc {
-	return func(t *jwt.Token) (interface{}, error) {
+	return func(t *jwt.Token) (any, error) {
 		k, _ := t.Header["kid"].(string)
 		if k != kid {
 			return nil, jwt.ErrTokenSignatureInvalid
