@@ -1,4 +1,5 @@
-[![Build & Test](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml/badge.svg)](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml)
+[![Build & Test](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml/badge.svg?branch=main)](https://github.com/markmnl/fmsg-webapi/actions/workflows/build-test.yml?query=branch%3Amain)
+[![Go 1.27+](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
 
 # fmsg-webapi
 
@@ -179,7 +180,7 @@ go run ./cmd/fmsg-webapi api-key rotate-delegation \
 
 ## Building
 
-Requires **Go 1.25** or newer.
+Requires **Go 1.27** or newer.
 
 ```bash
 go build ./...
