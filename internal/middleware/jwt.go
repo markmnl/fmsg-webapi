@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,9 @@ const (
 
 	AuthTypeIdP = "idp"
 	AuthTypeAPI = "api_token"
+	// AuthTypeOAuth marks a delegated OAuth token: one issued to a third-party
+	// client on the owner's behalf. It never carries owner privileges.
+	AuthTypeOAuth = "oauth"
 )
 
 // DefaultClockSkew is the leeway applied to iat/nbf/exp validation to tolerate
@@ -50,6 +54,12 @@ type Config struct {
 	Audience     string
 	AddressClaim string
 
+	// OAuthAudience enables delegated OAuth tokens. A provider token whose aud
+	// contains this value is scope-restricted and is never treated as an owner
+	// session. It requires Audience, and must differ from it, so that both
+	// kinds of token are identified positively by their audience.
+	OAuthAudience string
+
 	// Ed25519 first-party API-token verification. Enabled when APIPublicKey is non-empty.
 	APIPublicKey ed25519.PublicKey
 	APIIssuer    string
@@ -68,6 +78,10 @@ type authResult struct {
 	Addr      string
 	OwnerAddr string
 	AuthType  string
+
+	// Scopes and Expires are set for AuthTypeOAuth only.
+	Scopes  map[string]struct{}
+	Expires time.Time
 }
 
 // Verifier verifies fmsg bearer tokens. It is safe for concurrent use and is
@@ -77,6 +91,7 @@ type Verifier struct {
 	idpKeyFunc   jwt.Keyfunc
 	issuer       string
 	audience     string
+	oauthAud     string
 	addressClaim string
 	apiParser    *jwt.Parser
 	apiPublicKey ed25519.PublicKey
@@ -98,6 +113,9 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 		if cfg.AddressClaim == "" {
 			return nil, errors.New("middleware: EdDSA mode requires an AddressClaim")
 		}
+		if cfg.OAuthAudience != "" && (cfg.Audience == "" || cfg.Audience == cfg.OAuthAudience) {
+			return nil, errors.New("middleware: OAuthAudience requires a different, non-empty Audience")
+		}
 		v.idpKeyFunc = func(t *jwt.Token) (any, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %s", t.Method.Alg())
@@ -111,12 +129,12 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 			jwt.WithIssuedAt(),
 			jwt.WithIssuer(cfg.Issuer),
 		}
-		if cfg.Audience != "" {
-			parserOpts = append(parserOpts, jwt.WithAudience(cfg.Audience))
-		}
+		// The audience is checked in authenticateIdP: it decides whether a
+		// token is an owner session or a delegated OAuth token.
 		v.idpParser = jwt.NewParser(parserOpts...)
 		v.issuer = cfg.Issuer
 		v.audience = cfg.Audience
+		v.oauthAud = cfg.OAuthAudience
 		v.addressClaim = cfg.AddressClaim
 	}
 
@@ -185,6 +203,11 @@ func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) 
 		return authResult{}, err
 	}
 
+	delegated, err := v.classifyAudience(claims)
+	if err != nil {
+		return authResult{}, err
+	}
+
 	owner, _ := claims[v.addressClaim].(string)
 	if owner == "" {
 		sub, _ := claims["sub"].(string)
@@ -195,6 +218,24 @@ func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) 
 		return authResult{}, authError{status: status, msg: msg}
 	}
 	res := authResult{Addr: owner, OwnerAddr: owner, AuthType: AuthTypeIdP}
+	var identities []string
+	if delegated {
+		// Missing or malformed scopes deny; they never fall back to the
+		// privileges of an owner session.
+		scopes, err := parseScopes(claims)
+		if err != nil {
+			log.Printf("auth rejected: reason=oauth_scope addr=%s", owner)
+			return authResult{}, authError{status: http.StatusForbidden, msg: "missing or malformed scope"}
+		}
+		if identities, err = delegatedIdentities(claims); err != nil {
+			return authResult{}, authError{status: http.StatusForbidden, msg: "malformed identities claim"}
+		}
+		res.AuthType = AuthTypeOAuth
+		res.Scopes = scopes
+		if exp, err := claims.GetExpirationTime(); err == nil && exp != nil {
+			res.Expires = exp.Time
+		}
+	}
 
 	if strings.TrimSpace(actAs) == "" {
 		return res, nil
@@ -203,6 +244,11 @@ func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) 
 		return authResult{}, authError{status: http.StatusForbidden, msg: "act-as is not enabled"}
 	}
 	actAs = strings.TrimSpace(actAs)
+	// A delegated token may only select identities recorded in its grant; the
+	// owner/sub-account relationship below is still required as well.
+	if delegated && !slices.Contains(identities, actAs) {
+		return authResult{}, authError{status: http.StatusForbidden, msg: "act-as identity is not authorised for this token"}
+	}
 	if !IsValidAddr(actAs) {
 		return authResult{}, authError{status: http.StatusUnauthorized, msg: "invalid act-as identity"}
 	}
@@ -214,6 +260,41 @@ func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) 
 	}
 	res.Addr = actAs
 	return res, nil
+}
+
+// classifyAudience enforces the intended audience and reports whether the
+// token is a delegated OAuth token. With no OAuthAudience configured every
+// provider token is an owner session, as before.
+func (v *Verifier) classifyAudience(claims jwt.MapClaims) (delegated bool, err error) {
+	if v.audience == "" {
+		return false, nil // OAuthAudience cannot be set without Audience
+	}
+	aud, err := claims.GetAudience()
+	if err != nil {
+		return false, err
+	}
+	ownerAud := audienceContains(aud, v.audience)
+	if v.oauthAud == "" {
+		if !ownerAud {
+			return false, jwt.ErrTokenInvalidAudience
+		}
+		return false, nil
+	}
+	oauthAud := audienceContains(aud, v.oauthAud)
+	switch {
+	case oauthAud && ownerAud:
+		return false, authError{status: http.StatusUnauthorized, msg: "ambiguous token audience"}
+	case oauthAud:
+		return true, nil
+	case !ownerAud:
+		return false, jwt.ErrTokenInvalidAudience
+	}
+	// An actor claim marks delegation (RFC 8693); it has no place on an owner
+	// session, so refuse it rather than grant owner privileges.
+	if _, has := claims["act"]; has {
+		return false, authError{status: http.StatusUnauthorized, msg: "delegated token presented with owner audience"}
+	}
+	return false, nil
 }
 
 func (v *Verifier) authenticateAPIToken(ctx context.Context, tokenStr, remoteAddr, actAs string) (authResult, error) {
@@ -312,6 +393,9 @@ func New(cfg Config) (gin.HandlerFunc, error) {
 		res, status, msg := verifier.AuthenticateRequest(c.Request.Context(), tokenStr, c.ClientIP(), c.GetHeader("X-FMSG-Act-As"))
 		if status != http.StatusOK {
 			respondAuth(c, status, msg)
+			return
+		}
+		if !CheckScope(c, res) {
 			return
 		}
 

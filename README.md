@@ -10,6 +10,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 - [Environment Variables](#environment-variables)
 - [Authentication](#authentication)
   - [EdDSA (production, JWKS-backed JWTs)](#eddsa-production-jwks-backed-jwts)
+  - [Delegated OAuth tokens](#delegated-oauth-tokens)
   - [API Keys And First-Party JWTs](#api-keys-and-first-party-jwts)
 - [Building](#building)
 - [Testing](#testing)
@@ -32,6 +33,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_JWT_JWKS_URL` | *(prod)*                 | JWKS endpoint for the configured identity provider (e.g. `https://idp.example.com/.well-known/jwks.json`). When set, the API verifies EdDSA (Ed25519) JWTs. Public keys are fetched and cached, refreshed and looked up by the token's `kid` header. |
 | `FMSG_JWT_ISSUER`   | *(prod, required with JWKS)* | Expected `iss` claim value (e.g. `https://idp.example.com/`). Tokens with a different issuer are rejected. This must exactly match the token issuer. |
 | `FMSG_JWT_AUDIENCE` | *(optional)* | When set, tokens must include this value in their `aud` claim. Leave unset if your identity provider does not issue an `aud` claim. |
+| `FMSG_JWT_OAUTH_AUDIENCE` | *(optional)* | Enables delegated OAuth tokens: provider tokens whose `aud` contains this value are scope-restricted and cannot administer API keys or grants. Requires `FMSG_JWT_AUDIENCE`, set to a different value. See [Delegated OAuth tokens](#delegated-oauth-tokens). |
 | `FMSG_JWT_ADDRESS_CLAIM` | *(prod, required with JWKS)* | JWT claim name containing the fmsg address in `@user@domain` form, e.g. `sub` or a namespaced custom claim. |
 | `FMSG_API_TOKEN_ED25519_PRIVATE_KEY` | *(optional)* | Base64-encoded Ed25519 private key or seed used to mint first-party JWTs from API keys. Required to enable `/fmsg/token` and sub-account routes. |
 | `FMSG_API_TOKEN_ISSUER` | `fmsg-webapi` | Issuer for first-party API-key JWTs. |
@@ -101,6 +103,31 @@ Clients must send a JWT that matches the configured issuer (and audience, if
 configured) and includes the configured address claim. Whether that token is
 an ID token or access token is determined by the identity provider
 configuration for the deployment.
+
+### Delegated OAuth tokens
+
+Active when `FMSG_JWT_OAUTH_AUDIENCE` is set. The identity provider can then
+issue tokens to third-party clients (for example through an MCP server using
+OAuth token exchange) that message as the consenting user without the
+privileges of that user's own session.
+
+The `aud` claim alone decides the kind of token. A token whose `aud` contains
+`FMSG_JWT_AUDIENCE` is an owner session, as before. A token whose `aud`
+contains `FMSG_JWT_OAUTH_AUDIENCE` is delegated: it needs the `fmsg:read` or
+`fmsg:write` scope for each message, attachment and WebSocket route, and is
+refused every other route, including all sub-account (API key and grant)
+routes and push subscriptions. A missing or malformed `scope` is refused with
+403; it never falls back to owner privileges. A token carrying both audiences,
+or an owner-audience token carrying an `act` claim, is rejected.
+
+`X-FMSG-Act-As` is refused for delegated tokens unless the address is listed in
+the token's `fmsg_identities` claim and also passes the usual grant check.
+Message permissions, quotas and acceptance checks are unchanged. With the
+variable unset, behaviour is exactly as before and a token issued for the
+OAuth audience fails the audience check.
+
+[docs/oauth-claims.md](docs/oauth-claims.md) is the full claims contract for
+issuers and resource servers.
 
 ### API Keys And First-Party JWTs
 

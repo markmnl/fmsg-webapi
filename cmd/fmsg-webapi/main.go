@@ -43,6 +43,7 @@ func main() {
 	jwksURL := os.Getenv("FMSG_JWT_JWKS_URL")
 	jwtIssuer := os.Getenv("FMSG_JWT_ISSUER")
 	jwtAudience := os.Getenv("FMSG_JWT_AUDIENCE")
+	jwtOAuthAudience := os.Getenv("FMSG_JWT_OAUTH_AUDIENCE")
 	jwtAddressClaim := os.Getenv("FMSG_JWT_ADDRESS_CLAIM")
 	apiTokenPrivate := os.Getenv("FMSG_API_TOKEN_ED25519_PRIVATE_KEY")
 	apiTokenIssuer := envOrDefault("FMSG_API_TOKEN_ISSUER", apiauth.DefaultTokenIssuer)
@@ -101,7 +102,7 @@ func main() {
 	}
 
 	// Initialise authentication middleware.
-	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, jwtAddressClaim, idURL, tokenIssuer, apiStore)
+	jwtCfg, err := buildJWTConfig(ctx, jwksURL, jwtIssuer, jwtAudience, jwtOAuthAudience, jwtAddressClaim, idURL, tokenIssuer, apiStore)
 	if err != nil {
 		log.Fatalf("failed to configure auth: %v", err)
 	}
@@ -164,54 +165,13 @@ func main() {
 	go hub.Run(context.Background())
 	wsHandler := handlers.NewWSHandler(jwtVerifier, hub, corsOrigins)
 
+	var tokenHandler *handlers.TokenHandler
+	var subAccountHandler *handlers.SubAccountHandler
 	if tokenIssuer != nil {
-		tokenHandler := handlers.NewTokenHandler(apiStore, tokenIssuer, idURL)
-		router.POST("/fmsg/token", tokenHandler.Exchange)
+		tokenHandler = handlers.NewTokenHandler(apiStore, tokenIssuer, idURL)
+		subAccountHandler = handlers.NewSubAccountHandler(apiStore, idURL)
 	}
-
-	// Register routes under /fmsg, all protected by JWT.
-	fmsg := router.Group("/fmsg")
-	fmsg.Use(jwtMiddleware)
-	{
-		if tokenIssuer != nil {
-			subAccountHandler := handlers.NewSubAccountHandler(apiStore, idURL)
-			fmsg.GET("/sub-accounts", subAccountHandler.List)
-			fmsg.POST("/sub-accounts", subAccountHandler.Create)
-			fmsg.GET("/sub-accounts/:agent", subAccountHandler.Get)
-			fmsg.PATCH("/sub-accounts/:agent", subAccountHandler.UpdateCIDRs)
-			fmsg.POST("/sub-accounts/:agent/rotate-key", subAccountHandler.RotateKey)
-			fmsg.DELETE("/sub-accounts/:agent", subAccountHandler.Delete)
-		}
-
-		fmsg.GET("", msgHandler.List)
-		fmsg.GET("/sent", msgHandler.Sent)
-		fmsg.POST("", msgHandler.Atomic((*handlers.MessageHandler).Create))
-		fmsg.GET("/:id", msgHandler.Get)
-		fmsg.PUT("/:id", msgHandler.Atomic((*handlers.MessageHandler).Update))
-		fmsg.DELETE("/:id", msgHandler.Atomic((*handlers.MessageHandler).Delete))
-		fmsg.POST("/:id/send", msgHandler.Atomic((*handlers.MessageHandler).Send))
-		fmsg.POST("/:id/read", msgHandler.MarkRead)
-		fmsg.POST("/:id/add-to", msgHandler.Atomic((*handlers.MessageHandler).AddRecipients))
-		fmsg.POST("/:id/react", msgHandler.Atomic((*handlers.MessageHandler).React))
-		fmsg.GET("/:id/data", msgHandler.DownloadData)
-		fmsg.GET("/:id/thread", msgHandler.ThreadText)
-		fmsg.GET("/:id/thread/messages", msgHandler.ThreadMessages)
-
-		fmsg.POST("/:id/attach", attHandler.Atomic((*handlers.AttachmentHandler).Upload))
-		fmsg.GET("/:id/attach/:filename", attHandler.Download)
-		fmsg.DELETE("/:id/attach/:filename", attHandler.Atomic((*handlers.AttachmentHandler).DeleteAttachment))
-
-		if pushHandler != nil {
-			fmsg.POST("/push/subscribe", pushHandler.Subscribe)
-			fmsg.DELETE("/push/subscribe", pushHandler.Unsubscribe)
-		}
-	}
-
-	// The WebSocket endpoint is registered outside the JWT-protected group:
-	// browsers cannot set an Authorization header on a WebSocket, so the
-	// handler authenticates itself via the access_token query parameter or
-	// an Authorization header.
-	router.GET("/fmsg/ws", wsHandler.Connect)
+	registerRoutes(router, jwtMiddleware, msgHandler, attHandler, tokenHandler, subAccountHandler, pushHandler, wsHandler)
 
 	srv := &http.Server{
 		Handler:           router,
@@ -295,25 +255,81 @@ func envOrDefaultDuration(key string, defaultValue time.Duration) time.Duration 
 	return defaultValue
 }
 
+// registerRoutes registers every API route. Optional handlers may be nil.
+// Routes that delegated OAuth tokens may call must also be listed in the
+// middleware scope table; a test keeps the two in step.
+func registerRoutes(router *gin.Engine, jwtMiddleware gin.HandlerFunc, msgHandler *handlers.MessageHandler, attHandler *handlers.AttachmentHandler, tokenHandler *handlers.TokenHandler, subAccountHandler *handlers.SubAccountHandler, pushHandler *handlers.PushHandler, wsHandler *handlers.WSHandler) {
+	if tokenHandler != nil {
+		router.POST("/fmsg/token", tokenHandler.Exchange)
+	}
+
+	// Register routes under /fmsg, all protected by JWT.
+	fmsg := router.Group("/fmsg")
+	fmsg.Use(jwtMiddleware)
+	{
+		if subAccountHandler != nil {
+			fmsg.GET("/sub-accounts", subAccountHandler.List)
+			fmsg.POST("/sub-accounts", subAccountHandler.Create)
+			fmsg.GET("/sub-accounts/:agent", subAccountHandler.Get)
+			fmsg.PATCH("/sub-accounts/:agent", subAccountHandler.UpdateCIDRs)
+			fmsg.POST("/sub-accounts/:agent/rotate-key", subAccountHandler.RotateKey)
+			fmsg.DELETE("/sub-accounts/:agent", subAccountHandler.Delete)
+		}
+
+		fmsg.GET("", msgHandler.List)
+		fmsg.GET("/sent", msgHandler.Sent)
+		fmsg.POST("", msgHandler.Atomic((*handlers.MessageHandler).Create))
+		fmsg.GET("/:id", msgHandler.Get)
+		fmsg.PUT("/:id", msgHandler.Atomic((*handlers.MessageHandler).Update))
+		fmsg.DELETE("/:id", msgHandler.Atomic((*handlers.MessageHandler).Delete))
+		fmsg.POST("/:id/send", msgHandler.Atomic((*handlers.MessageHandler).Send))
+		fmsg.POST("/:id/read", msgHandler.MarkRead)
+		fmsg.POST("/:id/add-to", msgHandler.Atomic((*handlers.MessageHandler).AddRecipients))
+		fmsg.POST("/:id/react", msgHandler.Atomic((*handlers.MessageHandler).React))
+		fmsg.GET("/:id/data", msgHandler.DownloadData)
+		fmsg.GET("/:id/thread", msgHandler.ThreadText)
+		fmsg.GET("/:id/thread/messages", msgHandler.ThreadMessages)
+
+		fmsg.POST("/:id/attach", attHandler.Atomic((*handlers.AttachmentHandler).Upload))
+		fmsg.GET("/:id/attach/:filename", attHandler.Download)
+		fmsg.DELETE("/:id/attach/:filename", attHandler.Atomic((*handlers.AttachmentHandler).DeleteAttachment))
+
+		if pushHandler != nil {
+			fmsg.POST("/push/subscribe", pushHandler.Subscribe)
+			fmsg.DELETE("/push/subscribe", pushHandler.Unsubscribe)
+		}
+	}
+
+	// The WebSocket endpoint is registered outside the JWT-protected group:
+	// browsers cannot set an Authorization header on a WebSocket, so the
+	// handler authenticates itself via the access_token query parameter or
+	// an Authorization header.
+	router.GET("/fmsg/ws", wsHandler.Connect)
+}
+
 // buildJWTConfig assembles a middleware.Config from environment-derived inputs.
-func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, addressClaim, idURL string, tokenIssuer *apiauth.TokenIssuer, apiStore *apiauth.Store) (middleware.Config, error) {
+func buildJWTConfig(ctx context.Context, jwksURL, issuer, audience, oauthAudience, addressClaim, idURL string, tokenIssuer *apiauth.TokenIssuer, apiStore *apiauth.Store) (middleware.Config, error) {
 	cfg := middleware.Config{
-		Issuer:       issuer,
-		Audience:     audience,
-		AddressClaim: addressClaim,
-		IDURL:        idURL,
+		Issuer:        issuer,
+		Audience:      audience,
+		OAuthAudience: oauthAudience,
+		AddressClaim:  addressClaim,
+		IDURL:         idURL,
 	}
 
 	if jwksURL != "" {
 		if issuer == "" || addressClaim == "" {
 			return cfg, errors.New("FMSG_JWT_ISSUER and FMSG_JWT_ADDRESS_CLAIM are required when FMSG_JWT_JWKS_URL is set")
 		}
+		if oauthAudience != "" && (audience == "" || audience == oauthAudience) {
+			return cfg, errors.New("FMSG_JWT_OAUTH_AUDIENCE requires FMSG_JWT_AUDIENCE to be set to a different value")
+		}
 		k, err := keyfunc.NewDefaultCtx(ctx, []string{jwksURL})
 		if err != nil {
 			return cfg, err
 		}
 		cfg.JWKS = k.Keyfunc
-		log.Printf("EdDSA auth enabled (issuer=%s, jwks=%s, audience=%q, address_claim=%s)", issuer, jwksURL, audience, addressClaim)
+		log.Printf("EdDSA auth enabled (issuer=%s, jwks=%s, audience=%q, oauth_audience=%q, address_claim=%s)", issuer, jwksURL, audience, oauthAudience, addressClaim)
 	} else {
 		log.Println("EdDSA auth disabled (FMSG_JWT_JWKS_URL not set)")
 	}
