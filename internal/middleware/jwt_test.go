@@ -177,11 +177,6 @@ func TestEdDSAMode_Happy(t *testing.T) {
 }
 
 func TestEdDSAMode_ActAsSubAccount(t *testing.T) {
-	fmsgIDCache.Delete("@alice@example.com")
-	fmsgIDCache.Delete("@alice_bot@example.com")
-	defer fmsgIDCache.Delete("@alice@example.com")
-	defer fmsgIDCache.Delete("@alice_bot@example.com")
-
 	srv := fmsgIDServer(t, http.StatusOK, true)
 	defer srv.Close()
 	priv, jwks := newEdDSAFixture(t)
@@ -319,7 +314,6 @@ func TestEdDSAMode_ConfigValidation(t *testing.T) {
 func TestEdDSAMode_FmsgIDFailures(t *testing.T) {
 	priv, jwks := newEdDSAFixture(t)
 
-	fmsgIDCache.Delete("@alice@example.com")
 	srv := fmsgIDServer(t, http.StatusNotFound, false)
 	mw, err := New(providerConfig(srv.URL, jwks))
 	if err != nil {
@@ -331,7 +325,6 @@ func TestEdDSAMode_FmsgIDFailures(t *testing.T) {
 	}
 	srv.Close()
 
-	fmsgIDCache.Delete("@alice@example.com")
 	srv = fmsgIDServer(t, http.StatusOK, false)
 	defer srv.Close()
 	mw, err = New(providerConfig(srv.URL, jwks))

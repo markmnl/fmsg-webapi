@@ -145,9 +145,19 @@ DO UPDATE SET max_sub_accounts = EXCLUDED.max_sub_accounts;
 
 Operators can bootstrap or rotate keys without EdDSA by using the built-in CLI
 command. It uses the standard `PG*` connection environment variables and prints
-the plaintext API key once. Creation verifies that the owner and delegated
-address are present and accepting new messages in fmsgid; derived sub-accounts
-are registered in fmsgid automatically.
+the plaintext API key once. Creation also requires the fmsgid service configured
+by `FMSG_ID_URL`:
+
+- `create` checks that the owner exists and accepts new messages, registers the
+  derived address with fmsgid's default quotas, and verifies it accepts new
+  messages before storing the key. Existing address settings are preserved;
+  quotas are independent of the owner's.
+- `create-delegation` requires both the owner and delegated address to already
+  exist and accept new messages. It does not register either address.
+
+Failed fmsgid checks prevent key creation. Token exchange still requires the
+granted address to exist and accept new messages. Rotation replaces an existing
+key without registering addresses or changing their quotas.
 
 Derived sub-account:
 
