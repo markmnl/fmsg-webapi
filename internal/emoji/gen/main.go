@@ -102,8 +102,8 @@ func parseTest(r io.Reader) ([]string, string) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
-		if strings.HasPrefix(line, "# Version:") {
-			version = strings.TrimSpace(strings.TrimPrefix(line, "# Version:"))
+		if after, ok := strings.CutPrefix(line, "# Version:"); ok {
+			version = strings.TrimSpace(after)
 			continue
 		}
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -120,7 +120,7 @@ func parseTest(r io.Reader) ([]string, string) {
 			continue
 		}
 		var b strings.Builder
-		for _, cp := range strings.Fields(line[:semi]) {
+		for cp := range strings.FieldsSeq(line[:semi]) {
 			n, err := strconv.ParseUint(cp, 16, 32)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "bad code point %q\n", cp)
@@ -153,8 +153,8 @@ func parseData(r io.Reader) map[string][]span {
 		}
 		rng, prop := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 		lo, hi := rng, rng
-		if dots := strings.Index(rng, ".."); dots >= 0 {
-			lo, hi = rng[:dots], rng[dots+2:]
+		if before, after, ok := strings.Cut(rng, ".."); ok {
+			lo, hi = before, after
 		}
 		l, err1 := strconv.ParseUint(lo, 16, 32)
 		h, err2 := strconv.ParseUint(hi, 16, 32)

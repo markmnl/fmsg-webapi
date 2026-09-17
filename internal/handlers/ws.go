@@ -3,6 +3,7 @@ package handlers
 import (
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -57,10 +58,8 @@ func NewWSHandler(verifier *middleware.Verifier, hub *Hub, allowedOrigins []stri
 				if len(allowedOrigins) == 0 {
 					return true
 				}
-				for _, o := range allowedOrigins {
-					if o == origin {
-						return true
-					}
+				if slices.Contains(allowedOrigins, origin) {
+					return true
 				}
 				log.Printf("ws: rejected upgrade from origin %q", origin)
 				return false

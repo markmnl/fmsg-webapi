@@ -24,8 +24,8 @@ const (
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
 // Type field lets clients route events; Data carries the event-specific body.
 type wsEnvelope struct {
-	Type string      `json:"type"`
-	Data interface{} `json:"data"`
+	Type string `json:"type"`
+	Data any    `json:"data"`
 }
 
 // Hub maintains the set of connected WebSocket clients and fans out database
@@ -189,15 +189,15 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 
 // parseNotifyPayload parses a new_msg payload of the form "msgID,addr".
 func parseNotifyPayload(payload string) (msgID int64, addr string, ok bool) {
-	comma := strings.IndexByte(payload, ',')
-	if comma < 0 {
+	before, after, ok := strings.Cut(payload, ",")
+	if !ok {
 		return 0, "", false
 	}
-	id, err := strconv.ParseInt(payload[:comma], 10, 64)
+	id, err := strconv.ParseInt(before, 10, 64)
 	if err != nil {
 		return 0, "", false
 	}
-	addr = payload[comma+1:]
+	addr = after
 	if addr == "" {
 		return 0, "", false
 	}
