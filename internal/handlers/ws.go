@@ -98,6 +98,9 @@ func (h *WSHandler) Connect(c *gin.Context) {
 		c.JSON(status, gin.H{"error": msg})
 		return
 	}
+	if !middleware.CheckScope(c, res) {
+		return
+	}
 	addr := res.Addr
 
 	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -114,6 +117,13 @@ func (h *WSHandler) Connect(c *gin.Context) {
 		done: make(chan struct{}),
 	}
 	h.hub.Register(client)
+
+	// A delegated OAuth token's connection ends with the token, so a revoked
+	// grant cannot keep receiving; the client reconnects with a fresh token.
+	if !res.Expires.IsZero() {
+		expiry := time.AfterFunc(time.Until(res.Expires), client.close)
+		defer expiry.Stop()
+	}
 
 	go client.writePump()
 	client.readPump() // blocks until the connection ends
