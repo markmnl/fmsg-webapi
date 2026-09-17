@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -48,6 +49,18 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	}
 	if len(allowed) == 0 {
 		return fmt.Errorf("cidr is required for create")
+	}
+	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
+	if err := requireAcceptingCLIAddress(idURL, *owner, "owner"); err != nil {
+		return err
+	}
+	// Match the self-service sub-account flow: derived addresses are created in
+	// fmsgid before their API key is persisted.
+	if err := middleware.RegisterFmsgID(idURL, subAddr); err != nil {
+		return fmt.Errorf("registering derived address with fmsgid: %w", err)
+	}
+	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
+		return err
 	}
 	database, err := db.New(ctx, "")
 	if err != nil {
@@ -123,6 +136,13 @@ func runAPIKeyCreateDelegation(ctx context.Context, args []string) error {
 	}
 	if !middleware.IsValidAddr(*addr) {
 		return fmt.Errorf("addr must be an fmsg address")
+	}
+	idURL := envOrDefault("FMSG_ID_URL", "http://127.0.0.1:8080")
+	if err := requireAcceptingCLIAddress(idURL, *owner, "owner"); err != nil {
+		return err
+	}
+	if err := requireAcceptingCLIAddress(idURL, *addr, "delegated address"); err != nil {
+		return err
 	}
 	database, err := db.New(ctx, "")
 	if err != nil {
@@ -212,6 +232,23 @@ func prepareCLIGrantInputs(owner, agent, cidrsRaw, expiresRaw string) ([]string,
 		return nil, time.Time{}, apiauth.APIKey{}, nil, err
 	}
 	return allowed, expires, key, apiauth.HashAPIKey(key.Value), nil
+}
+
+func requireAcceptingCLIAddress(idURL, addr, role string) error {
+	code, accepting, err := middleware.CheckFmsgID(idURL, addr)
+	if err != nil {
+		return fmt.Errorf("checking %s in fmsgid: %w", role, err)
+	}
+	if code == http.StatusNotFound {
+		return fmt.Errorf("%s %s not found in fmsgid", role, addr)
+	}
+	if code != http.StatusOK {
+		return fmt.Errorf("checking %s in fmsgid: unexpected status %d", role, code)
+	}
+	if !accepting {
+		return fmt.Errorf("%s %s is not accepting new messages", role, addr)
+	}
+	return nil
 }
 
 func printCLIKey(owner, agent, subAddr string, key apiauth.APIKey) {

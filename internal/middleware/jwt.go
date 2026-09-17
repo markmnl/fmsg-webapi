@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -395,7 +396,7 @@ type fmsgIDEntry struct {
 	acceptingNew bool
 }
 
-var fmsgIDCache sync.Map // map[string]fmsgIDEntry, key = addr
+var fmsgIDCache sync.Map // map[string]fmsgIDEntry, key = address lookup URL
 
 var fmsgIDGroup singleflight.Group
 
@@ -406,22 +407,23 @@ type fmsgIDResult struct {
 
 // CheckFmsgID queries the fmsgid service for a user address.
 func CheckFmsgID(idURL, addr string) (int, bool, error) {
-	if v, ok := fmsgIDCache.Load(addr); ok {
+	lookupURL := fmsgIDAddressURL(idURL, addr)
+	if v, ok := fmsgIDCache.Load(lookupURL); ok {
 		entry := v.(fmsgIDEntry)
 		if time.Now().Before(entry.expires) {
 			return entry.code, entry.acceptingNew, nil
 		}
-		fmsgIDCache.Delete(addr)
+		fmsgIDCache.Delete(lookupURL)
 	}
 
-	v, err, _ := fmsgIDGroup.Do(addr, func() (any, error) {
-		if v, ok := fmsgIDCache.Load(addr); ok {
+	v, err, _ := fmsgIDGroup.Do(lookupURL, func() (any, error) {
+		if v, ok := fmsgIDCache.Load(lookupURL); ok {
 			entry := v.(fmsgIDEntry)
 			if time.Now().Before(entry.expires) {
 				return fmsgIDResult{code: entry.code, acceptingNew: entry.acceptingNew}, nil
 			}
 		}
-		return fetchFmsgID(idURL, addr)
+		return fetchFmsgID(lookupURL)
 	})
 	if err != nil {
 		return 0, false, err
@@ -450,13 +452,16 @@ func RegisterFmsgID(idURL, addr string) error {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
 	}
-	fmsgIDCache.Delete(addr)
+	fmsgIDCache.Delete(fmsgIDAddressURL(idURL, addr))
 	return nil
 }
 
-func fetchFmsgID(idURL, addr string) (fmsgIDResult, error) {
-	url := strings.TrimRight(idURL, "/") + "/fmsgid/" + addr
-	resp, err := fmsgIDClient.Get(url) //nolint:gosec // URL constructed from trusted config + validated addr
+func fmsgIDAddressURL(idURL, addr string) string {
+	return strings.TrimRight(idURL, "/") + "/fmsgid/" + url.PathEscape(addr)
+}
+
+func fetchFmsgID(lookupURL string) (fmsgIDResult, error) {
+	resp, err := fmsgIDClient.Get(lookupURL) //nolint:gosec // URL constructed from trusted config + escaped addr
 	if err != nil {
 		return fmsgIDResult{}, err
 	}
@@ -470,16 +475,19 @@ func fetchFmsgID(idURL, addr string) (fmsgIDResult, error) {
 	}
 
 	var result struct {
-		AcceptingNew bool `json:"acceptingNew"`
+		AcceptingNew *bool `json:"acceptingNew"`
 	}
 	if err := decodeJSON(resp.Body, &result); err != nil {
-		return fmsgIDResult{code: http.StatusOK, acceptingNew: true}, nil
+		return fmsgIDResult{}, fmt.Errorf("decoding fmsgid address: %w", err)
+	}
+	if result.AcceptingNew == nil {
+		return fmsgIDResult{}, errors.New("fmsgid address response is missing acceptingNew")
 	}
 
-	fmsgIDCache.Store(addr, fmsgIDEntry{
+	fmsgIDCache.Store(lookupURL, fmsgIDEntry{
 		expires:      time.Now().Add(fmsgIDCacheTTL),
 		code:         http.StatusOK,
-		acceptingNew: result.AcceptingNew,
+		acceptingNew: *result.AcceptingNew,
 	})
-	return fmsgIDResult{code: http.StatusOK, acceptingNew: result.AcceptingNew}, nil
+	return fmsgIDResult{code: http.StatusOK, acceptingNew: *result.AcceptingNew}, nil
 }
