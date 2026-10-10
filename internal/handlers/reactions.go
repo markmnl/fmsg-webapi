@@ -398,6 +398,12 @@ func (h *MessageHandler) React(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "reaction parent has no finalized identity"})
 		return
 	}
+	// A reaction is a message like any other: it counts against the
+	// sender's send limits, and its recipients' receive limits.
+	size := int64(len(want))
+	if !h.checkSendQuota(c, identity, size) {
+		return
+	}
 	now := float64(time.Now().UnixMicro()) / 1e6
 	tx, err := h.q().Begin(ctx)
 	if err != nil {
@@ -456,6 +462,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 	afterCommit(c, func() {
 		plain := *h
 		plain.query = nil
+		plain.recordSend(identity, now, size)
 		plain.resolveLocalDelivery(ctx, "msg_to", reactionID, h.LocalDomain, recipients)
 	})
 
