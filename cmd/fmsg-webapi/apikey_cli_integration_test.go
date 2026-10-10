@@ -287,3 +287,76 @@ func TestAPIKeyExchangeRejectsUnregisteredDerivedAddress(t *testing.T) {
 		t.Fatalf("unregistered address exchange status = %d", w.Code)
 	}
 }
+
+// TestAPIKeyCLICreateReinstates creates a derived sub-account whose address was
+// used before: fmsgid reinstates it, the CLI says so, and when the grant can't
+// be created the address is stopped accepting new messages again.
+func TestAPIKeyCLICreateReinstates(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("conflict=%v", conflict), func(t *testing.T) {
+			database := newAPIKeyCLIDB(t)
+			const owner = "@alice@example.com"
+			const target = "@alice_bot@example.com"
+			if conflict {
+				key, err := apiauth.GenerateAPIKey()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := apiauth.NewStore(database).Create(context.Background(), owner, "bot", target, key.ID,
+					apiauth.HashAPIKey(key.Value), []string{"127.0.0.0/8"}, time.Now().Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var mu sync.Mutex
+			accepting := false // the address exists and was disabled
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/fmsgid/"+owner:
+					_, _ = w.Write([]byte(`{"acceptingNew":true}`))
+				case r.Method == http.MethodGet && r.URL.Path == "/fmsgid/"+target:
+					_ = json.NewEncoder(w).Encode(map[string]bool{"acceptingNew": accepting})
+				case r.Method == http.MethodPost && r.URL.Path == "/fmsgid":
+					var body struct {
+						Address      string `json:"address"`
+						AcceptingNew *bool  `json:"accepting_new"`
+						QuotaPool    string `json:"quota_pool"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Address != target || body.AcceptingNew == nil {
+						t.Errorf("unexpected fmsgid update: %+v, err=%v", body, err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if *body.AcceptingNew && body.QuotaPool != owner {
+						t.Errorf("registration quota_pool = %q, want %s", body.QuotaPool, owner)
+					}
+					reinstated := !accepting && *body.AcceptingNew
+					accepting = *body.AcceptingNew
+					_ = json.NewEncoder(w).Encode(map[string]bool{"created": false, "reinstated": reinstated})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			t.Setenv("FMSG_ID_URL", server.URL)
+			output, err := runCapturedAPIKeyCLI(t, []string{"create", "-owner", owner, "-agent", "bot", "-cidr", "127.0.0.0/8",
+				"-expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
+			mu.Lock()
+			defer mu.Unlock()
+			if conflict {
+				if err == nil {
+					t.Fatal("create succeeded despite an existing grant")
+				}
+				if accepting {
+					t.Fatal("address left reinstated although its grant wasn't created")
+				}
+				return
+			}
+			if err != nil || !strings.Contains(output, "\nreinstated=true\n") || !accepting {
+				t.Fatalf("create: err=%v accepting=%v output=%q", err, accepting, output)
+			}
+		})
+	}
+}

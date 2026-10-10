@@ -46,6 +46,14 @@ type subAccountResponse struct {
 	APIKey       string   `json:"api_key,omitempty"`
 }
 
+type createSubAccountResponse struct {
+	subAccountResponse
+	// Reinstated is true when the derived address had been used before (its
+	// grant was deleted) and is now accepting new messages again, with its
+	// earlier messages still there.
+	Reinstated bool `json:"reinstated"`
+}
+
 func (h *SubAccountHandler) List(c *gin.Context) {
 	owner, ok := requireIdPOwner(c)
 	if !ok {
@@ -126,12 +134,24 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 		return
 	}
 	// Derived sub-accounts belong to an already-verified owner, so register
-	// them in fmsgid automatically rather than requiring a manual step.
-	// RegisterFmsgID never touches an address that already exists there.
-	if err := middleware.RegisterFmsgID(h.idURL, subAddr); err != nil {
+	// them in fmsgid automatically, in the owner's quota pool, rather than
+	// requiring a manual step. Only this owner can derive subAddr, so if it
+	// already exists there it was theirs before and is reinstated.
+	reinstated, err := middleware.RegisterLinkedFmsgID(h.idURL, subAddr, owner)
+	if err != nil {
 		log.Printf("sub-account create: fmsgid registration: addr=%s: %v", subAddr, err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 		return
+	}
+	// undo a reinstatement if no grant comes of it, so a deleted address
+	// doesn't start accepting new messages again without one
+	granted := false
+	if reinstated {
+		defer func() {
+			if !granted {
+				disableAfterFailedCreate(h.idURL, subAddr)
+			}
+		}()
 	}
 	if !checkAcceptingFmsgID(c, h.idURL, subAddr) {
 		return
@@ -147,15 +167,28 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 		respondSubAccountStoreError(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, subAccountResponse{
-		Agent:        in.Agent,
-		Addr:         subAddr,
-		GrantType:    apiauth.GrantTypeDerivedSubAccount,
-		KeyID:        key.ID,
-		AllowedCIDRs: in.AllowedCIDRs,
-		KeyExpiresAt: expires.UTC().Format(time.RFC3339),
-		APIKey:       key.Value,
+	granted = true
+	c.JSON(http.StatusCreated, createSubAccountResponse{
+		subAccountResponse: subAccountResponse{
+			Agent:        in.Agent,
+			Addr:         subAddr,
+			GrantType:    apiauth.GrantTypeDerivedSubAccount,
+			KeyID:        key.ID,
+			AllowedCIDRs: in.AllowedCIDRs,
+			KeyExpiresAt: expires.UTC().Format(time.RFC3339),
+			APIKey:       key.Value,
+		},
+		Reinstated: reinstated,
 	})
+}
+
+// disableAfterFailedCreate stops a reinstated derived address accepting new
+// messages again after its grant couldn't be created. It is best effort: the
+// create has already failed, so a failure here is only logged.
+func disableAfterFailedCreate(idURL, addr string) {
+	if err := middleware.DisableFmsgID(idURL, addr); err != nil {
+		log.Printf("sub-account create: re-disabling reinstated address after failure: addr=%s: %v", addr, err)
+	}
 }
 
 func (h *SubAccountHandler) RotateKey(c *gin.Context) {
@@ -255,6 +288,25 @@ func (h *SubAccountHandler) Delete(c *gin.Context) {
 	if err := apiauth.ValidateAgent(agent); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agent"})
 		return
+	}
+	account, err := h.store.Get(c.Request.Context(), owner, agent)
+	if err != nil {
+		respondSubAccountStoreError(c, err)
+		return
+	}
+	// A derived address exists only for its grant, so stop it accepting new
+	// messages: fmsg hosts then refuse mail to it. Do it before deleting the
+	// grant so that if fmsgid fails the grant is still there and the owner can
+	// retry; deleting first could leave the address accepting mail with
+	// nothing left to retry from. Its messages are kept and creating the
+	// sub-account again reinstates it. A delegated identity is an address in
+	// its own right and is left as it is.
+	if account.GrantType == apiauth.GrantTypeDerivedSubAccount {
+		if err := middleware.DisableFmsgID(h.idURL, account.Addr); err != nil {
+			log.Printf("sub-account delete: fmsgid disable: addr=%s: %v", account.Addr, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
+			return
+		}
 	}
 	if err := h.store.Delete(c.Request.Context(), owner, agent); err != nil {
 		respondSubAccountStoreError(c, err)
