@@ -176,9 +176,11 @@ the plaintext API key once. Creation also requires the fmsgid service configured
 by `FMSG_ID_URL`:
 
 - `create` checks that the owner exists and accepts new messages, registers the
-  derived address with fmsgid's default quotas, and verifies it accepts new
-  messages before storing the key. Existing address settings are preserved;
-  quotas are independent of the owner's.
+  derived address with fmsgid in the owner's quota pool (it shares the owner's
+  quota), reinstates it if it was used before and stopped accepting new
+  messages, and verifies it accepts new messages before storing the key. It
+  prints `reinstated=true` for such an address. Its other settings are
+  preserved.
 - `create-delegation` requires both the owner and delegated address to already
   exist and accept new messages. It does not register either address.
 
@@ -401,8 +403,33 @@ EdDSA owner authentication.
 
 The derived address is `@user_bot@domain`. `agent` may contain letters, digits,
 dots, and hyphens, but not underscores. The derived address is automatically
-registered with fmsgid (with default quotas) if it doesn't already exist there
-— no manual fmsgid step is needed for derived sub-accounts.
+registered with fmsgid, in the owner's quota pool so it shares the owner's
+quota — no manual fmsgid step is needed for derived sub-accounts.
+
+Only the owner can derive `@user_bot@domain`, so if the address already exists
+in fmsgid it is the owner's from before — a sub-account they deleted — and is
+reinstated: it accepts new messages again and its earlier messages are still
+there. The response is the new grant, as from `GET /fmsg/sub-accounts/:agent`,
+plus `api_key` (shown once) and `reinstated`, `true` for a reinstated address
+and `false` for a new one:
+
+```json
+{
+  "agent": "bot",
+  "addr": "@alice_bot@example.com",
+  "grant_type": "derived_sub_account",
+  "key_id": "abc",
+  "allowed_cidrs": ["203.0.113.0/24"],
+  "key_expires_at": "2026-12-31T00:00:00Z",
+  "api_key": "...",
+  "reinstated": true
+}
+```
+
+If the grant can't be created (e.g. `409` or the sub-account limit), a
+reinstated address is stopped accepting new messages again. Reinstating and
+pooling need an fmsgid that supports `accepting_new` and `quota_pool` on
+`POST /fmsgid`; with an older one `reinstated` is always `false`.
 
 Delegated identities such as `@sales@example.com` are not created by this
 self-service route. They are operator-created with `api-key create-delegation`
@@ -436,6 +463,13 @@ new plaintext key once. Requires `key_expires_at`. Does not touch
 
 Deletes a grant row and revokes future token exchange. Existing JWTs for that
 key are rejected on their next protected-route request.
+
+For a derived sub-account the address is first stopped accepting new messages
+in fmsgid (`accepting_new` false), so fmsg hosts refuse new mail to it; it and
+its messages are kept, and creating the same sub-account again reinstates it.
+If fmsgid can't be updated — unavailable, or a version without `accepting_new`
+— the delete fails with `503` and the grant is kept, so it can be retried.
+Delegated identities are addresses in their own right and are left as they are.
 
 ### GET `/fmsg/ws`
 

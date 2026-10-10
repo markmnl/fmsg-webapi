@@ -55,9 +55,21 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 		return err
 	}
 	// Match the self-service sub-account flow: derived addresses are created in
-	// fmsgid before their API key is persisted.
-	if err := middleware.RegisterFmsgID(idURL, subAddr); err != nil {
+	// fmsgid, in the owner's quota pool, before their API key is persisted, and
+	// one used before is reinstated.
+	reinstated, err := middleware.RegisterLinkedFmsgID(idURL, subAddr, *owner)
+	if err != nil {
 		return fmt.Errorf("registering derived address with fmsgid: %w", err)
+	}
+	granted := false
+	if reinstated {
+		defer func() {
+			if !granted {
+				if err := middleware.DisableFmsgID(idURL, subAddr); err != nil {
+					fmt.Fprintf(os.Stderr, "re-disabling reinstated address %s: %v\n", subAddr, err)
+				}
+			}
+		}()
 	}
 	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
 		return err
@@ -72,7 +84,9 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	if err := store.Create(ctx, *owner, *agent, subAddr, key.ID, hash, allowed, expires); err != nil {
 		return err
 	}
+	granted = true
 	printCLIKey(*owner, *agent, subAddr, key)
+	fmt.Printf("reinstated=%t\n", reinstated)
 	return nil
 }
 

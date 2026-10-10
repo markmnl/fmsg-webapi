@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -516,28 +517,89 @@ func CheckFmsgID(idURL, addr string) (int, bool, error) {
 	return res.code, res.acceptingNew, nil
 }
 
-// RegisterFmsgID registers addr with fmsgid using default quotas, idempotently.
-// It never modifies an address that already exists there.
-func RegisterFmsgID(idURL, addr string) error {
-	payload, err := json.Marshal(struct {
-		Address string `json:"address"`
-	}{Address: addr})
+// fmsgIDAddressReq is the body of fmsgid's POST /fmsgid, which registers an
+// address idempotently and applies accepting_new and quota_pool, when given,
+// whether or not the address already existed.
+type fmsgIDAddressReq struct {
+	Address      string `json:"address"`
+	AcceptingNew *bool  `json:"accepting_new,omitempty"`
+	QuotaPool    string `json:"quota_pool,omitempty"`
+}
+
+// fmsgIDAddressResp is fmsgid's answer to POST /fmsgid. fmsgid versions that
+// don't support accepting_new and quota_pool answer with no body.
+type fmsgIDAddressResp struct {
+	Created    bool `json:"created"`
+	Reinstated bool `json:"reinstated"`
+}
+
+// errFmsgIDNoAcceptingNew is returned when fmsgid answers POST /fmsgid without
+// a body, i.e. it is a version that ignores accepting_new.
+var errFmsgIDNoAcceptingNew = errors.New("fmsgid does not support accepting_new on POST /fmsgid; upgrade fmsgid")
+
+// RegisterLinkedFmsgID registers a linked address — a derived sub-account
+// address such as @alice_bot@example.com — with fmsgid, idempotently, in its
+// owner's quota pool and accepting new messages. Only its owner can derive a
+// linked address, so one that already exists there was this owner's before:
+// it is reinstated, with its earlier messages, and reinstated reports whether
+// it had stopped accepting new messages (e.g. its grant was deleted).
+func RegisterLinkedFmsgID(idURL, addr, owner string) (reinstated bool, err error) {
+	accepting := true
+	resp, err := postFmsgIDAddress(idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting, QuotaPool: owner})
+	if err != nil {
+		return false, err
+	}
+	return resp != nil && resp.Reinstated, nil
+}
+
+// DisableFmsgID stops addr accepting new messages in fmsgid, so fmsg hosts
+// refuse new messages to it. The address, its messages and its usage are kept,
+// so its owner can reinstate it with RegisterLinkedFmsgID.
+func DisableFmsgID(idURL, addr string) error {
+	accepting := false
+	resp, err := postFmsgIDAddress(idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting})
 	if err != nil {
 		return err
+	}
+	if resp == nil {
+		return errFmsgIDNoAcceptingNew
+	}
+	return nil
+}
+
+// postFmsgIDAddress POSTs req to fmsgid's /fmsgid and drops the cached lookup
+// of the address. The response is nil when fmsgid answers without a body.
+func postFmsgIDAddress(idURL string, req fmsgIDAddressReq) (*fmsgIDAddressResp, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
 	}
 
 	url := strings.TrimRight(idURL, "/") + "/fmsgid"
 	resp, err := fmsgIDClient.Post(url, "application/json", bytes.NewReader(payload)) //nolint:gosec // URL constructed from trusted config
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
+	// whatever fmsgid did, the cached lookup may now be stale
+	fmsgIDCache.Delete(fmsgIDAddressURL(idURL, req.Address))
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
 	}
-	fmsgIDCache.Delete(fmsgIDAddressURL(idURL, addr))
-	return nil
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return nil, fmt.Errorf("reading fmsgid registration response: %w", err)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, nil
+	}
+	var out fmsgIDAddressResp
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decoding fmsgid registration response: %w", err)
+	}
+	return &out, nil
 }
 
 func fmsgIDAddressURL(idURL, addr string) string {
