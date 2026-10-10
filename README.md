@@ -17,6 +17,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 - [Running](#running)
   - [TLS mode (production)](#tls-mode-production)
   - [Plain HTTP mode (development / reverse proxy)](#plain-http-mode-development--reverse-proxy)
+- [Quotas](#quotas)
 - [API Routes](#api-routes)
   - [Token and sub-account routes](#post-fmsgtoken)
   - [WebSocket route](#get-fmsgws)
@@ -288,6 +289,38 @@ and `IdleTimeout: 120s`. The write timeout is generous so large attachment
 transfers are not dropped prematurely. These timeouts do not apply to
 `/fmsg/ws` connections: once upgraded, a WebSocket connection is hijacked from
 the HTTP server and kept alive by its own ping/pong heartbeat.
+
+## Quotas
+
+fmsgid holds each address's limits and usage (`-1` is unlimited; an address in
+a quota pool has its pool owner's limits and the whole pool's usage). fmsgd
+checks and records mail it receives from other hosts. This service checks and
+records the rest: the mail it sends, and the mail it delivers between local
+addresses, which never passes through fmsgd.
+
+- **Sending.** Before a message is sent (`POST /fmsg/:id/send`, and the
+  reaction message `POST /fmsg/:id/react` sends), the sender's current limits
+  and usage are fetched from fmsgid and the message refused if it is bigger
+  than the per-message send size (`413`), or would exceed the messages sent per
+  day or bytes sent per day (`429`) or total bytes sent (`422`). Once sent, the
+  message is recorded once with `POST /fmsgid/send`, however many recipients it
+  has. Adding recipients with add-to doesn't send a new message, so it isn't
+  counted against send limits; each new local recipient is checked and counted
+  when it receives the message.
+- **Local delivery.** Each local recipient gets the checks fmsgd makes: unknown
+  (`100`), not accepting new messages (`102`), or over its messages received per
+  day, bytes received per day or total bytes received for one more message of
+  this size (`101`, user full). Those recipients aren't delivered, and their
+  code is recorded as their `response_code` in `to_delivery`/`add_to`. Each
+  recipient that is delivered is recorded with `POST /fmsgid/recv`.
+
+Sizes are the stored size: the body plus every attachment. Usage is
+timestamped when this service sent or delivered the message. The checks use
+fmsgid's current usage, never the lookup cached for authentication, which only
+holds whether the address exists and accepts new messages. If fmsgid can't be
+reached a send is refused with `503`, and a local recipient is left pending.
+Failing to record usage is logged and never fails the request, since the
+message has already been sent.
 
 ## API Routes
 
@@ -755,6 +788,14 @@ third-party delivery's outcome, so the reply is attempted and the wire's
 originating domain always passes (it retains its outgoing messages). Local
 recipients are unaffected.
 
+The sender's send limits are then checked against the message's size, the
+body plus its attachments (see [Quotas](#quotas)). A refusal leaves the
+message a draft, and carries a `code` naming the limit:
+`{"error": "daily message limit reached", "code": "send_count_per_1d_limit"}`.
+
+Local recipients are delivered at once, each subject to its receive limits;
+a recipient over one is not delivered and its `response_code` is `101`.
+
 **Response:** `200 OK` with `{"id": <int>, "time": <float64>, "sha256": "<64 hex characters>"}`.
 
 **Errors:**
@@ -762,10 +803,14 @@ recipients are unaffected.
 | Status | Condition |
 | ------ | --------- |
 | `400`  | Message is not sendable (no recipients, invalid recipient address, no type, unsupported version) |
-| `403`  | Not the owner |
+| `403`  | Not the owner, or the sender is no longer in fmsgid or accepting new messages |
 | `404`  | Message not found |
 | `409`  | Message already sent |
 | `409`  | Reply can never be accepted by one or more remote recipient domains (parent never addressed there, or its delivery there failed) |
+| `413`  | Message is bigger than the sender's per-message send size (`send_size_per_msg_limit`) |
+| `422`  | Sender's total sent bytes would exceed its limit, `storage limit reached` (`send_size_total_limit`) |
+| `429`  | Sender's messages per day (`send_count_per_1d_limit`) or bytes per day (`send_size_per_1d_limit`) would exceed its limit |
+| `503`  | fmsgid unavailable, so the send limits can't be checked |
 
 ### POST `/fmsg/:id/read`
 
@@ -795,6 +840,11 @@ This endpoint records the add-to as a new `msg_add_to_batch` row (capturing the 
 
 New addresses must be distinct among themselves (case-insensitive).
 
+On a sent message, new local recipients are delivered at once, each subject to
+its receive limits (a recipient over one gets `response_code` `101`). Adding
+recipients isn't counted against the caller's send limits (see
+[Quotas](#quotas)).
+
 **Response:** `200 OK` with `{"id": <int>, "added": <int>, "batch_id": <int>, "sha256": "<64 hex characters>"}`. On a draft, the batch hash is `null` until send finalizes it.
 
 **Errors:**
@@ -816,8 +866,10 @@ in `to` or `add_to` — and the message must be sent and not terminal.
 The reaction is sent immediately as a reaction message: a reply to `:id` with
 `no_reply` and `terminal` set, type `text/plain;charset=UTF-8`, body the emoji,
 addressed to every other participant of the message. Delivery then proceeds
-exactly as for any sent message. A reaction message cannot be replied to,
-reacted to, or have recipients added.
+exactly as for any sent message, and like any message it counts against the
+reactor's send limits and each local recipient's receive limits (see
+[Quotas](#quotas)). A reaction message cannot be replied to, reacted to, or
+have recipients added.
 
 **Request body (JSON):**
 
@@ -839,6 +891,8 @@ the caller has no reaction returns `200 OK` with `null` values.
 | `403`  | Authenticated identity is not a participant |
 | `404`  | Message not found |
 | `409`  | Message is a draft, is terminal, has no other participants, or a remote recipient host cannot accept the reaction because it does not hold the message |
+| `413`, `422`, `429` | The reaction would exceed one of the reactor's send limits, as for send |
+| `503`  | fmsgid unavailable, so the send limits can't be checked |
 
 ### GET `/fmsg/:id/data`
 

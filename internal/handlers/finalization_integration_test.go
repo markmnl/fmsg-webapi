@@ -31,6 +31,15 @@ type finalizationAPI struct {
 
 func newFinalizationAPI(t *testing.T) *finalizationAPI {
 	t.Helper()
+	return newFinalizationAPIWithID(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"acceptingNew":true}`)
+	}))
+}
+
+// newFinalizationAPIWithID is newFinalizationAPI with fmsgid served by fmsgID.
+func newFinalizationAPIWithID(t *testing.T, fmsgID http.Handler) *finalizationAPI {
+	t.Helper()
 	dsn := os.Getenv("FMSG_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("set FMSG_TEST_DATABASE_URL to run PostgreSQL integration tests")
@@ -66,10 +75,7 @@ func newFinalizationAPI(t *testing.T) *finalizationAPI {
 	if _, err = pool.Exec(ctx, string(sql)); err != nil {
 		t.Fatal(err)
 	}
-	id := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"acceptingNew":true}`)
-	}))
+	id := httptest.NewServer(fmsgID)
 	t.Cleanup(id.Close)
 	h := NewMessageHandler(&db.DB{Pool: pool}, t.TempDir(), 1<<20, 2<<20, 256, nil, id.URL, "example.com")
 	a := NewAttachmentHandler(h.DB, h.DataDir, 1<<20, 2<<20)

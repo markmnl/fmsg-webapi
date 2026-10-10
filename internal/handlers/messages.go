@@ -112,40 +112,56 @@ func formatDeliveredISO(t *float64) *string {
 // skips the local domain (no network hop is needed), so it never sets
 // time_delivered/response_code for same-domain recipients — fmsg-webapi has
 // to resolve that status itself via fmsgid, the same source fmsgd would have
-// consulted. Errors talking to fmsgid are logged and left pending (no status
-// written) rather than treated as a delivery failure.
+// consulted, with the same checks: unknown (100), not accepting (102), or
+// over a receive limit (101, user full) for one more message of the message's
+// stored size. A delivered recipient's usage is recorded with fmsgid, at the
+// delivery time. fmsgid is asked afresh for every recipient (not the cached
+// lookup), since usage changes with every message. Errors talking to fmsgid
+// are logged and left pending (no status written) rather than treated as a
+// delivery failure; a failure to record usage is only logged.
 func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string, msgID int64, localDomain string, addrs []string) {
 	now := float64(time.Now().UnixMicro()) / 1e6
 	query := "UPDATE " + table + " SET time_delivered = $1, response_code = $2 WHERE msg_id = $3 AND addr = $4 AND time_delivered IS NULL AND response_code IS NULL"
+	size := int64(-1) // the message's stored size, loaded once it is needed
 	for _, addr := range addrs {
 		_, domain := parseAddr(addr)
 		if !strings.EqualFold(domain, localDomain) {
 			continue // remote — fmsgd handles this
 		}
-		code, accepting, err := middleware.CheckFmsgID(h.IDURL, addr)
+		detail, status, err := middleware.FetchFmsgIDDetail(h.IDURL, addr)
 		if err != nil {
 			log.Printf("resolve local delivery: fmsgid check %s: %v", addr, err)
 			continue
 		}
-		var delivered *float64
-		var responseCode *int
-		switch {
-		case code == http.StatusNotFound:
-			rc := 100 // user unknown
-			responseCode = &rc
-		case code == http.StatusOK && !accepting:
-			rc := 102 // user not accepting
-			responseCode = &rc
-		case code == http.StatusOK && accepting:
-			rc := 200 // accept
-			responseCode = &rc
-			delivered = &now
-		default:
-			log.Printf("resolve local delivery: unexpected fmsgid status %d for %s", code, addr)
+		if size < 0 && status == http.StatusOK {
+			if size, err = h.messageStoredSize(ctx, msgID); err != nil {
+				log.Printf("resolve local delivery: size of msg %d: %v", msgID, err)
+				size = -1
+				continue
+			}
+		}
+		code, ok := localDeliveryCode(status, detail, size)
+		if !ok {
+			log.Printf("resolve local delivery: unexpected fmsgid status %d for %s", status, addr)
 			continue
 		}
-		if _, err := h.q().Exec(ctx, query, delivered, responseCode, msgID, addr); err != nil {
+		var delivered *float64
+		if code == responseCodeAccept {
+			delivered = &now
+		} else if code == responseCodeUserFull {
+			log.Printf("resolve local delivery: msg %d to %s refused: over a receive limit", msgID, addr)
+		}
+		tag, err := h.q().Exec(ctx, query, delivered, code, msgID, addr)
+		if err != nil {
 			log.Printf("resolve local delivery: update %s msg %d addr %s: %v", table, msgID, addr, err)
+			continue
+		}
+		// Record usage only for the delivery made here, never for a row
+		// another request had already resolved.
+		if delivered != nil && tag.RowsAffected() > 0 {
+			if err := middleware.RecordFmsgIDRecv(h.IDURL, addr, now, size); err != nil {
+				log.Printf("resolve local delivery: record recv usage %s msg %d: %v", addr, msgID, err)
+			}
 		}
 	}
 }
@@ -961,6 +977,18 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		}
 	}
 
+	// The sender's send limits, for the message's stored size (body plus
+	// attachments). The message is counted once, however many recipients.
+	size, err := h.messageStoredSize(ctx, msgID)
+	if err != nil {
+		log.Printf("send message %d: size: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
+	if !h.checkSendQuota(c, existing.From, size) {
+		return
+	}
+
 	now := float64(time.Now().UnixMicro()) / 1e6
 	tx, ok := h.query.(pgx.Tx)
 	if !ok {
@@ -981,6 +1009,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	afterCommit(c, func() {
 		plain := *h
 		plain.query = nil
+		plain.recordSend(existing.From, now, size)
 		plain.resolveLocalDelivery(ctx, "msg_to", msgID, h.LocalDomain, existing.To)
 		for _, b := range existing.AddTo {
 			plain.resolveLocalDelivery(ctx, "msg_add_to", msgID, h.LocalDomain, b.To)
