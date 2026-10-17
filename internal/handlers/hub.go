@@ -19,6 +19,7 @@ const (
 	eventDelivered       = "delivered"
 	eventRecipientsAdded = "recipients_added"
 	eventReaction        = "reaction"
+	eventRead            = "read"
 )
 
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
@@ -118,9 +119,9 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 }
 
-// listen opens a dedicated connection, LISTENs on new_msg and delivered, and
-// dispatches every notification until the connection fails or ctx is
-// cancelled. onConnected is invoked once both LISTENs have succeeded so the
+// listen opens a dedicated connection, LISTENs on every notification channel,
+// and routes each notification until the connection fails or ctx is
+// cancelled. onConnected is invoked once every LISTEN has succeeded so the
 // caller can reset its backoff.
 func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	// An empty connection string makes pgx read the standard PG* environment
@@ -140,7 +141,10 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	if _, err := conn.Exec(ctx, "LISTEN recipients_added"); err != nil {
 		return err
 	}
-	log.Println("ws hub: listening on new_msg, delivered, recipients_added")
+	if _, err := conn.Exec(ctx, "LISTEN msg_read"); err != nil {
+		return err
+	}
+	log.Println("ws hub: listening on new_msg, delivered, recipients_added, msg_read")
 	onConnected()
 
 	for {
@@ -153,37 +157,48 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 			log.Printf("ws hub: ignoring malformed notification payload %q", n.Payload)
 			continue
 		}
-		switch n.Channel {
-		case "new_msg":
-			if h.reactionSubject != nil {
-				if subject, ok := h.reactionSubject(ctx, msgID); ok {
-					// FMSG-005: a reaction is a low-priority event on its
-					// subject, not a new message. No Web Push is sent.
-					h.dispatch(ctx, subject, addr, eventReaction)
-					continue
-				}
+		h.route(ctx, n.Channel, msgID, addr)
+	}
+}
+
+// route handles one notification on channel for message msgID and address
+// addr.
+func (h *Hub) route(ctx context.Context, channel string, msgID int64, addr string) {
+	switch channel {
+	case "new_msg":
+		if h.reactionSubject != nil {
+			if subject, ok := h.reactionSubject(ctx, msgID); ok {
+				// FMSG-005: a reaction is a low-priority event on its
+				// subject, not a new message. No Web Push is sent.
+				h.dispatch(ctx, subject, addr, eventReaction)
+				return
 			}
-			// Web Push runs in its own goroutine: it is network I/O to many
-			// endpoints and must not stall the single listener. It is
-			// dispatched here, alongside (not inside) dispatch, so a push is
-			// sent even when the recipient has no live WebSocket.
-			if h.notifyPush != nil {
-				go h.notifyPush(ctx, msgID, addr)
-			}
-			h.dispatch(ctx, msgID, addr, eventNewMsg)
-		case "delivered":
-			// addr here is the message's sender (see notify_delivered in
-			// dd.sql), not a recipient -- no Web Push for this event yet.
-			h.dispatch(ctx, msgID, addr, eventDelivered)
-		case "recipients_added":
-			// An add-to batch was recorded against the message; addr is one
-			// of its participants (see notify_recipients_added in fmsgd's
-			// dd.sql). Pushes the refreshed message so clients can show the
-			// updated recipient list.
-			h.dispatch(ctx, msgID, addr, eventRecipientsAdded)
-		default:
-			log.Printf("ws hub: ignoring notification on unknown channel %q", n.Channel)
 		}
+		// Web Push runs in its own goroutine: it is network I/O to many
+		// endpoints and must not stall the single listener. It is
+		// dispatched here, alongside (not inside) dispatch, so a push is
+		// sent even when the recipient has no live WebSocket.
+		if h.notifyPush != nil {
+			go h.notifyPush(ctx, msgID, addr)
+		}
+		h.dispatch(ctx, msgID, addr, eventNewMsg)
+	case "delivered":
+		// addr here is the message's sender (see notify_delivered in
+		// dd.sql), not a recipient -- no Web Push for this event yet.
+		h.dispatch(ctx, msgID, addr, eventDelivered)
+	case "msg_read":
+		// A recipient marked the message read (see MarkRead); addr is that
+		// recipient. Pushes the message with its read state so the reader's
+		// other tabs and devices stop showing it as unread.
+		h.dispatch(ctx, msgID, addr, eventRead)
+	case "recipients_added":
+		// An add-to batch was recorded against the message; addr is one
+		// of its participants (see notify_recipients_added in fmsgd's
+		// dd.sql). Pushes the refreshed message so clients can show the
+		// updated recipient list.
+		h.dispatch(ctx, msgID, addr, eventRecipientsAdded)
+	default:
+		log.Printf("ws hub: ignoring notification on unknown channel %q", channel)
 	}
 }
 

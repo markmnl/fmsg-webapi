@@ -1096,6 +1096,13 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 		return
 	}
 
+	// Tell the reader's other connections, so another tab or device stops
+	// showing the message as unread. A failure is logged: the message is read.
+	if _, err = h.q().Exec(ctx, `SELECT pg_notify('msg_read', $1)`,
+		fmt.Sprintf("%d,%s", msgID, identity)); err != nil {
+		log.Printf("mark read %d: notify: %v", msgID, err)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "time_read": now})
 }
 
