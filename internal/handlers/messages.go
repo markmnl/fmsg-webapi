@@ -322,8 +322,9 @@ func (h *MessageHandler) List(c *gin.Context) {
 		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
 		        ) AS time_read
 		 FROM msg m
-		 WHERE EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1))
-		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
+		 WHERE m.time_sent IS NOT NULL
+		   AND (EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1))
+		     OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1)))
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
 		addrs, limit, offset,
@@ -620,6 +621,11 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		return
 	}
 
+	if draftHidden(addrs, msg.From, msg.Time) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+
 	// Authorization: owner or recipient (to or add_to), across all visible addrs.
 	isSender := isRecipient(addrs, msg.From)
 	if !isSender && !anyRecipient(addrs, msg.To) && !anyAddToContains(addrs, msg.AddTo) {
@@ -673,9 +679,10 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 	// Fetch message metadata for auth check and file path.
 	var fromAddr string
 	var dataPath string
+	var timeSent *float64
 	err = h.q().QueryRow(ctx,
-		"SELECT from_addr, filepath FROM msg WHERE id = $1", msgID,
-	).Scan(&fromAddr, &dataPath)
+		"SELECT from_addr, filepath, time_sent FROM msg WHERE id = $1", msgID,
+	).Scan(&fromAddr, &dataPath, &timeSent)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -683,6 +690,10 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 			log.Printf("download data: fetch msg %d: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		}
+		return
+	}
+	if draftHidden(addrs, fromAddr, timeSent) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
 
@@ -1042,8 +1053,9 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 		        (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2)),
 		        (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2))
 		    ),
-		    EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2))
-		    OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2))`,
+		    (EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = $1 AND lower(mt.addr) = lower($2))
+		     OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = $1 AND lower(mat.addr) = lower($2)))
+		    AND EXISTS (SELECT 1 FROM msg m WHERE m.id = $1 AND m.time_sent IS NOT NULL)`,
 		msgID, identity,
 	).Scan(&existing, &recipient)
 	if err != nil {
@@ -1136,6 +1148,10 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 			log.Printf("add recipients: fetch msg %d: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		}
+		return
+	}
+	if draftHidden([]string{identity}, fromAddr, timeSent) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
 	// A terminal message is a leaf: recipients cannot be added to it (fmsg
@@ -1601,6 +1617,13 @@ func parseLimitOffset(c *gin.Context) (int, int, bool) {
 // ownership checks must never compare bytes.
 func sameAddr(a, b string) bool {
 	return strings.EqualFold(a, b)
+}
+
+// draftHidden reports whether a message is a draft that none of addrs sent. A
+// draft is its sender's alone: until it is sent, its recipients get 404 for it
+// on every route, as if it did not exist.
+func draftHidden(addrs []string, from string, timeSent *float64) bool {
+	return timeSent == nil && !isRecipient(addrs, from)
 }
 
 func isRecipient(to []string, addr string) bool {

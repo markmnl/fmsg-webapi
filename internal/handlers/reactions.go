@@ -326,6 +326,10 @@ func (h *MessageHandler) React(c *gin.Context) {
 		return
 	}
 
+	if draftHidden([]string{identity}, subject.From, subject.Time) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
 	// Only a participant of the subject may react to it (the host enforces
 	// the same rule on the wire).
 	if !strings.EqualFold(subject.From, identity) && !isRecipient(subject.To, identity) && !addToContains(subject.AddTo, identity) {
