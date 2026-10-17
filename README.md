@@ -434,6 +434,9 @@ EdDSA owner authentication.
 }
 ```
 
+`allowed_cidrs` is required and must hold at least one CIDR range; the API key
+works only from those ranges (`["0.0.0.0/0", "::/0"]` allows any address).
+
 The derived address is `@user_bot@domain`. `agent` may contain letters, digits,
 dots, and hyphens, but not underscores. The derived address is automatically
 registered with fmsgid, in the owner's quota pool so it shares the owner's
@@ -476,7 +479,8 @@ shape as one entry from `GET /fmsg/sub-accounts`.
 
 ### PATCH `/fmsg/sub-accounts/:agent`
 
-Replaces a grant's allowed CIDRs without rotating its API key.
+Replaces a grant's allowed CIDRs without rotating its API key. `allowed_cidrs`
+must hold at least one CIDR range.
 
 ```json
 {
@@ -491,6 +495,19 @@ Replaces a grant's allowed CIDRs without rotating its API key.
 Rotates any grant API key owned by the EdDSA-authenticated user and returns the
 new plaintext key once. Requires `key_expires_at`. Does not touch
 `allowed_cidrs` — use `PATCH /fmsg/sub-accounts/:agent` for that.
+
+**Response:** `200 OK`:
+
+```json
+{
+  "agent": "bot",
+  "addr": "@alice_bot@example.com",
+  "grant_type": "derived_sub_account",
+  "key_id": "def",
+  "key_expires_at": "2027-06-30T00:00:00Z",
+  "api_key": "..."
+}
+```
 
 ### DELETE `/fmsg/sub-accounts/:agent`
 
@@ -565,7 +582,7 @@ has read the message.
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `limit`   | `20`    | Max messages to return (1–100) |
+| `limit`   | `20`    | Max messages to return (at least 1; values above 100 return 100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
 **Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /fmsg/:id` (with an additional `id` field), including the `read`/`time_read` fields reflecting the caller's per-recipient read state. Message body data and attachment contents are not included — use the dedicated download endpoints instead.
@@ -580,7 +597,7 @@ This includes both sent messages and drafts (`time_sent` may be `NULL`).
 
 | Parameter | Default | Description |
 | --------- | ------- | ----------- |
-| `limit`   | `20`    | Max messages to return (1–100) |
+| `limit`   | `20`    | Max messages to return (at least 1; values above 100 return 100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
 
 **Response:** JSON array of message objects with the same shape as `GET /fmsg`.
@@ -595,13 +612,13 @@ Add-to recipients are not part of this body — they are added later via `POST /
 
 | Field       | Type       | Required | Description |
 | ----------- | ---------- | -------- | ----------- |
-| `version`   | `int`      | yes      | Protocol version (currently `1`) |
+| `version`   | `int`      | to send  | Protocol version (currently `1`); checked when the draft is sent |
 | `from`      | `string`   | yes      | Sender address (`@user@domain`), must match JWT identity |
 | `to`        | `string[]` | yes      | Recipient addresses (at least one) |
 | `pid`       | `int`      | no       | Parent message ID (required for replies) |
 | `topic`     | `string`   | no       | Thread topic (only on root messages without `pid`) |
-| `type`      | `string`   | yes      | MIME type of the message body |
-| `size`      | `int`      | yes      | Data size in bytes |
+| `type`      | `string`   | to send  | MIME type of the message body; checked when the draft is sent |
+| `size`      | `int`      | no       | Ignored: the stored size is the length of `data` |
 | `important` | `bool`     | no       | Mark message as important |
 | `no_reply`  | `bool`     | no       | Indicate replies will be discarded |
 | `terminal`  | `bool`     | no       | Mark the message terminal: a leaf nobody can reply to or add recipients to (fmsg Specification v0.6.0 flag bit 6, enforced by every host) |
@@ -616,6 +633,7 @@ Add-to recipients are not part of this body — they are added later via `POST /
 | `400`  | Missing/invalid fields, empty `to`, `topic` set together with `pid`, or `pid` not found |
 | `403`  | `from` does not match authenticated user |
 | `409`  | `pid` references a terminal message, which cannot be replied to |
+| `413`  | `data` is larger than `FMSG_API_MAX_DATA_SIZE` |
 
 ### GET `/fmsg/:id`
 
@@ -625,10 +643,11 @@ Retrieves a single message by ID. The authenticated identity must be a participa
 
 ```json
 {
+  "sha256": null,
+  "psha256": null,
   "version": 1,
   "has_pid": false,
-  "has_add_to": false,
-  "common_type": false,
+  "has_add_to": true,
   "important": false,
   "no_reply": false,
   "deflate": false,
@@ -641,6 +660,7 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   ],
   "add_to": [
     {
+      "sha256": null,
       "batch_id": 42,
       "add_to_from": "@bob@example.com",
       "to": ["@carol@example.com", "@dave@example.com"],
@@ -658,13 +678,16 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   "short_text": "hello world",
   "read": false,
   "time_read": null,
-  "attachments": [],
+  "attachments": null,
   "reaction": null,
   "reactions": [
     { "emoji": "👍", "from": ["@bob@example.com", "@carol@example.com"] }
   ]
 }
 ```
+
+`to`, `to_delivery`, `add_to` and `attachments` are `null`, not `[]`, when
+there are none; `reactions` is always an array.
 
 `terminal` is the fmsg _terminal_ flag: the message is a leaf of its thread
 and no host will accept a reply to it or an add-to on it.
@@ -716,7 +739,9 @@ a UTF-8 rune boundary, so UIs can render a preview without a separate
 
 ### PUT `/fmsg/:id`
 
-Updates a draft message. Only the owner (`from`) may update, and the message must not have been sent yet. Accepts the same body as `POST /fmsg`. Recipients in `to` are fully replaced.
+Updates a draft message. Only the owner (`from`) may update, and the message must not have been sent yet. Accepts the same body as `POST /fmsg`, except that `to` may be empty. Recipients in `to` are fully replaced.
+
+**Response:** `200 OK` with `{"id": <int>}`.
 
 **Errors:**
 
@@ -726,6 +751,7 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 | `409`  | `pid` references a terminal message, which cannot be replied to |
+| `413`  | `data` is larger than `FMSG_API_MAX_DATA_SIZE`, or `data` plus attachments is larger than `FMSG_API_MAX_MSG_SIZE` |
 
 ### DELETE `/fmsg/:id`
 
@@ -768,8 +794,9 @@ original or batch. Client-provided `sha256`/`psha256` values are not trusted.
 
 Atomically stamps `time_sent`, computes the protocol `sha256`, and retains the finalized wire representation. This happens for local-only delivery too. Only the owner may send. Compression and common media type encoding are chosen before hashing; future federation reuses that representation. A failure leaves the message a draft. Concurrent edits, attachment changes, deletion, and send are serialized; sent content is immutable.
 
-**Send is the validation gate.** Drafts are a workspace: create/update accept
-incomplete messages (no recipients, no type) by design, but a draft may only
+**Send is the validation gate.** Drafts are a workspace: create accepts a draft
+without a `type` or `version`, and update one without recipients too, by
+design, but a draft may only
 be *sent* when it is a complete, valid fmsg message — at least one
 well-formed recipient, a `type`, and a supported `version`. An incomplete
 draft is refused with `400` listing every problem.
@@ -983,6 +1010,7 @@ truncated.
 | `404`  | Requested message does not exist |
 | `413`  | Aggregate inline text exceeds 32 MiB (`thread_too_large`) |
 | `422`  | Direct ancestry exceeds 100 messages (`thread_too_deep`) |
+| `500`  | A message body in the thread couldn't be read (`thread_data_unavailable`) |
 
 ### POST `/fmsg/:id/attach`
 
@@ -999,6 +1027,7 @@ Uploads a file attachment for a draft message. Only the owner may upload, and th
 | `400`  | Missing or invalid `file` field |
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
+| `413`  | The file is larger than `FMSG_API_MAX_ATTACH_SIZE`, or data plus attachments is larger than `FMSG_API_MAX_MSG_SIZE` |
 
 ### GET `/fmsg/:id/attach/:filename`
 
