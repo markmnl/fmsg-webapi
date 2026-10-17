@@ -571,6 +571,10 @@ ws.onmessage = (e) => {
 
 Returns messages where the authenticated identity is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
 
+Only sent messages are listed. A draft is its sender's alone: until it is sent,
+its recipients get `404` for it on every route (get, data, attachments, thread,
+read, react and add-to), as if it did not exist.
+
 Visibility is always scoped to exactly the one identity the caller
 authenticated as — the owner, or (via a sub-account's own API-key token or
 the owner's `X-FMSG-Act-As` header) a single sub-account. A request never

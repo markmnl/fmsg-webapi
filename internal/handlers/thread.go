@@ -289,8 +289,9 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		)
 		SELECT c.id, c.from_addr, c.time_sent, c.type, c.size, c.filepath,
 		       (lower(c.from_addr) = ANY($2)
-		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
-		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2))) AS readable
+		        OR (c.time_sent IS NOT NULL
+		            AND (EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
+		                 OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2))))) AS readable
 		FROM chain c ORDER BY c.depth DESC`,
 		msgID, addrs, threadMaxHops,
 	)
@@ -326,8 +327,12 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 
 	// Authorization gate is the requested message itself, same as GET
 	// /fmsg/:id — a non-participant learns nothing, not even chain shape.
-	if !entries[len(entries)-1].Readable {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+	if last := entries[len(entries)-1]; !last.Readable {
+		if last.TimeSent == nil { // someone else's draft
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		} else {
+			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		}
 		return
 	}
 
@@ -395,8 +400,9 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		       c.is_terminal, c.time_sent, c.from_addr, c.topic, c.type, c.size, c.filepath,
 		       encode(c.sha256, 'hex'), encode(c.psha256, 'hex'),
 		       (lower(c.from_addr) = ANY($2)
-		        OR EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
-		        OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2)))
+		        OR (c.time_sent IS NOT NULL
+		            AND (EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
+		                 OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2)))))
 		FROM chain c ORDER BY c.depth DESC`, msgID, addrs, threadMaxHops)
 	if err != nil {
 		log.Printf("thread messages: walk %d: %v", msgID, err)
@@ -429,8 +435,12 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
-	if !messages[len(messages)-1].Visible {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+	if last := messages[len(messages)-1]; !last.Visible {
+		if last.Time == nil { // someone else's draft
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		} else {
+			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		}
 		return
 	}
 	if len(messages) == threadMaxHops && messages[0].PID != nil {

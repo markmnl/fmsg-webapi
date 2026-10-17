@@ -187,7 +187,8 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 
 	// Check ownership or recipient access.
 	var fromAddr string
-	err := h.q().QueryRow(ctx, "SELECT from_addr FROM msg WHERE id = $1", msgID).Scan(&fromAddr)
+	var timeSent *float64
+	err := h.q().QueryRow(ctx, "SELECT from_addr, time_sent FROM msg WHERE id = $1", msgID).Scan(&fromAddr, &timeSent)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -195,6 +196,10 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 			log.Printf("download attachment: fetch msg %d: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		}
+		return
+	}
+	if draftHidden([]string{identity}, fromAddr, timeSent) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
 
