@@ -552,6 +552,7 @@ event types can be added without breaking clients:
 | `new_msg`  | A message object, same shape as an item in the `GET /fmsg` list response (includes `id`). | A new message arrives for the authenticated user. Not sent for reactions. |
 | `delivered` | The refreshed message object. | A recipient's delivery state changed on a message the user sent. |
 | `recipients_added` | The refreshed message object. | An add-to batch was recorded on a message the user participates in. |
+| `read` | The message object, with `read` and `time_read` set. | The user marked a message read (`POST /fmsg/:id/read`), on this or any other connection, so every tab and device can stop showing it as unread. Sent once, when the message first becomes read. |
 | `reaction` | The refreshed **subject** message object, with its `reactions` up to date. | A reaction (FMSG-005) on a message the user participates in arrives. The reaction message itself is not pushed as `new_msg` and triggers no Web Push. |
 
 A client only ever receives events for messages it is a participant on. The
@@ -848,6 +849,8 @@ a recipient over one is not delivered and its `response_code` is `101`.
 Marks a message as read by the authenticated recipient by setting `time_read`
 on the caller's `msg_to` or `msg_add_to` row. Idempotent: re-reading an
 already-read message returns the original `time_read` without updating it.
+The first read pushes a `read` event to all of the caller's WebSocket
+connections (see [`GET /fmsg/ws`](#get-fmsgws)).
 
 **Response:** `200 OK` with `{"id": <int>, "time_read": <float64>}`.
 
