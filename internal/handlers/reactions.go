@@ -326,7 +326,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 		return
 	}
 
-	if draftHidden([]string{identity}, subject.From, subject.Time) {
+	if draftHidden([]string{identity}, subject.From, subject.Time) || purgedFor(ctx, h.q(), identity, msgID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}

@@ -63,6 +63,7 @@ type threadMessage struct {
 	Type          string              `json:"type,omitempty"`
 	Size          int                 `json:"size,omitempty"`
 	MessageSHA256 string              `json:"message_sha256,omitempty"`
+	Trash         *string             `json:"trash,omitempty"` // "message" or "thread" when in the caller's trash
 	Body          *threadBody         `json:"body,omitempty"`
 	Attachments   []threadAttachment  `json:"attachments,omitempty"`
 	dataPath      string
@@ -277,6 +278,17 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	hasTrash, err := h.hasTrash(ctx, addrs[0])
+	if err != nil {
+		log.Printf("thread text: trash: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+		return
+	}
+	// A message deleted for good is not found, as for one that doesn't exist.
+	if hasTrash && purgedFor(ctx, h.q(), addrs[0], msgID) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
 
 	rows, err := h.q().Query(ctx, `
 		WITH RECURSIVE chain AS (
@@ -291,9 +303,10 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		       (lower(c.from_addr) = ANY($2)
 		        OR (c.time_sent IS NOT NULL
 		            AND (EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
-		                 OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2))))) AS readable
+		                 OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2)))))
+		       AND (NOT $4 OR fmsg_api_trash_state($2[1], c.id) IS DISTINCT FROM 'purged') AS readable
 		FROM chain c ORDER BY c.depth DESC`,
-		msgID, addrs, threadMaxHops,
+		msgID, addrs, threadMaxHops, hasTrash,
 	)
 	if err != nil {
 		log.Printf("thread text: walk %d: %v", msgID, err)
@@ -376,6 +389,17 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	hasTrash, err := h.hasTrash(ctx, addrs[0])
+	if err != nil {
+		log.Printf("thread messages: trash: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+		return
+	}
+	// A message deleted for good is not found, as for one that doesn't exist.
+	if hasTrash && purgedFor(ctx, h.q(), addrs[0], msgID) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
 	tx, err := h.DB.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		log.Printf("thread messages: begin: %v", err)
@@ -402,8 +426,9 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		       (lower(c.from_addr) = ANY($2)
 		        OR (c.time_sent IS NOT NULL
 		            AND (EXISTS (SELECT 1 FROM msg_to t WHERE t.msg_id = c.id AND lower(t.addr) = ANY($2))
-		                 OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2)))))
-		FROM chain c ORDER BY c.depth DESC`, msgID, addrs, threadMaxHops)
+		                 OR EXISTS (SELECT 1 FROM msg_add_to a WHERE a.msg_id = c.id AND lower(a.addr) = ANY($2))))),
+		       CASE WHEN $4 THEN fmsg_api_trash_state($2[1], c.id) END
+		FROM chain c ORDER BY c.depth DESC`, msgID, addrs, threadMaxHops, hasTrash)
 	if err != nil {
 		log.Printf("thread messages: walk %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
@@ -415,7 +440,7 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		var hash *string
 		if err = rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important,
 			&m.Deflate, &m.Terminal, &m.Time, &m.From, &m.Topic, &m.Type, &m.Size, &m.dataPath,
-			&hash, &m.PSHA256, &m.Visible); err != nil {
+			&hash, &m.PSHA256, &m.Visible, &m.Trash); err != nil {
 			rows.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 			return
@@ -423,6 +448,13 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		if hash != nil {
 			m.MessageSHA256 = *hash
 			m.SHA256 = hash
+		}
+		// A message deleted for good is no longer visible to the caller.
+		if m.Trash != nil && *m.Trash == trashPurged {
+			m.Visible = false
+		}
+		if !m.Visible {
+			m.Trash = nil
 		}
 		messages = append(messages, m)
 	}

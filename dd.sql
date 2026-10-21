@@ -72,3 +72,37 @@ CREATE INDEX IF NOT EXISTS fmsg_api_sub_account_sub_idx
 CREATE UNIQUE INDEX IF NOT EXISTS fmsg_api_sub_account_owner_sub_unique
     ON fmsg_api_sub_account ((lower(owner_addr)), (lower(sub_addr)))
     WHERE agent <> '';
+
+-- Trash: what each address has deleted. A row marks one message for one
+-- address (lower-cased). thread marks the whole thread below that message;
+-- time_purged means deleted for good: never shown to that address again,
+-- nor anything that replies to it. Rows go with their message when it is
+-- removed from the host.
+CREATE TABLE IF NOT EXISTS fmsg_api_trash (
+    addr text NOT NULL,
+    msg_id bigint NOT NULL REFERENCES msg (id) ON DELETE CASCADE,
+    thread boolean NOT NULL DEFAULT false,
+    time_deleted double precision NOT NULL,
+    time_purged double precision,
+    PRIMARY KEY (addr, msg_id)
+);
+
+-- fmsg_api_trash_state is where a message stands for an address: 'purged'
+-- when it or an ancestor is deleted for good, 'thread' when it or an ancestor
+-- carries a thread mark, 'message' when it is deleted itself, NULL when it
+-- isn't deleted. addr must be lower-cased.
+CREATE OR REPLACE FUNCTION fmsg_api_trash_state(p_addr text, p_msg bigint) RETURNS text
+LANGUAGE sql STABLE AS $$
+    WITH RECURSIVE up(id, depth) AS (
+        SELECT p_msg, 0
+        UNION ALL
+        SELECT m.pid, up.depth + 1 FROM msg m JOIN up ON m.id = up.id
+        WHERE m.pid IS NOT NULL AND up.depth < 1000
+    )
+    SELECT CASE
+        WHEN bool_or(t.time_purged IS NOT NULL) THEN 'purged'
+        WHEN bool_or(t.thread) THEN 'thread'
+        WHEN bool_or(up.depth = 0) THEN 'message'
+    END
+    FROM up JOIN fmsg_api_trash t ON t.addr = p_addr AND t.msg_id = up.id
+$$;

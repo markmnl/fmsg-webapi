@@ -90,8 +90,12 @@ type messageListItem struct {
 	Attachments []models.Attachment        `json:"attachments"`
 	Reaction    *string                    `json:"reaction"`
 	Reactions   []models.Reaction          `json:"reactions"`
+	// Trash is "message" or "thread" when the message is in the caller's
+	// trash, null otherwise.
+	Trash *string `json:"trash"`
 
 	dataPath string // stored body path, for reaction recognition; never serialised
+	purged   bool   // deleted for good by the address it was built for; never serialised
 }
 
 // formatDeliveredISO converts a nullable Unix-epoch-seconds timestamp (as
@@ -312,22 +316,34 @@ func (h *MessageHandler) List(c *gin.Context) {
 	if !ok {
 		return
 	}
+	trashFilter, ok := trashListFilter(c)
+	if !ok {
+		return
+	}
 
 	ctx := c.Request.Context()
+	hasTrash, err := h.hasTrash(ctx, addrs[0])
+	if err != nil {
+		log.Printf("list messages: trash: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
+		return
+	}
 
 	rows, err := h.q().Query(ctx,
 		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, encode(m.sha256,'hex'), encode(m.psha256,'hex'), m.from_addr, m.topic, m.type, m.size, m.filepath,
 		        COALESCE(
 		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1)),
 		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
-		        ) AS time_read
+		        ) AS time_read, t.state
 		 FROM msg m
+		 CROSS JOIN LATERAL (SELECT CASE WHEN $4 THEN fmsg_api_trash_state($5, m.id) END AS state) t
 		 WHERE m.time_sent IS NOT NULL
 		   AND (EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1))
 		     OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1)))
+		   AND `+trashFilter+`
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
-		addrs, limit, offset,
+		addrs, limit, offset, hasTrash, addrs[0],
 	)
 	if err != nil {
 		log.Printf("list messages: %v", err)
@@ -341,7 +357,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.SHA256, &m.PSHA256, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.SHA256, &m.PSHA256, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.TimeRead, &m.Trash); err != nil {
 			log.Printf("list messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})
 			return
@@ -417,16 +433,28 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	if !ok {
 		return
 	}
+	trashFilter, ok := trashListFilter(c)
+	if !ok {
+		return
+	}
 
 	ctx := c.Request.Context()
+	hasTrash, err := h.hasTrash(ctx, addrs[0])
+	if err != nil {
+		log.Printf("list sent messages: trash: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
+		return
+	}
 
 	rows, err := h.q().Query(ctx,
-		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, encode(m.sha256,'hex'), encode(m.psha256,'hex'), m.from_addr, m.topic, m.type, m.size, m.filepath
+		`SELECT m.id, m.version, m.pid, m.no_reply, m.is_important, m.is_deflate, m.is_terminal, m.time_sent, encode(m.sha256,'hex'), encode(m.psha256,'hex'), m.from_addr, m.topic, m.type, m.size, m.filepath, t.state
 		 FROM msg m
+		 CROSS JOIN LATERAL (SELECT CASE WHEN $4 AND m.time_sent IS NOT NULL THEN fmsg_api_trash_state($5, m.id) END AS state) t
 		 WHERE lower(m.from_addr) = ANY($1)
+		   AND `+trashFilter+`
 		 ORDER BY m.id DESC
 		 LIMIT $2 OFFSET $3`,
-		addrs, limit, offset,
+		addrs, limit, offset, hasTrash, addrs[0],
 	)
 	if err != nil {
 		log.Printf("list sent messages: %v", err)
@@ -440,7 +468,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	for rows.Next() {
 		var m messageListItem
 		var dataPath string
-		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.SHA256, &m.PSHA256, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath); err != nil {
+		if err := rows.Scan(&m.ID, &m.Version, &m.PID, &m.NoReply, &m.Important, &m.Deflate, &m.Terminal, &m.Time, &m.SHA256, &m.PSHA256, &m.From, &m.Topic, &m.Type, &m.Size, &dataPath, &m.Trash); err != nil {
 			log.Printf("list sent messages scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list sent messages"})
 			return
@@ -632,6 +660,19 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
+	trash, err := trashStateQ(ctx, h.q(), addrs[0], msgID)
+	if err != nil {
+		log.Printf("get message %d: trash: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
+	if trash == trashPurged {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+	if trash != "" {
+		msg.Trash = &trash
+	}
 
 	// Compute ShortText only after authorization has been confirmed.
 	msg.ShortText = h.extractShortText(dataPath, msg.Type)
@@ -692,7 +733,7 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 		}
 		return
 	}
-	if draftHidden(addrs, fromAddr, timeSent) {
+	if draftHidden(addrs, fromAddr, timeSent) || purgedFor(ctx, h.q(), addrs[0], msgID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
@@ -850,7 +891,8 @@ func (h *MessageHandler) Update(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": msgID})
 }
 
-// Delete handles DELETE /fmsg/:id — deletes a draft message.
+// Delete handles DELETE /fmsg/:id — deletes a draft, or moves a sent message
+// to the caller's trash (see trash.go).
 func (h *MessageHandler) Delete(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 	msgID, ok := resolveID(c, h.q())
@@ -870,12 +912,14 @@ func (h *MessageHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if !sameAddr(existing.From, identity) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may delete a message"})
+	// A sent message goes to the caller's trash (or is deleted for good with
+	// ?permanent=true); only a draft is deleted outright, by its owner.
+	if existing.Time != nil {
+		h.trashSent(c, msgID)
 		return
 	}
-	if existing.Time != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "sent messages cannot be deleted"})
+	if !sameAddr(existing.From, identity) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may delete a message"})
 		return
 	}
 
@@ -1063,7 +1107,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark message read"})
 		return
 	}
-	if !recipient {
+	if !recipient || purgedFor(ctx, h.q(), identity, msgID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
@@ -1157,7 +1201,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 		}
 		return
 	}
-	if draftHidden([]string{identity}, fromAddr, timeSent) {
+	if draftHidden([]string{identity}, fromAddr, timeSent) || purgedFor(ctx, h.q(), identity, msgID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
@@ -1502,6 +1546,16 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 	).Scan(&timeRead); err == nil {
 		item.TimeRead = timeRead
 		item.Read = timeRead != nil
+	}
+
+	// Where it stands in the recipient's trash.
+	trash, err := trashStateQ(ctx, h.q(), recipient, msgID)
+	if err != nil {
+		return nil, err
+	}
+	item.purged = trash == trashPurged
+	if trash != "" && !item.purged {
+		item.Trash = &trash
 	}
 
 	return item, nil

@@ -52,6 +52,7 @@ type Message struct {
 	Attachments []Attachment        `json:"attachments"`
 	Reaction    *string             `json:"reaction"`  // FMSG-005: the emoji this message carries when it is a reaction ("" clears); nil otherwise
 	Reactions   []Reaction          `json:"reactions"` // FMSG-005: effective reactions on this message
+	Trash       *string             `json:"trash"`     // "message" or "thread" when in the caller's trash, null otherwise
 }
 
 // Reaction is one emoji currently reacted on a message and the participants

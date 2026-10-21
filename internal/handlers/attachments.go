@@ -198,7 +198,7 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 		}
 		return
 	}
-	if draftHidden([]string{identity}, fromAddr, timeSent) {
+	if draftHidden([]string{identity}, fromAddr, timeSent) || purgedFor(ctx, h.q(), identity, msgID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}

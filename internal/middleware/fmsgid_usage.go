@@ -86,6 +86,20 @@ func RecordFmsgIDSend(idURL, addr string, ts float64, size int64) error {
 	return postFmsgIDUsage(idURL, "send", addr, ts, size)
 }
 
+// ReleaseFmsgIDSend gives back to addr the storage of a message it sent that
+// is deleted for good: size bytes come off its sent size total, not off its
+// daily usage.
+func ReleaseFmsgIDSend(idURL, addr string, ts float64, size int64) error {
+	return postFmsgIDUsage(idURL, "send/release", addr, ts, size)
+}
+
+// ReleaseFmsgIDRecv gives back to addr the storage of a message it received
+// that is deleted for good: size bytes come off its received size total, not
+// off its daily usage.
+func ReleaseFmsgIDRecv(idURL, addr string, ts float64, size int64) error {
+	return postFmsgIDUsage(idURL, "recv/release", addr, ts, size)
+}
+
 func postFmsgIDUsage(idURL, part, addr string, ts float64, size int64) error {
 	payload, err := json.Marshal(map[string]any{"address": addr, "ts": ts, "size": size})
 	if err != nil {

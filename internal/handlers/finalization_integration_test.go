@@ -75,6 +75,14 @@ func newFinalizationAPIWithID(t *testing.T, fmsgID http.Handler) *finalizationAP
 	if _, err = pool.Exec(ctx, string(sql)); err != nil {
 		t.Fatal(err)
 	}
+	// This service's own tables (dd.sql at the repository root).
+	apiSQL, err := os.ReadFile("../../dd.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(apiSQL)); err != nil {
+		t.Fatal(err)
+	}
 	id := httptest.NewServer(fmsgID)
 	t.Cleanup(id.Close)
 	h := NewMessageHandler(&db.DB{Pool: pool}, t.TempDir(), 1<<20, 2<<20, 256, nil, id.URL, "example.com")
@@ -91,6 +99,7 @@ func newFinalizationAPIWithID(t *testing.T, fmsgID http.Handler) *finalizationAP
 	r.GET("/fmsg/:id/data", h.DownloadData)
 	r.POST("/fmsg/:id/send", h.Atomic((*MessageHandler).Send))
 	r.POST("/fmsg/:id/read", h.MarkRead)
+	r.POST("/fmsg/:id/restore", h.Atomic((*MessageHandler).Restore))
 	r.POST("/fmsg/:id/add-to", h.Atomic((*MessageHandler).AddRecipients))
 	r.POST("/fmsg/:id/react", h.Atomic((*MessageHandler).React))
 	r.GET("/fmsg/:id/thread", h.ThreadText)

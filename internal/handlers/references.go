@@ -104,6 +104,11 @@ func (h *MessageHandler) resolveParent(c *gin.Context, in *messageInput) bool {
 		c.JSON(403, gin.H{"error": "not a participant of this parent; added recipients must use their batch sha256"})
 		return false
 	}
+	// A parent deleted for good no longer exists for the caller.
+	if purgedFor(ctx, h.q(), middleware.GetIdentity(c), id) {
+		c.JSON(400, gin.H{"error": "parent message not found"})
+		return false
+	}
 	if sent == nil || terminal {
 		c.JSON(409, gin.H{"error": "parent is a draft or terminal message"})
 		return false

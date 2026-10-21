@@ -73,3 +73,40 @@ func TestMarkReadNotifies(t *testing.T) {
 		t.Errorf("second read notified %q", n.Payload)
 	}
 }
+
+// A msg_trash notification for a message deleted for good pushes only its id.
+func TestHubRoute_MsgTrashPurged(t *testing.T) {
+	hub := &Hub{
+		buildItem: func(_ context.Context, msgID int64, _ string) (*messageListItem, error) {
+			return &messageListItem{ID: msgID, purged: true}, nil
+		},
+		registry: make(map[string]map[*wsClient]struct{}),
+	}
+	c := &wsClient{addr: "@bob@example.com", send: make(chan []byte, 4)}
+	hub.Register(c)
+
+	hub.route(context.Background(), "msg_trash", 5, "@bob@example.com")
+	select {
+	case frame := <-c.send:
+		var env struct {
+			Type string         `json:"type"`
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(frame, &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Type != eventTrash || env.Data["id"] != float64(5) || env.Data["trash"] != trashPurged || len(env.Data) != 2 {
+			t.Errorf("frame %s", frame)
+		}
+	default:
+		t.Fatal("no frame pushed")
+	}
+
+	// Other events about it are not pushed at all.
+	hub.route(context.Background(), "new_msg", 5, "@bob@example.com")
+	select {
+	case frame := <-c.send:
+		t.Errorf("pushed %s for a purged message", frame)
+	default:
+	}
+}
