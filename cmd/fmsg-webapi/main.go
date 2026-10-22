@@ -284,6 +284,7 @@ func registerRoutes(router *gin.Engine, jwtMiddleware gin.HandlerFunc, msgHandle
 		fmsg.DELETE("/:id", msgHandler.Atomic((*handlers.MessageHandler).Delete))
 		fmsg.POST("/:id/send", msgHandler.Atomic((*handlers.MessageHandler).Send))
 		fmsg.POST("/:id/read", msgHandler.MarkRead)
+		fmsg.POST("/:id/restore", msgHandler.Atomic((*handlers.MessageHandler).Restore))
 		fmsg.POST("/:id/add-to", msgHandler.Atomic((*handlers.MessageHandler).AddRecipients))
 		fmsg.POST("/:id/react", msgHandler.Atomic((*handlers.MessageHandler).React))
 		fmsg.GET("/:id/data", msgHandler.DownloadData)

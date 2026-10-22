@@ -60,8 +60,9 @@ Standard PostgreSQL environment variables (`PGHOST`, `PGPORT`, `PGUSER`,
 
 fmsg-webapi assumes [fmsgd](https://github.com/markmnl/fmsgd) is the fmsg host
 implementation and uses the same PostgreSQL database. The fmsgd schema remains
-the base schema; this repository's [dd.sql](dd.sql) adds the API-key and
-delegation tables used by fmsg-webapi.
+the base schema; this repository's [dd.sql](dd.sql) adds the API-key,
+delegation and [trash](#trash) tables used by fmsg-webapi. Apply it after the
+fmsgd schema, which it extends.
 
 A `.env` file placed in the working directory is loaded automatically at startup
 (values in the environment take precedence).
@@ -347,9 +348,10 @@ the application.
 | `POST`   | `/fmsg`                          | Create a draft message   |
 | `GET`    | `/fmsg/:id`                      | Retrieve a message       |
 | `PUT`    | `/fmsg/:id`                      | Update a draft message   |
-| `DELETE` | `/fmsg/:id`                      | Delete a draft message   |
+| `DELETE` | `/fmsg/:id`                      | Delete a draft; move a sent message to the trash, or delete it for good |
 | `POST`   | `/fmsg/:id/send`                 | Send a message           |
 | `POST`   | `/fmsg/:id/read`                 | Mark a message as read   |
+| `POST`   | `/fmsg/:id/restore`              | Take a message or thread out of the trash |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
 | `POST`   | `/fmsg/:id/react`                | Set or clear an emoji reaction (FMSG-005) |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
@@ -554,6 +556,10 @@ event types can be added without breaking clients:
 | `recipients_added` | The refreshed message object. | An add-to batch was recorded on a message the user participates in. |
 | `read` | The message object, with `read` and `time_read` set. | The user marked a message read (`POST /fmsg/:id/read`), on this or any other connection, so every tab and device can stop showing it as unread. Sent once, when the message first becomes read. |
 | `reaction` | The refreshed **subject** message object, with its `reactions` up to date. | A reaction (FMSG-005) on a message the user participates in arrives. The reaction message itself is not pushed as `new_msg` and triggers no Web Push. |
+| `trash` | The message object with its `trash` state, or `{"id": <int>, "trash": "purged"}` for a message deleted for good. | The user moved a message into or out of their [trash](#trash), or deleted it for good, on this or any other connection. |
+
+No event about a message the user deleted for good is ever pushed again,
+except that `trash` event.
 
 A client only ever receives events for messages it is a participant on. The
 server sends periodic WebSocket pings; clients should respond with pongs (most
@@ -589,6 +595,7 @@ has read the message.
 | --------- | ------- | ----------- |
 | `limit`   | `20`    | Max messages to return (at least 1; values above 100 return 100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
+| `trash`   | `exclude` | Messages in the caller's [trash](#trash): `exclude` leaves them out, `include` lists them too, `only` lists only them. Messages deleted for good are never listed. |
 
 **Response:** JSON array of message objects. Each object has the same shape as the single-message response from `GET /fmsg/:id` (with an additional `id` field), including the `read`/`time_read` fields reflecting the caller's per-recipient read state. Message body data and attachment contents are not included — use the dedicated download endpoints instead.
 
@@ -604,6 +611,7 @@ This includes both sent messages and drafts (`time_sent` may be `NULL`).
 | --------- | ------- | ----------- |
 | `limit`   | `20`    | Max messages to return (at least 1; values above 100 return 100) |
 | `offset`  | `0`     | Number of messages to skip for pagination |
+| `trash`   | `exclude` | As for `GET /fmsg`. |
 
 **Response:** JSON array of message objects with the same shape as `GET /fmsg`.
 
@@ -760,16 +768,59 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 
 ### DELETE `/fmsg/:id`
 
-Deletes a draft message and all its attachments from the database and disk. Only the owner may delete, and the message must not have been sent.
+**A draft:** deletes it and all its attachments from the database and disk. Only
+the owner may delete a draft. **Response:** `204 No Content`.
 
-**Response:** `204 No Content`.
+**A sent message:** moves it into the caller's [trash](#trash). Its sender and
+any of its recipients may do this; it changes nothing for anyone else.
+
+| Parameter | Description |
+| --------- | ----------- |
+| `thread=true` | Delete the whole thread below this message, including replies that arrive later. |
+| `permanent=true` | Delete for good: this message and everything below it (with `thread=true`, the whole thread). |
+
+**Response:** `200 OK` with `{"id": <int>, "trash": "message" | "thread"}`, or
+for `permanent=true` `{"id": <int>, "trash": "purged", "purged": <int>, "removed": <int>}`:
+how many messages were newly deleted for good, and how many of those were
+removed from the host.
 
 **Errors:**
 
 | Status | Condition |
 | ------ | --------- |
-| `403`  | Not the owner, or message already sent |
-| `404`  | Message not found |
+| `403`  | A draft and not its owner |
+| `404`  | Message not found, the caller is not a participant, or it is already deleted for good |
+
+### POST `/fmsg/:id/restore`
+
+Takes a message out of the caller's [trash](#trash). With `thread=true`, takes
+the whole thread below it out. Messages deleted for good can't be restored.
+
+**Response:** `200 OK` with `{"id": <int>, "trash": null}`; `trash` is still
+`"thread"` when the message is in a deleted thread that wasn't restored.
+
+**Errors:** `404` when the message isn't found, the caller is not a
+participant, or it is deleted for good.
+
+### Trash
+
+Each identity has its own trash; nothing in it changes what anyone else sees.
+
+- **Deleted** messages (`"trash": "message"`) and messages in a deleted thread
+  (`"trash": "thread"`) are left out of `GET /fmsg` and `GET /fmsg/sent` unless
+  `trash=include` or `trash=only` is given, and carry their `trash` state on
+  every route. Replies keep arriving: a reply in a deleted thread is in the
+  trash too, and triggers no [Web Push](#web-push).
+- **Deleted for good** (`permanent=true`) is final. The message and everything
+  that replies to it are never listed again for that identity, every route
+  answers `404` for them (or shows them as not visible in a thread), and a
+  reply to them is refused (`400 parent message not found`). What they counted
+  against that identity's storage quota is given back to fmsgid. Once no local
+  participant holds a message any more (none sent or accepted it without
+  deleting it for good) and none of its deliveries is pending, it is removed
+  from the host: its rows and files are deleted, and replies to it from
+  anywhere are then rejected by fmsgd as parent not found. This needs the
+  fmsgd schema that lets a transaction set `fmsg.purge`.
 
 ### Message hashes and references
 
@@ -1130,7 +1181,8 @@ The push carries a JSON payload:
 ```
 
 `threadId`, `url` and `tag` reference the thread's **root** message id, so
-replies group with their thread. If a push service responds `404` or `410` the
+replies group with their thread. A message in the recipient's
+[trash](#trash), such as a reply in a thread they deleted, is not pushed. If a push service responds `404` or `410` the
 subscription is dead and is deleted automatically.
 
 **Enabling.** Web Push is active only when `FMSG_VAPID_PUBLIC_KEY`,

@@ -51,6 +51,18 @@ func newAPIKeyCLIDB(t *testing.T) *db.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	// This service's dd.sql extends the fmsgd schema.
+	fmsgdDD := os.Getenv("FMSG_TEST_DD")
+	if fmsgdDD == "" {
+		fmsgdDD = "../../../fmsgd/dd.sql"
+	}
+	base, err := os.ReadFile(fmsgdDD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(base)); err != nil {
+		t.Fatal(err)
+	}
 	dd, err := os.ReadFile("../../dd.sql")
 	if err != nil {
 		t.Fatal(err)

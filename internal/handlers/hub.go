@@ -20,6 +20,7 @@ const (
 	eventRecipientsAdded = "recipients_added"
 	eventReaction        = "reaction"
 	eventRead            = "read"
+	eventTrash           = "trash"
 )
 
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
@@ -144,7 +145,10 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	if _, err := conn.Exec(ctx, "LISTEN msg_read"); err != nil {
 		return err
 	}
-	log.Println("ws hub: listening on new_msg, delivered, recipients_added, msg_read")
+	if _, err := conn.Exec(ctx, "LISTEN msg_trash"); err != nil {
+		return err
+	}
+	log.Println("ws hub: listening on new_msg, delivered, recipients_added, msg_read, msg_trash")
 	onConnected()
 
 	for {
@@ -191,6 +195,11 @@ func (h *Hub) route(ctx context.Context, channel string, msgID int64, addr strin
 		// recipient. Pushes the message with its read state so the reader's
 		// other tabs and devices stop showing it as unread.
 		h.dispatch(ctx, msgID, addr, eventRead)
+	case "msg_trash":
+		// The address moved the message into or out of its trash, or
+		// deleted it for good (see trash.go). Its other tabs and devices
+		// get the message with its trash state.
+		h.dispatchTrash(ctx, msgID, addr)
 	case "recipients_added":
 		// An add-to batch was recorded against the message; addr is one
 		// of its participants (see notify_recipients_added in fmsgd's
@@ -244,7 +253,49 @@ func (h *Hub) dispatch(ctx context.Context, msgID int64, addr string, eventType 
 		log.Printf("ws hub: build message %d for %s: %v", msgID, addr, err)
 		return
 	}
-	payload, err := json.Marshal(wsEnvelope{Type: eventType, Data: item})
+	if item.purged {
+		return // deleted for good by addr: never shown to it again
+	}
+	h.send(clients, msgID, wsEnvelope{Type: eventType, Data: item})
+}
+
+// trashGone is the trash event data for a message deleted for good.
+type trashGone struct {
+	ID    int64  `json:"id"`
+	Trash string `json:"trash"`
+}
+
+// dispatchTrash pushes a trash event to addr's clients: the message with its
+// trash state, or only its id when addr deleted it for good (it may no longer
+// exist).
+func (h *Hub) dispatchTrash(ctx context.Context, msgID int64, addr string) {
+	clients := h.clientsOf(addr)
+	if len(clients) == 0 {
+		return
+	}
+	item, err := h.buildItem(ctx, msgID, addr)
+	if err != nil || item.purged {
+		h.send(clients, msgID, wsEnvelope{Type: eventTrash, Data: trashGone{ID: msgID, Trash: trashPurged}})
+		return
+	}
+	h.send(clients, msgID, wsEnvelope{Type: eventTrash, Data: item})
+}
+
+// clientsOf lists the clients connected as addr.
+func (h *Hub) clientsOf(addr string) []*wsClient {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	set := h.registry[strings.ToLower(addr)]
+	clients := make([]*wsClient, 0, len(set))
+	for c := range set {
+		clients = append(clients, c)
+	}
+	return clients
+}
+
+// send marshals env and queues it on each client.
+func (h *Hub) send(clients []*wsClient, msgID int64, env wsEnvelope) {
+	payload, err := json.Marshal(env)
 	if err != nil {
 		log.Printf("ws hub: marshal message %d: %v", msgID, err)
 		return

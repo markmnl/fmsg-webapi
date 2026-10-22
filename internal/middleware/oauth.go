@@ -41,6 +41,7 @@ var oauthRouteScopes = map[string]string{
 	"DELETE /fmsg/:id":                  ScopeWrite,
 	"POST /fmsg/:id/send":               ScopeWrite,
 	"POST /fmsg/:id/read":               ScopeWrite,
+	"POST /fmsg/:id/restore":            ScopeWrite,
 	"POST /fmsg/:id/add-to":             ScopeWrite,
 	"POST /fmsg/:id/react":              ScopeWrite,
 	"POST /fmsg/:id/attach":             ScopeWrite,
