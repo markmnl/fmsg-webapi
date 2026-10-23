@@ -271,63 +271,26 @@ func (h *MessageHandler) purge(c *gin.Context, identity string, msgID int64, thr
 		fail("subtree", err)
 		return
 	}
-
-	// What each message newly deleted for good counted against identity.
-	var releases []usageRelease
-	var purged int
-	now := float64(time.Now().UnixMicro()) / 1e6
-	for _, id := range ids {
-		var already bool
-		if err := h.q().QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM fmsg_api_trash WHERE addr = $1 AND msg_id = $2 AND time_purged IS NOT NULL)`,
-			identity, id).Scan(&already); err != nil {
-			fail("purged state", err)
-			return
-		}
-		if already {
-			continue
-		}
-		if _, err := h.q().Exec(ctx, `
-			INSERT INTO fmsg_api_trash (addr, msg_id, thread, time_deleted, time_purged) VALUES ($1, $2, $3, $4, $4)
-			ON CONFLICT (addr, msg_id) DO UPDATE SET time_purged = EXCLUDED.time_purged,
-			    thread = fmsg_api_trash.thread OR EXCLUDED.thread`,
-			identity, id, thread && id == msgID, now); err != nil {
-			fail("mark", err)
-			return
-		}
-		purged++
-		rel, err := h.usageOf(ctx, identity, id)
-		if err != nil {
-			fail("usage", err)
-			return
-		}
-		releases = append(releases, rel...)
+	top := int64(0)
+	if thread {
+		top = msgID
 	}
-
-	// Remove what nobody here holds any more, deepest first, so a reply
-	// is gone before the message it replies to.
-	var removed int
-	var files []string
-	for _, id := range ids {
-		gone, paths, err := h.removeIfUnheld(ctx, id)
-		if err != nil {
-			fail("remove", err)
-			return
-		}
-		if gone {
-			removed++
-			files = append(files, paths...)
-		}
+	now := float64(time.Now().UnixMicro()) / 1e6
+	purged, releases, err := h.markPurged(ctx, identity, ids, top, now)
+	if err != nil {
+		fail("mark", err)
+		return
+	}
+	removed, files, err := h.removeUnheld(ctx, ids)
+	if err != nil {
+		fail("remove", err)
+		return
 	}
 	h.notifyTrash(ctx, identity, ids)
 
 	for _, p := range files {
 		path := p
-		afterCommit(c, func() {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				log.Printf("purge: remove %s: %v", path, err)
-			}
-		})
+		afterCommit(c, func() { removeStoredFile(path) })
 	}
 	if h.IDURL != "" && len(releases) > 0 {
 		idURL := h.IDURL
@@ -346,6 +309,67 @@ func (h *MessageHandler) purge(c *gin.Context, identity string, msgID int64, thr
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"id": msgID, "trash": trashPurged, "purged": purged, "removed": removed})
+}
+
+// markPurged deletes ids for good for identity, skipping those it already
+// has, and returns how many were newly purged and what they counted against
+// identity's quota. threadTop, when not 0, is the id whose trash row marks a
+// whole thread.
+func (h *MessageHandler) markPurged(ctx context.Context, identity string, ids []int64, threadTop int64, now float64) (int, []usageRelease, error) {
+	var releases []usageRelease
+	var purged int
+	for _, id := range ids {
+		var already bool
+		if err := h.q().QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM fmsg_api_trash WHERE addr = $1 AND msg_id = $2 AND time_purged IS NOT NULL)`,
+			identity, id).Scan(&already); err != nil {
+			return 0, nil, fmt.Errorf("purged state: %w", err)
+		}
+		if already {
+			continue
+		}
+		if _, err := h.q().Exec(ctx, `
+			INSERT INTO fmsg_api_trash (addr, msg_id, thread, time_deleted, time_purged) VALUES ($1, $2, $3, $4, $4)
+			ON CONFLICT (addr, msg_id) DO UPDATE SET time_purged = EXCLUDED.time_purged,
+			    thread = fmsg_api_trash.thread OR EXCLUDED.thread`,
+			identity, id, threadTop != 0 && id == threadTop, now); err != nil {
+			return 0, nil, err
+		}
+		purged++
+		rel, err := h.usageOf(ctx, identity, id)
+		if err != nil {
+			return 0, nil, fmt.Errorf("usage: %w", err)
+		}
+		releases = append(releases, rel...)
+	}
+	return purged, releases, nil
+}
+
+// removeUnheld removes from the host each of ids that nobody here holds any
+// more. ids are deepest first, so a reply is gone before the message it
+// replies to. It returns how many were removed and the stored files to
+// delete once the transaction commits.
+func (h *MessageHandler) removeUnheld(ctx context.Context, ids []int64) (int, []string, error) {
+	var removed int
+	var files []string
+	for _, id := range ids {
+		gone, paths, err := h.removeIfUnheld(ctx, id)
+		if err != nil {
+			return 0, nil, err
+		}
+		if gone {
+			removed++
+			files = append(files, paths...)
+		}
+	}
+	return removed, files, nil
+}
+
+// removeStoredFile deletes a stored body or attachment file.
+func removeStoredFile(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("purge: remove %s: %v", path, err)
+	}
 }
 
 // usageOf is what msgID counted against addr's quota: its size as sent if
