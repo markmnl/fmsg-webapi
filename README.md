@@ -1016,8 +1016,8 @@ to an agent as context.
 The authenticated identity must be a participant of the *requested*
 message. Each message is preceded by a one-line separator with its sender
 and send time. Ancestors the caller is not a participant of appear as
-`[message not visible to you]` (a recipient added mid-thread cannot read
-what came before); non-text bodies appear as a `[non-text message: <type>,
+`--- hidden ---` and `[message not visible to you]`, with no sender or time
+(a recipient added mid-thread cannot read what came before); non-text bodies appear as a `[non-text message: <type>,
 <size> bytes]` placeholder. The walk is capped at 100 hops.
 
 **Response:** `200 OK`, `text/plain; charset=utf-8`.
