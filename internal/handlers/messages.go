@@ -45,6 +45,10 @@ type MessageHandler struct {
 	// has a different domain than this instance, but that has no bearing on
 	// which recipients are local to it. See resolveLocalDelivery.
 	LocalDomain string
+	// RetryMaxAge is fmsgd's FMSG_RETRY_MAX_AGE in seconds (0 means
+	// DefaultRetryMaxAge): deliveries older than this are ones fmsgd has given
+	// up on, so they no longer keep a deleted-for-good message on the host.
+	RetryMaxAge float64
 }
 
 // NewMessageHandler creates a MessageHandler.

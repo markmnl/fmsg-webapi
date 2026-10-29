@@ -106,3 +106,30 @@ LANGUAGE sql STABLE AS $$
     END
     FROM up JOIN fmsg_api_trash t ON t.addr = p_addr AND t.msg_id = up.id
 $$;
+
+-- fmsg_api_delivery_pending is whether fmsgd may still deliver some part of
+-- message p_msg: a recipient (msg_to, msg_add_to) or an add-to participant
+-- notification (msg_add_to_notify) that is not delivered, whose last attempt
+-- (if any) got a code in p_retryable, and that at p_now is younger than
+-- p_max_age seconds, measured from the message's time_sent or its add-to
+-- batch's time_added as fmsgd's sender measures it. fmsgd gives up on older
+-- rows without marking them, so they no longer keep a message on the host.
+CREATE OR REPLACE FUNCTION fmsg_api_delivery_pending(p_msg bigint, p_now double precision, p_max_age double precision, p_retryable smallint[]) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM msg_to t JOIN msg m ON m.id = t.msg_id
+        WHERE t.msg_id = p_msg AND m.time_sent IS NOT NULL
+          AND t.time_delivered IS NULL
+          AND (t.response_code IS NULL OR t.response_code = ANY (p_retryable))
+          AND p_now - m.time_sent < p_max_age)
+    OR EXISTS (
+        SELECT 1 FROM msg_add_to a JOIN msg_add_to_batch b ON b.id = a.batch_id
+        WHERE a.msg_id = p_msg AND a.time_delivered IS NULL
+          AND (a.response_code IS NULL OR a.response_code = ANY (p_retryable))
+          AND p_now - b.time_added < p_max_age)
+    OR EXISTS (
+        SELECT 1 FROM msg_add_to_notify n JOIN msg_add_to_batch b ON b.id = n.batch_id
+        WHERE b.msg_id = p_msg AND n.time_notified IS NULL
+          AND (n.response_code IS NULL OR n.response_code = ANY (p_retryable))
+          AND p_now - b.time_added < p_max_age)
+$$;

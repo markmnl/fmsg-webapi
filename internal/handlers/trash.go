@@ -455,12 +455,36 @@ func (h *MessageHandler) fileSize(path string, fallback int64) int64 {
 	return fallback
 }
 
+// retryableResponseCodes are the per-recipient response codes after which
+// fmsgd retries a delivery: -1, its local code for an attempt that got no
+// response, and the fmsg reject codes undisclosed (3), insufficient resources
+// (5) and user full (101). Any other code is final. Must match fmsgd's
+// retryableResponseCodes (cmd/fmsgd/sender.go).
+var retryableResponseCodes = []int16{-1, 3, 5, 101}
+
+// DefaultRetryMaxAge is fmsgd's default FMSG_RETRY_MAX_AGE in seconds: how
+// long after a message is sent (or recipients are added) fmsgd keeps retrying
+// its deliveries.
+const DefaultRetryMaxAge = 86400
+
+// retryMaxAge is the configured retry window in seconds, or the default.
+func (h *MessageHandler) retryMaxAge() float64 {
+	if h.RetryMaxAge > 0 {
+		return h.RetryMaxAge
+	}
+	return DefaultRetryMaxAge
+}
+
 // removeIfUnheld removes msgID from the host when no local participant holds
 // it any more (none sent or accepted it without deleting it for good) and no
-// delivery or add-to notification of it is still pending. It returns whether
-// it was removed and the stored files to delete once the transaction commits.
+// delivery or add-to notification of it is still pending: undelivered, with a
+// code fmsgd retries, and within the retry window (fmsg_api_delivery_pending
+// in dd.sql). A delivery fmsgd has given up on doesn't keep the message. It
+// returns whether it was removed and the stored files to delete once the
+// transaction commits.
 func (h *MessageHandler) removeIfUnheld(ctx context.Context, msgID int64) (bool, []string, error) {
 	var held, pending bool
+	now := float64(time.Now().UnixMicro()) / 1e6
 	err := h.q().QueryRow(ctx, `SELECT
 		EXISTS (
 			SELECT 1 FROM (
@@ -471,11 +495,8 @@ func (h *MessageHandler) removeIfUnheld(ctx context.Context, msgID int64) (bool,
 			WHERE split_part(lower(p.a), '@', 3) = ANY($2)
 			  AND NOT EXISTS (SELECT 1 FROM fmsg_api_trash t
 			                  WHERE t.addr = lower(p.a) AND t.msg_id = $1 AND t.time_purged IS NOT NULL)),
-		EXISTS (SELECT 1 FROM msg_to WHERE msg_id = $1 AND time_delivered IS NULL AND (response_code IS NULL OR response_code = -1))
-		OR EXISTS (SELECT 1 FROM msg_add_to WHERE msg_id = $1 AND time_delivered IS NULL AND (response_code IS NULL OR response_code = -1))
-		OR EXISTS (SELECT 1 FROM msg_add_to_notify n JOIN msg_add_to_batch b ON b.id = n.batch_id
-		           WHERE b.msg_id = $1 AND n.time_notified IS NULL)`,
-		msgID, h.localDomains()).Scan(&held, &pending)
+		fmsg_api_delivery_pending($1, $3, $4, $5)`,
+		msgID, h.localDomains(), now, h.retryMaxAge(), retryableResponseCodes).Scan(&held, &pending)
 	if err != nil || held || pending {
 		return false, nil, err
 	}
