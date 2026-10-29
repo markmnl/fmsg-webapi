@@ -126,6 +126,7 @@ func main() {
 	// make every few seconds, are left out of the request log.
 	router := gin.New()
 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/healthz"}}), gin.Recovery())
+	router.Use(middleware.SecurityHeaders())
 	if trustedProxies := parseCSV(os.Getenv("FMSG_TRUSTED_PROXIES")); len(trustedProxies) > 0 {
 		if err := router.SetTrustedProxies(trustedProxies); err != nil {
 			log.Fatalf("invalid FMSG_TRUSTED_PROXIES: %v", err)

@@ -331,6 +331,9 @@ returns a JWT. Other routes require a valid `Authorization: Bearer <token>`
 header. The WebSocket route `/fmsg/ws` additionally accepts the token via an
 `access_token` query parameter (browsers cannot set headers on a WebSocket).
 
+Every response carries `X-Content-Type-Options: nosniff`, so a browser never
+treats a downloaded body or attachment as HTML or script.
+
 Rate limiting is enforced at the host level (e.g. `nftables`) rather than in
 the application.
 
