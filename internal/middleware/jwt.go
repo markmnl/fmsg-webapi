@@ -524,6 +524,9 @@ type fmsgIDAddressReq struct {
 	Address      string `json:"address"`
 	AcceptingNew *bool  `json:"accepting_new,omitempty"`
 	QuotaPool    string `json:"quota_pool,omitempty"`
+	// Claim asks fmsgid to register the address only when it is new or
+	// already in QuotaPool, and to answer 409 otherwise.
+	Claim bool `json:"claim,omitempty"`
 }
 
 // fmsgIDAddressResp is fmsgid's answer to POST /fmsgid. fmsgid versions that
@@ -533,19 +536,27 @@ type fmsgIDAddressResp struct {
 	Reinstated bool `json:"reinstated"`
 }
 
+// ErrLinkedAddressTaken is returned by RegisterLinkedFmsgID when the derived
+// address already exists in fmsgid outside the owner's quota pool: someone
+// else holds it.
+var ErrLinkedAddressTaken = errors.New("derived address is already someone else's")
+
 // errFmsgIDNoAcceptingNew is returned when fmsgid answers POST /fmsgid without
 // a body, i.e. it is a version that ignores accepting_new.
 var errFmsgIDNoAcceptingNew = errors.New("fmsgid does not support accepting_new on POST /fmsgid; upgrade fmsgid")
 
 // RegisterLinkedFmsgID registers a linked address — a derived sub-account
 // address such as @alice_bot@example.com — with fmsgid, idempotently, in its
-// owner's quota pool and accepting new messages. Only its owner can derive a
-// linked address, so one that already exists there was this owner's before:
-// it is reinstated, with its earlier messages, and reinstated reports whether
-// it had stopped accepting new messages (e.g. its grant was deleted).
+// owner's quota pool and accepting new messages. The name alone doesn't prove
+// the address is the owner's: an identity provider may let someone else hold
+// @alice_bot@example.com. So it is claimed (fmsgid's claim): a new address is
+// created in the pool, one already in the owner's pool is reinstated, with
+// its earlier messages, and any other existing address is refused with
+// ErrLinkedAddressTaken. reinstated reports whether it had stopped accepting
+// new messages (e.g. its grant was deleted).
 func RegisterLinkedFmsgID(idURL, addr, owner string) (reinstated bool, err error) {
 	accepting := true
-	resp, err := postFmsgIDAddress(idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting, QuotaPool: owner})
+	resp, err := postFmsgIDAddress(idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting, QuotaPool: owner, Claim: true})
 	if err != nil {
 		return false, err
 	}
@@ -585,6 +596,9 @@ func postFmsgIDAddress(idURL string, req fmsgIDAddressReq) (*fmsgIDAddressResp, 
 	// whatever fmsgid did, the cached lookup may now be stale
 	fmsgIDCache.Delete(fmsgIDAddressURL(idURL, req.Address))
 
+	if resp.StatusCode == http.StatusConflict && req.Claim {
+		return nil, ErrLinkedAddressTaken
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return nil, fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
 	}

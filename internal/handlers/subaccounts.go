@@ -135,9 +135,13 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	}
 	// Derived sub-accounts belong to an already-verified owner, so register
 	// them in fmsgid automatically, in the owner's quota pool, rather than
-	// requiring a manual step. Only this owner can derive subAddr, so if it
-	// already exists there it was theirs before and is reinstated.
+	// requiring a manual step. One already in the owner's pool was theirs
+	// before and is reinstated; one held by anyone else is refused.
 	reinstated, err := middleware.RegisterLinkedFmsgID(h.idURL, subAddr, owner)
+	if errors.Is(err, middleware.ErrLinkedAddressTaken) {
+		c.JSON(http.StatusConflict, gin.H{"error": "that name is already taken; choose another"})
+		return
+	}
 	if err != nil {
 		log.Printf("sub-account create: fmsgid registration: addr=%s: %v", subAddr, err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})

@@ -446,10 +446,13 @@ dots, and hyphens, but not underscores. The derived address is automatically
 registered with fmsgid, in the owner's quota pool so it shares the owner's
 quota — no manual fmsgid step is needed for derived sub-accounts.
 
-Only the owner can derive `@user_bot@domain`, so if the address already exists
-in fmsgid it is the owner's from before — a sub-account they deleted — and is
+The name alone doesn't make `@user_bot@domain` the owner's: an identity
+provider may let someone else sign up as `user_bot`. So the address is claimed
+in fmsgid (`claim` on `POST /fmsgid`). If it already exists in the owner's
+quota pool it is the owner's from before — a sub-account they deleted — and is
 reinstated: it accepts new messages again and its earlier messages are still
-there. The response is the new grant, as from `GET /fmsg/sub-accounts/:agent`,
+there. If it exists anywhere else, someone else holds it: the request fails
+with `409` and nothing changes. The response is the new grant, as from `GET /fmsg/sub-accounts/:agent`,
 plus `api_key` (shown once) and `reinstated`, `true` for a reinstated address
 and `false` for a new one:
 
@@ -469,7 +472,9 @@ and `false` for a new one:
 If the grant can't be created (e.g. `409` or the sub-account limit), a
 reinstated address is stopped accepting new messages again. Reinstating and
 pooling need an fmsgid that supports `accepting_new` and `quota_pool` on
-`POST /fmsgid`; with an older one `reinstated` is always `false`.
+`POST /fmsgid`; with an older one `reinstated` is always `false`. Refusing
+someone else's address needs an fmsgid that supports `claim`: deploy that
+fmsgid first, since an older one ignores `claim`.
 
 Delegated identities such as `@sales@example.com` are not created by this
 self-service route. They are operator-created with `api-key create-delegation`
