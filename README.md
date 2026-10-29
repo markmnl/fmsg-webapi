@@ -325,7 +325,7 @@ message has already been sent.
 
 ## API Routes
 
-All routes are prefixed with `/fmsg`. `POST /fmsg/token` accepts an API key and
+All routes except `/healthz` are prefixed with `/fmsg`. `POST /fmsg/token` accepts an API key and
 returns a JWT. Other routes require a valid `Authorization: Bearer <token>`
 header. The WebSocket route `/fmsg/ws` additionally accepts the token via an
 `access_token` query parameter (browsers cannot set headers on a WebSocket).
@@ -335,6 +335,7 @@ the application.
 
 | Method   | Path                                        | Description              |
 | -------- | ------------------------------------------- | ------------------------ |
+| `GET`    | `/healthz`                       | Health check (no auth): `200 ok`, or `503` when the database is unreachable |
 | `GET`    | `/fmsg`                          | List messages for the authenticated identity |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
