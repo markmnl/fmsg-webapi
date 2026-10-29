@@ -28,6 +28,12 @@ func TestRenderThreadText(t *testing.T) {
 			t.Fatalf("missing %q in:\n%s", want, got)
 		}
 	}
+	if strings.Count(got, "@bob@example.com") != 1 {
+		t.Fatalf("a message the caller cannot read must not name its sender:\n%s", got)
+	}
+	if !strings.Contains(got, "--- hidden ---\n[message not visible to you]") {
+		t.Fatalf("missing hidden placeholder in:\n%s", got)
+	}
 	if strings.Index(got, "root body") > strings.Index(got, "latest reply") {
 		t.Fatal("root must come first (top to bottom)")
 	}

@@ -230,12 +230,17 @@ type threadEntry struct {
 // renderThreadText renders the lineage as plain text, root at the top. Each
 // message gets a one-line separator with sender and send time; non-text
 // bodies and messages the caller may not read become placeholders, so the
-// chain's shape stays visible without leaking content.
+// chain's shape stays visible without leaking content. A message the caller
+// may not read shows neither its sender nor its time.
 func renderThreadText(entries []threadEntry) string {
 	var b strings.Builder
 	for i, e := range entries {
 		if i > 0 {
 			b.WriteString("\n\n")
+		}
+		if !e.Readable {
+			b.WriteString("--- hidden ---\n[message not visible to you]")
+			continue
 		}
 		ts := "draft"
 		if e.TimeSent != nil {
@@ -243,8 +248,6 @@ func renderThreadText(entries []threadEntry) string {
 		}
 		fmt.Fprintf(&b, "--- %s %s ---\n", e.From, ts)
 		switch {
-		case !e.Readable:
-			b.WriteString("[message not visible to you]")
 		case !e.Text:
 			fmt.Fprintf(&b, "[non-text message: %s, %d bytes]", e.Type, e.Size)
 		default:
