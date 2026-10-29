@@ -289,7 +289,9 @@ func TestPurgeKeepsRetryableDelivery(t *testing.T) {
 func TestPurgeRemovesGivenUpDelivery(t *testing.T) {
 	a := newFinalizationAPI(t)
 	ctx := context.Background()
-	a.h.RetryMaxAge = 0.2
+	// An hour's window; the test moves the rows' timestamps back past it
+	// rather than waiting, so a slow run can't close the window early.
+	a.h.RetryMaxAge = 3600
 
 	// Never answered: fmsgd records -1 and retries until the window closes.
 	id := a.sendAs(t, alice, []string{"@dave@remote.example"}, "out", nil)
@@ -320,7 +322,7 @@ func TestPurgeRemovesGivenUpDelivery(t *testing.T) {
 	if v := jsonResponse(t, a.request(alice, "DELETE", "/fmsg/"+id+"?permanent=true", nil), 200); v["removed"] != float64(0) {
 		t.Fatalf("delivery still in the retry window removed: %v", v)
 	}
-	time.Sleep(300 * time.Millisecond)
+	ageBy(t, a, mustID(t, added), 7200)
 
 	// Past it, deleting for good removes the message from the host.
 	if v := jsonResponse(t, a.request(alice, "DELETE", "/fmsg/"+added+"?permanent=true", nil), 200); v["removed"] != float64(1) {
@@ -392,5 +394,32 @@ func TestTrashNotifies(t *testing.T) {
 	}
 	if want := id + "," + bob; n.Payload != want {
 		t.Errorf("payload %q, want %q", n.Payload, want)
+	}
+}
+
+// ageBy moves a sent message's time_sent and its add-to batches' time_added
+// back by secs, as if that long had passed. time_sent is immutable once sent,
+// so the update runs with triggers off (the test database user is a superuser).
+func ageBy(t *testing.T, a *finalizationAPI, msgID int64, secs float64) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`UPDATE msg SET time_sent = time_sent - $2 WHERE id = $1`,
+		`UPDATE msg_add_to_batch SET time_added = time_added - $2 WHERE msg_id = $1`,
+	} {
+		if _, err := tx.Exec(ctx, q, msgID, secs); err != nil {
+			t.Fatalf("age message %d: %v", msgID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
