@@ -49,6 +49,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
 | `FMSG_API_SHORT_TEXT_SIZE`| `768`               | Maximum bytes of message body returned inline as `short_text` for `text/*` UTF-8 messages |
+| `FMSG_RETRY_MAX_AGE` | `86400`                  | Seconds fmsgd keeps retrying a delivery after the message was sent (its `FMSG_RETRY_MAX_AGE`; set both the same). A delivery older than this has been given up on and no longer keeps a deleted-for-good message on the host. |
 | `FMSG_CORS_ORIGINS` | *(optional)*             | Comma-separated list of browser origins allowed via CORS, e.g. `https://example.com,https://www.example.com`. Use `*` to allow any origin. When unset, no CORS headers are emitted (server-to-server callers are unaffected). |
 | `FMSG_VAPID_PUBLIC_KEY` | *(optional)*         | VAPID public key (URL-safe base64) for Web Push. Browsers also pass this as `applicationServerKey`. Generate the pair once with `npx web-push generate-vapid-keys`. |
 | `FMSG_VAPID_PRIVATE_KEY` | *(optional)*        | VAPID private key (URL-safe base64) for Web Push. |
@@ -820,8 +821,12 @@ Each identity has its own trash; nothing in it changes what anyone else sees.
   participant holds a message any more (none sent or accepted it without
   deleting it for good) and none of its deliveries is pending, it is removed
   from the host: its rows and files are deleted, and replies to it from
-  anywhere are then rejected by fmsgd as parent not found. This needs the
-  fmsgd schema that lets a transaction set `fmsg.purge`.
+  anywhere are then rejected by fmsgd as parent not found. A delivery (or
+  add-to participant notification) is pending while fmsgd may still make it:
+  undelivered, its last attempt (if any) got a code fmsgd retries, and it is
+  younger than `FMSG_RETRY_MAX_AGE`; one fmsgd has given up on doesn't keep
+  the message. This needs the fmsgd schema that lets a transaction set
+  `fmsg.purge`.
 
 ### Message hashes and references
 

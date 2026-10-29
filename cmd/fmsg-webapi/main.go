@@ -64,6 +64,10 @@ func main() {
 	maxAttachSize := int64(envOrDefaultInt("FMSG_API_MAX_ATTACH_SIZE", 10)) * 1024 * 1024
 	maxMsgSize := int64(envOrDefaultInt("FMSG_API_MAX_MSG_SIZE", 20)) * 1024 * 1024
 	shortTextSize := envOrDefaultInt("FMSG_API_SHORT_TEXT_SIZE", 768)
+	retryMaxAge := envOrDefaultInt("FMSG_RETRY_MAX_AGE", handlers.DefaultRetryMaxAge)
+	if retryMaxAge <= 0 {
+		log.Fatal("environment variable FMSG_RETRY_MAX_AGE must be a positive number of seconds")
+	}
 
 	// CORS: comma-separated list of allowed browser origins, e.g.
 	// "https://app.example.com,https://www.example.com". Empty disables CORS.
@@ -144,6 +148,7 @@ func main() {
 
 	// Instantiate handlers.
 	msgHandler := handlers.NewMessageHandler(database, dataDir, maxDataSize, maxMsgSize, shortTextSize, apiStore, idURL, localDomain)
+	msgHandler.RetryMaxAge = float64(retryMaxAge)
 	attHandler := handlers.NewAttachmentHandler(database, dataDir, maxAttachSize, maxMsgSize)
 
 	// Web Push handler: stores subscriptions and delivers VAPID pushes for

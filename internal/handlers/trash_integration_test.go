@@ -262,6 +262,91 @@ func TestPurge(t *testing.T) {
 	}
 }
 
+// A delivery fmsgd still retries keeps the message, whatever the code it
+// retries after; one that ended with a final code does not.
+func TestPurgeKeepsRetryableDelivery(t *testing.T) {
+	a := newFinalizationAPI(t)
+	ctx := context.Background()
+	full := a.sendAs(t, alice, []string{"@dave@remote.example"}, "user full", nil)
+	if _, err := a.pool.Exec(ctx, `UPDATE msg_to SET response_code = 101, attempt_count = 1, time_last_attempt = $2 WHERE msg_id = $1`, mustID(t, full), now()); err != nil {
+		t.Fatal(err)
+	}
+	if v := jsonResponse(t, a.request(alice, "DELETE", "/fmsg/"+full+"?permanent=true", nil), 200); v["removed"] != float64(0) {
+		t.Errorf("delivery fmsgd retries (user full) removed: %v", v)
+	}
+	unknown := a.sendAs(t, alice, []string{"@dave@remote.example"}, "user unknown", nil)
+	if _, err := a.pool.Exec(ctx, `UPDATE msg_to SET response_code = 100, attempt_count = 1, time_last_attempt = $2 WHERE msg_id = $1`, mustID(t, unknown), now()); err != nil {
+		t.Fatal(err)
+	}
+	if v := jsonResponse(t, a.request(alice, "DELETE", "/fmsg/"+unknown+"?permanent=true", nil), 200); v["removed"] != float64(1) {
+		t.Errorf("delivery that ended with a final code kept: %v", v)
+	}
+}
+
+// A delivery fmsgd has given up on (older than the retry window, still
+// undelivered) no longer keeps the message, nor does an add-to participant
+// notification it has given up on.
+func TestPurgeRemovesGivenUpDelivery(t *testing.T) {
+	a := newFinalizationAPI(t)
+	ctx := context.Background()
+	a.h.RetryMaxAge = 0.2
+
+	// Never answered: fmsgd records -1 and retries until the window closes.
+	id := a.sendAs(t, alice, []string{"@dave@remote.example"}, "out", nil)
+	if _, err := a.pool.Exec(ctx, `UPDATE msg_to SET response_code = -1, attempt_count = 5, time_last_attempt = $2 WHERE msg_id = $1`, mustID(t, id), now()); err != nil {
+		t.Fatal(err)
+	}
+	// Delivered to dave, then erin added: erin's delivery and the notification
+	// owed to dave's domain are pending until they age out.
+	added := a.sendAs(t, alice, []string{"@dave@remote.example"}, "added to", nil)
+	if _, err := a.pool.Exec(ctx, `UPDATE msg_to SET time_delivered = $2, response_code = 0 WHERE msg_id = $1`, mustID(t, added), now()); err != nil {
+		t.Fatal(err)
+	}
+	jsonResponse(t, a.request(alice, "POST", "/fmsg/"+added+"/add-to", map[string]any{"add_to": []string{"@erin@other.example"}}), 200)
+	var notifies int
+	if err := a.pool.QueryRow(ctx, `SELECT count(*) FROM msg_add_to_notify n JOIN msg_add_to_batch b ON b.id = n.batch_id WHERE b.msg_id = $1 AND n.time_notified IS NULL`, mustID(t, added)).Scan(&notifies); err != nil || notifies != 1 {
+		t.Fatalf("pending notify rows = %d, %v; want 1", notifies, err)
+	}
+	for _, q := range []string{
+		`UPDATE msg_add_to SET response_code = -1, attempt_count = 5, time_last_attempt = $2 WHERE msg_id = $1`,
+		`UPDATE msg_add_to_notify SET response_code = -1, attempt_count = 5, time_last_attempt = $2 WHERE batch_id IN (SELECT id FROM msg_add_to_batch WHERE msg_id = $1)`,
+	} {
+		if _, err := a.pool.Exec(ctx, q, mustID(t, added), now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Inside the window both are kept (only hidden from alice).
+	if v := jsonResponse(t, a.request(alice, "DELETE", "/fmsg/"+id+"?permanent=true", nil), 200); v["removed"] != float64(0) {
+		t.Fatalf("delivery still in the retry window removed: %v", v)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Past it, deleting for good removes the message from the host.
+	if v := jsonResponse(t, a.request(alice, "DELETE", "/fmsg/"+added+"?permanent=true", nil), 200); v["removed"] != float64(1) {
+		t.Errorf("given-up add-to delivery and notification kept the message: %v", v)
+	}
+	if a.exists(t, added) {
+		t.Error("message reported removed is still stored")
+	}
+	if !a.exists(t, id) {
+		t.Error("message deleted for good inside the window was removed without a purge")
+	}
+}
+
+// exists reports whether message id is still stored on the host.
+func (a *finalizationAPI) exists(t *testing.T, id string) bool {
+	t.Helper()
+	var ok bool
+	if err := a.pool.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM msg WHERE id = $1)`, mustID(t, id)).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+// now is the current time as fmsgd stores times: seconds since the epoch.
+func now() float64 { return float64(time.Now().UnixMicro()) / 1e6 }
+
 // A message still being delivered elsewhere is not removed.
 func TestPurgeKeepsPendingDelivery(t *testing.T) {
 	a := newFinalizationAPI(t)
