@@ -21,7 +21,7 @@ import (
 )
 
 // fakeFmsgID is an in-memory fmsgid serving GET /fmsgid/:address and
-// POST /fmsgid with accepting_new and quota_pool.
+// POST /fmsgid with accepting_new, quota_pool and claim.
 type fakeFmsgID struct {
 	mu        sync.Mutex
 	accepting map[string]bool
@@ -69,6 +69,13 @@ func (f *fakeFmsgID) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		addr := strings.ToLower(body["address"].(string))
 		was, existed := f.accepting[addr]
+		// a claim of an existing address outside the pool changes nothing
+		if claim, _ := body["claim"].(bool); claim && existed && !f.legacy {
+			if p, _ := body["quota_pool"].(string); f.pool[addr] != strings.ToLower(p) {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+		}
 		if !existed {
 			f.accepting[addr] = true
 		}
@@ -328,6 +335,38 @@ func TestSubAccountCreateFailureUndoesReinstatement(t *testing.T) {
 	createSubAccount(t, r, "old", http.StatusForbidden)
 	if accepting, _ := id.isAccepting("@alice_old@example.com"); accepting {
 		t.Fatal("address reinstated although its grant wasn't created")
+	}
+}
+
+// TestSubAccountCreateRefusesSomeoneElsesAddress: a derived address that
+// already exists outside the owner's pool (an account someone else signed up
+// for, or a closed one) is refused, and neither fmsgid nor the grants change.
+func TestSubAccountCreateRefusesSomeoneElsesAddress(t *testing.T) {
+	store := newSubAccountTestStore(t)
+	id, server := newFakeFmsgID(t, lifecycleOwner, "@alice_bot@example.com", "@alice_closed@example.com")
+	id.accepting["@alice_closed@example.com"] = false
+	r := subAccountRouter(NewSubAccountHandler(store, server.URL))
+
+	for _, agent := range []string{"bot", "closed"} {
+		createSubAccount(t, r, agent, http.StatusConflict)
+	}
+	if accepting, _ := id.isAccepting("@alice_closed@example.com"); accepting {
+		t.Fatal("refused claim reinstated a closed address")
+	}
+	if len(id.pool) != 0 {
+		t.Fatalf("refused claims pooled %v", id.pool)
+	}
+	if _, grants, err := store.List(context.Background(), lifecycleOwner); err != nil || len(grants) != 0 {
+		t.Fatalf("grants after refused creates: %v, err=%v", grants, err)
+	}
+
+	// the owner's own deleted sub-account is still reinstated
+	createSubAccount(t, r, "mine", http.StatusCreated)
+	if w := serveSubAccount(r, http.MethodDelete, "/fmsg/sub-accounts/mine", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("delete: status %d", w.Code)
+	}
+	if out := createSubAccount(t, r, "mine", http.StatusCreated); out["reinstated"] != true {
+		t.Fatalf("re-create own sub-account: %v, want reinstated", out)
 	}
 }
 

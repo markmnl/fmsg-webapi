@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -47,7 +48,7 @@ func TestRegisterLinkedFmsgIDRefreshesExistingAddress(t *testing.T) {
 				case r.Method == http.MethodPost && r.URL.Path == "/fmsgid":
 					var body map[string]any
 					if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["address"] != addr ||
-						body["accepting_new"] != true || body["quota_pool"] != "@alice@example.com" {
+						body["accepting_new"] != true || body["quota_pool"] != "@alice@example.com" || body["claim"] != true {
 						t.Errorf("registration payload: %v, err=%v", body, err)
 						w.WriteHeader(http.StatusBadRequest)
 						return
@@ -83,6 +84,7 @@ func TestRegisterLinkedFmsgIDResponses(t *testing.T) {
 		body           string
 		wantReinstated bool
 		wantErr        bool
+		wantTaken      bool
 	}{
 		{name: "created", status: http.StatusCreated, body: `{"created":true,"reinstated":false}`},
 		{name: "existing", status: http.StatusOK, body: `{"created":false,"reinstated":false}`},
@@ -90,6 +92,7 @@ func TestRegisterLinkedFmsgIDResponses(t *testing.T) {
 		{name: "fmsgid without accepting_new", status: http.StatusOK, body: ""},
 		{name: "malformed", status: http.StatusOK, body: "<html>", wantErr: true},
 		{name: "quota pool refused", status: http.StatusUnprocessableEntity, body: `{"error":"quota_pool address not found"}`, wantErr: true},
+		{name: "someone else's address", status: http.StatusConflict, body: `{"error":"address already exists outside that quota pool"}`, wantErr: true, wantTaken: true},
 		{name: "unavailable", status: http.StatusServiceUnavailable, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,6 +104,9 @@ func TestRegisterLinkedFmsgIDResponses(t *testing.T) {
 			reinstated, err := RegisterLinkedFmsgID(server.URL, "@alice_bot@example.com", "@alice@example.com")
 			if (err != nil) != tc.wantErr || reinstated != tc.wantReinstated {
 				t.Fatalf("reinstated=%v, err=%v; want reinstated=%v, error=%v", reinstated, err, tc.wantReinstated, tc.wantErr)
+			}
+			if errors.Is(err, ErrLinkedAddressTaken) != tc.wantTaken {
+				t.Fatalf("err=%v, want ErrLinkedAddressTaken %v", err, tc.wantTaken)
 			}
 		})
 	}
