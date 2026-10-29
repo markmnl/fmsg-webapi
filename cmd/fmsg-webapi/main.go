@@ -118,8 +118,10 @@ func main() {
 		log.Fatalf("failed to initialise JWT verifier: %v", err)
 	}
 
-	// Create Gin router.
-	router := gin.Default()
+	// Create Gin router. Like gin.Default, but health checks, which monitors
+	// make every few seconds, are left out of the request log.
+	router := gin.New()
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/healthz"}}), gin.Recovery())
 	if trustedProxies := parseCSV(os.Getenv("FMSG_TRUSTED_PROXIES")); len(trustedProxies) > 0 {
 		if err := router.SetTrustedProxies(trustedProxies); err != nil {
 			log.Fatalf("invalid FMSG_TRUSTED_PROXIES: %v", err)
@@ -171,6 +173,7 @@ func main() {
 		tokenHandler = handlers.NewTokenHandler(apiStore, tokenIssuer, idURL)
 		subAccountHandler = handlers.NewSubAccountHandler(apiStore, idURL)
 	}
+	router.GET("/healthz", handlers.Healthz(database.Pool))
 	registerRoutes(router, jwtMiddleware, msgHandler, attHandler, tokenHandler, subAccountHandler, pushHandler, wsHandler)
 
 	srv := &http.Server{
