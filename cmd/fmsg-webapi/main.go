@@ -296,6 +296,7 @@ func registerRoutes(router *gin.Engine, jwtMiddleware gin.HandlerFunc, msgHandle
 		fmsg.POST("/:id/restore", msgHandler.Atomic((*handlers.MessageHandler).Restore))
 		fmsg.POST("/:id/add-to", msgHandler.Atomic((*handlers.MessageHandler).AddRecipients))
 		fmsg.POST("/:id/react", msgHandler.Atomic((*handlers.MessageHandler).React))
+		fmsg.POST("/:id/indicate", msgHandler.Indicate)
 		fmsg.GET("/:id/data", msgHandler.DownloadData)
 		fmsg.GET("/:id/thread", msgHandler.ThreadText)
 		fmsg.GET("/:id/thread/messages", msgHandler.ThreadMessages)
