@@ -359,6 +359,7 @@ the application.
 | `POST`   | `/fmsg/:id/restore`              | Take a message or thread out of the trash |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
 | `POST`   | `/fmsg/:id/react`                | Set or clear an emoji reaction (FMSG-005) |
+| `POST`   | `/fmsg/:id/indicate`             | Show or clear an indicator, such as composing a reply (FMSG-006) |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
 | `GET`    | `/fmsg/:id/thread`               | Render direct ancestry as plain text |
 | `GET`    | `/fmsg/:id/thread/messages`      | Load direct ancestry as structured JSON |
@@ -566,6 +567,7 @@ event types can be added without breaking clients:
 | `recipients_added` | The refreshed message object. | An add-to batch was recorded on a message the user participates in. |
 | `read` | The message object, with `read` and `time_read` set. | The user marked a message read (`POST /fmsg/:id/read`), on this or any other connection, so every tab and device can stop showing it as unread. Sent once, when the message first becomes read. |
 | `reaction` | The refreshed **subject** message object, with its `reactions` up to date. | A reaction (FMSG-005) on a message the user participates in arrives. The reaction message itself is not pushed as `new_msg` and triggers no Web Push. |
+| `indicator` | `{"id": <int>, "root_id": <int>, "from": "<address>", "emoji": "<emoji, or empty>", "ttl": <seconds>}`: `from`'s state on message `id` (in the thread starting at `root_id`), valid for `ttl` seconds unless a later one replaces it. An empty `emoji` clears it. | A participant of a message the user is on [shows or clears an indicator](#post-fmsgidindicate) on it, on this host or another. Never stored, and no Web Push. |
 | `trash` | The message object with its `trash` state, or `{"id": <int>, "trash": "purged"}` for a message deleted for good. | The user moved a message into or out of their [trash](#trash), or deleted it for good, on this or any other connection. |
 
 No event about a message the user deleted for good is ever pushed again,
@@ -992,6 +994,43 @@ the caller has no reaction returns `200 OK` with `null` values.
 | `409`  | Message is a draft, is terminal, has no other participants, or a remote recipient host cannot accept the reaction because it does not hold the message |
 | `413`, `422`, `429` | The reaction would exceed one of the reactor's send limits, as for send |
 | `503`  | fmsgid unavailable, so the send limits can't be checked |
+
+### POST `/fmsg/:id/indicate`
+
+Shows or clears the authenticated identity's indicator on a message, per
+[FMSG-006 Indicators](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-006-indicators.md):
+a short-lived state such as ✍️ composing a reply or ⏳ working on one. The
+identity must be a participant of the message, and the message must be sent and
+not terminal.
+
+Nothing is stored. The indicator is published on the PostgreSQL `NOTIFY`
+channel `indicator` as JSON `{"id", "from", "emoji", "ttl"}`; every instance's
+WebSocket hub sends it to the message's other connected participants as an
+[`indicator` event](#get-fmsgws), and the host sends it on to participants on
+other hosts. A client should repeat it every couple of seconds while the state
+lasts, and clear it when the state ends (for example when the reply is sent);
+an uncleared state lapses after `ttl` seconds.
+
+**Request body (JSON):**
+
+| Field   | Type      | Required | Description |
+| ------- | --------- | -------- | ----------- |
+| `emoji` | `string`  | no       | A single emoji, as for reactions. `""` or `null` clears the indicator. |
+| `ttl`   | `integer` | no       | Seconds the state lasts unless repeated: 1 to 120 (larger values are clamped), default 6. `0` clears. |
+
+Indicators set more than once a second by one identity on one message are
+accepted but dropped; clears always go through.
+
+**Response:** `202 Accepted` with no body.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `400`  | `emoji` is not a single emoji, or `ttl` is negative |
+| `403`  | Authenticated identity is not a participant |
+| `404`  | Message not found |
+| `409`  | Message is a draft or is terminal |
 
 ### GET `/fmsg/:id/data`
 

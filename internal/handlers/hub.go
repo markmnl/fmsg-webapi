@@ -21,6 +21,7 @@ const (
 	eventReaction        = "reaction"
 	eventRead            = "read"
 	eventTrash           = "trash"
+	eventIndicator       = "indicator"
 )
 
 // wsEnvelope is the JSON shape of every frame pushed over a WebSocket. The
@@ -51,6 +52,10 @@ type Hub struct {
 	// as new_msg.
 	reactionSubject func(ctx context.Context, msgID int64) (int64, bool)
 
+	// indicatorAudience reports a message's participants and its thread's
+	// first message, for FMSG-006 indicators.
+	indicatorAudience func(ctx context.Context, msgID int64) ([]string, int64, error)
+
 	mu sync.RWMutex
 	// registry maps a lower-cased user address to the set of that user's
 	// currently connected clients (a user may have several connections).
@@ -66,9 +71,10 @@ func (h *Hub) SetPushNotifier(fn func(ctx context.Context, msgID int64, addr str
 // NewHub creates a Hub that builds pushed message payloads via msgs.
 func NewHub(msgs *MessageHandler) *Hub {
 	return &Hub{
-		buildItem:       msgs.messageItemFor,
-		reactionSubject: msgs.reactionSubject,
-		registry:        make(map[string]map[*wsClient]struct{}),
+		buildItem:         msgs.messageItemFor,
+		reactionSubject:   msgs.reactionSubject,
+		indicatorAudience: msgs.indicatorAudience,
+		registry:          make(map[string]map[*wsClient]struct{}),
 	}
 }
 
@@ -148,13 +154,20 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	if _, err := conn.Exec(ctx, "LISTEN msg_trash"); err != nil {
 		return err
 	}
-	log.Println("ws hub: listening on new_msg, delivered, recipients_added, msg_read, msg_trash")
+	if _, err := conn.Exec(ctx, "LISTEN "+IndicatorChannel); err != nil {
+		return err
+	}
+	log.Println("ws hub: listening on new_msg, delivered, recipients_added, msg_read, msg_trash, indicator")
 	onConnected()
 
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			return err
+		}
+		if n.Channel == IndicatorChannel {
+			h.routeIndicator(ctx, n.Payload)
+			continue
 		}
 		msgID, addr, ok := parseNotifyPayload(n.Payload)
 		if !ok {
@@ -311,4 +324,39 @@ func (h *Hub) send(clients []*wsClient, msgID int64, env wsEnvelope) {
 			c.close()
 		}
 	}
+}
+
+// routeIndicator delivers an FMSG-006 indicator (a JSON Indicator payload on
+// the indicator channel) to every connected participant of its message except
+// the indicating one. It is sent as is, with the thread's first message id
+// added; nothing is stored and no Web Push is sent.
+func (h *Hub) routeIndicator(ctx context.Context, payload string) {
+	var ind Indicator
+	if err := json.Unmarshal([]byte(payload), &ind); err != nil || ind.ID <= 0 || ind.From == "" {
+		log.Printf("ws hub: ignoring malformed indicator payload %q", payload)
+		return
+	}
+	if h.indicatorAudience == nil {
+		return
+	}
+	addrs, root, err := h.indicatorAudience(ctx, ind.ID)
+	if err != nil {
+		log.Printf("ws hub: indicator on %d: %v", ind.ID, err)
+		return
+	}
+	ind.RootID = root
+	var clients []*wsClient
+	seen := map[string]bool{strings.ToLower(ind.From): true}
+	for _, a := range addrs {
+		k := strings.ToLower(a)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		clients = append(clients, h.clientsOf(a)...)
+	}
+	if len(clients) == 0 {
+		return
+	}
+	h.send(clients, ind.ID, wsEnvelope{Type: eventIndicator, Data: ind})
 }
