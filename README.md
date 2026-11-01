@@ -342,6 +342,7 @@ the application.
 | `GET`    | `/healthz`                       | Health check (no auth): `200 ok`, or `503` when the database is unreachable |
 | `GET`    | `/fmsg`                          | List messages for the authenticated identity |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
+| `GET`    | `/fmsg/count`                    | Count the identity's threads |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
 | `GET`    | `/fmsg/sub-accounts`             | List owned API-access grants |
@@ -626,6 +627,22 @@ This includes both sent messages and drafts (`time_sent` may be `NULL`).
 | `trash`   | `exclude` | As for `GET /fmsg`. |
 
 **Response:** JSON array of message objects with the same shape as `GET /fmsg`.
+
+### GET `/fmsg/count`
+
+How many threads the authenticated identity has, for a client to show "93 of
+8,324 threads" while it pages through the lists. Every sent message the
+identity can see (as its sender, a recipient or an added recipient) whose
+parent it can't also see starts one thread, which is how a thread is grouped
+from listed messages. Drafts don't count.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+| --------- | ------- | ----------- |
+| `trash`   | `exclude` | As for `GET /fmsg`: `exclude`, `include` or `only` |
+
+**Response:** `200 OK` with `{"threads": <int>}`.
 
 ### POST `/fmsg`
 

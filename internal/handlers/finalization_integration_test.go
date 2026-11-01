@@ -95,6 +95,7 @@ func newFinalizationAPIWithID(t *testing.T, fmsgID http.Handler) *finalizationAP
 	r.DELETE("/fmsg/:id", h.Atomic((*MessageHandler).Delete))
 	r.GET("/fmsg", h.List)
 	r.GET("/fmsg/sent", h.Sent)
+	r.GET("/fmsg/count", h.Count)
 	r.GET("/fmsg/:id", h.Get)
 	r.GET("/fmsg/:id/data", h.DownloadData)
 	r.POST("/fmsg/:id/send", h.Atomic((*MessageHandler).Send))
