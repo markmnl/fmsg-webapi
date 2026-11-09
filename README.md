@@ -589,7 +589,7 @@ ws.onmessage = (e) => {
 
 ### GET `/fmsg`
 
-Returns messages where the authenticated identity is a recipient (listed in `msg_to` or `msg_add_to`), ordered by message ID descending.
+Returns messages where the authenticated identity is a recipient (listed in `msg_to` or `msg_add_to`), most recently arrived first. A message arrives when it is sent to the identity or, later, when an add-to batch adds the identity to it (the batch's `time_added`), whichever is latest; ties are broken by message ID descending. So an older message the identity was just added to is listed first, not at its original position.
 
 Only sent messages are listed. A draft is its sender's alone: until it is sent,
 its recipients get `404` for it on every route (get, data, attachments, thread,
