@@ -307,7 +307,10 @@ type messageInput struct {
 	Data   string          `json:"data"`
 }
 
-// List handles GET /fmsg — lists messages where the authenticated user is a recipient.
+// List handles GET /fmsg — lists messages where the authenticated user is a
+// recipient, most recently arrived first. A message arrives for the identity
+// when it is sent to them or, later, when they are added to it, so an older
+// message someone has just added them to comes first rather than at its id.
 func (h *MessageHandler) List(c *gin.Context) {
 	addrs, err := h.visibleAddrs(c)
 	if err != nil {
@@ -339,13 +342,24 @@ func (h *MessageHandler) List(c *gin.Context) {
 		            (SELECT mt.time_read FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1)),
 		            (SELECT mat.time_read FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1))
 		        ) AS time_read, t.state
-		 FROM msg m
+		 FROM (
+		     SELECT r.msg_id, max(r.arrived) AS arrived
+		     FROM (
+		         SELECT mt.msg_id, m0.time_sent AS arrived
+		         FROM msg_to mt JOIN msg m0 ON m0.id = mt.msg_id
+		         WHERE lower(mt.addr) = ANY($1)
+		         UNION ALL
+		         SELECT mat.msg_id, b.time_added
+		         FROM msg_add_to mat JOIN msg_add_to_batch b ON b.id = mat.batch_id
+		         WHERE lower(mat.addr) = ANY($1)
+		     ) r
+		     GROUP BY r.msg_id
+		 ) inbox
+		 JOIN msg m ON m.id = inbox.msg_id
 		 CROSS JOIN LATERAL (SELECT CASE WHEN $4 THEN fmsg_api_trash_state($5, m.id) END AS state) t
 		 WHERE m.time_sent IS NOT NULL
-		   AND (EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1))
-		     OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1)))
 		   AND `+trashFilter+`
-		 ORDER BY m.id DESC
+		 ORDER BY inbox.arrived DESC NULLS LAST, m.id DESC
 		 LIMIT $2 OFFSET $3`,
 		addrs, limit, offset, hasTrash, addrs[0],
 	)
