@@ -52,7 +52,17 @@ type Message struct {
 	Attachments []Attachment        `json:"attachments"`
 	Reaction    *string             `json:"reaction"`  // FMSG-005: the emoji this message carries when it is a reaction ("" clears); nil otherwise
 	Reactions   []Reaction          `json:"reactions"` // FMSG-005: effective reactions on this message
+	Edit        bool                `json:"edit"`      // FMSG-008: whether this message is itself an edit message
+	Edited      *Edited             `json:"edited"`    // FMSG-008: the effective edit on this message; nil when it has none
 	Trash       *string             `json:"trash"`     // "message" or "thread" when in the caller's trash, null otherwise
+}
+
+// Edited identifies the edit message in force on a message (FMSG-008) and the
+// byte length of the edited data, nil when the edit could not be applied.
+type Edited struct {
+	ID   int64   `json:"id"`
+	Time float64 `json:"time"`
+	Size *int    `json:"size"`
 }
 
 // Reaction is one emoji currently reacted on a message and the participants

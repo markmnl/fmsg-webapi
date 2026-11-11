@@ -181,6 +181,9 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 	if item.Reaction != nil {
 		return // FMSG-005: a reaction does not warrant a notification
 	}
+	if item.Edit {
+		return // FMSG-008: nor does an edit
+	}
 	if item.purged || item.Trash != nil {
 		return // in the recipient's trash: they aren't told
 	}

@@ -347,8 +347,9 @@ func (h *MessageHandler) React(c *gin.Context) {
 
 	recipients := reactionRecipients(subject, identity)
 	if len(recipients) == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "message has no other participants to send a reaction to"})
-		return
+		// A message the caller sent only to themselves: the reaction is
+		// addressed to the caller (FMSG-005 v0.1.1).
+		recipients = []string{identity}
 	}
 
 	// Idempotency: the caller's current effective reaction.
