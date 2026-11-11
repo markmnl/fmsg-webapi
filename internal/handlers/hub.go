@@ -19,6 +19,7 @@ const (
 	eventDelivered       = "delivered"
 	eventRecipientsAdded = "recipients_added"
 	eventReaction        = "reaction"
+	eventEdit            = "edit"
 	eventRead            = "read"
 	eventTrash           = "trash"
 	eventIndicator       = "indicator"
@@ -51,6 +52,10 @@ type Hub struct {
 	// recipients as a reaction event carrying the refreshed subject, never
 	// as new_msg.
 	reactionSubject func(ctx context.Context, msgID int64) (int64, bool)
+	// editSubject, when non-nil, reports the subject message of msgID when
+	// msgID is an FMSG-008 edit. An edit is pushed to its recipients as an
+	// edit event carrying the refreshed subject, never as a new message.
+	editSubject func(ctx context.Context, msgID int64) (int64, bool)
 
 	// indicatorAudience reports a message's participants and its thread's
 	// first message, for FMSG-006 indicators.
@@ -73,6 +78,7 @@ func NewHub(msgs *MessageHandler) *Hub {
 	return &Hub{
 		buildItem:         msgs.messageItemFor,
 		reactionSubject:   msgs.reactionSubject,
+		editSubject:       msgs.editSubject,
 		indicatorAudience: msgs.indicatorAudience,
 		registry:          make(map[string]map[*wsClient]struct{}),
 	}
@@ -188,6 +194,14 @@ func (h *Hub) route(ctx context.Context, channel string, msgID int64, addr strin
 				// FMSG-005: a reaction is a low-priority event on its
 				// subject, not a new message. No Web Push is sent.
 				h.dispatch(ctx, subject, addr, eventReaction)
+				return
+			}
+		}
+		if h.editSubject != nil {
+			if subject, ok := h.editSubject(ctx, msgID); ok {
+				// FMSG-008: an edit is a low-priority event on its
+				// subject, not a new message. No Web Push is sent.
+				h.dispatch(ctx, subject, addr, eventEdit)
 				return
 			}
 		}

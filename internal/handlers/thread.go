@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -65,6 +66,7 @@ type threadMessage struct {
 	MessageSHA256 string              `json:"message_sha256,omitempty"`
 	Trash         *string             `json:"trash,omitempty"` // "message" or "thread" when in the caller's trash
 	Body          *threadBody         `json:"body,omitempty"`
+	Edited        *models.Edited      `json:"edited,omitempty"`
 	Attachments   []threadAttachment  `json:"attachments,omitempty"`
 	dataPath      string
 }
@@ -269,6 +271,41 @@ func isTextType(mimeType string) bool {
 // text, root first. The caller must be a participant of the requested
 // message; ancestors the caller is not a participant of appear as
 // placeholders (a recipient added mid-thread cannot read what came before).
+// applyThreadEdits presents each visible message that has an effective
+// FMSG-008 edit as edited: its body becomes the edited data, cached under the
+// edit message's hash since the subject's own hash no longer identifies it.
+func (h *MessageHandler) applyThreadEdits(ctx context.Context, messages []threadMessage) {
+	var ids []int64
+	for i := range messages {
+		if messages[i].Visible {
+			ids = append(ids, messages[i].ID)
+		}
+	}
+	edits := h.loadEffectiveEdits(ctx, ids)
+	for i := range messages {
+		m := &messages[i]
+		eff := edits[m.ID]
+		if !m.Visible || eff == nil {
+			continue
+		}
+		m.Edited = eff.edited()
+		if !eff.applied || m.Body == nil {
+			continue
+		}
+		key := partCacheKey(hex.EncodeToString(eff.hash), "body", 0, "")
+		m.Body.Size = len(eff.data)
+		m.Body.CacheKey = key
+		m.Body.Cacheable = key != ""
+		m.Body.Text = nil
+		m.Body.Download = threadDownloadPath(m.ID, "")
+		if isTextType(m.Type) && utf8.Valid(eff.data) {
+			text := string(eff.data)
+			m.Body.Text = &text
+			m.Body.Download = ""
+		}
+	}
+}
+
 func (h *MessageHandler) ThreadText(c *gin.Context) {
 	addrs, err := h.visibleAddrs(c)
 	if err != nil {
@@ -352,9 +389,23 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		return
 	}
 
+	entryIDs := make([]int64, 0, len(entries))
+	for i := range entries {
+		if entries[i].Readable {
+			entryIDs = append(entryIDs, entries[i].ID)
+		}
+	}
+	edits := h.loadEffectiveEdits(ctx, entryIDs)
+
 	for i := range entries {
 		e := &entries[i]
 		if !e.Readable || !isTextType(e.Type) {
+			continue
+		}
+		if eff := edits[e.ID]; eff != nil && eff.applied {
+			// FMSG-008: an edited message renders as edited.
+			e.Body = string(eff.data)
+			e.Text = true
 			continue
 		}
 		dataPath := paths[e.ID]
@@ -500,6 +551,7 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "thread data is unavailable", "code": "thread_data_unavailable"})
 		return
 	}
+	h.applyThreadEdits(ctx, messages)
 	complete := true
 	for i := range messages {
 		if !messages[i].Visible {

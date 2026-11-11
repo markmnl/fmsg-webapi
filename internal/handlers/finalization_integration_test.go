@@ -103,6 +103,7 @@ func newFinalizationAPIWithID(t *testing.T, fmsgID http.Handler) *finalizationAP
 	r.POST("/fmsg/:id/restore", h.Atomic((*MessageHandler).Restore))
 	r.POST("/fmsg/:id/add-to", h.Atomic((*MessageHandler).AddRecipients))
 	r.POST("/fmsg/:id/react", h.Atomic((*MessageHandler).React))
+	r.POST("/fmsg/:id/edit", h.Atomic((*MessageHandler).Edit))
 	r.POST("/fmsg/:id/indicate", h.Indicate)
 	r.GET("/fmsg/:id/thread", h.ThreadText)
 	r.GET("/fmsg/:id/thread/messages", h.ThreadMessages)

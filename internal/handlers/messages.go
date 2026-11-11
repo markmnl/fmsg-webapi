@@ -94,6 +94,8 @@ type messageListItem struct {
 	Attachments []models.Attachment        `json:"attachments"`
 	Reaction    *string                    `json:"reaction"`
 	Reactions   []models.Reaction          `json:"reactions"`
+	Edit        bool                       `json:"edit"`
+	Edited      *models.Edited             `json:"edited"`
 	// Trash is "message" or "thread" when the message is in the caller's
 	// trash, null otherwise.
 	Trash *string `json:"trash"`
@@ -428,6 +430,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	}
 
 	h.populateListReactions(ctx, messages)
+	h.populateListEdits(ctx, messages)
 
 	c.JSON(http.StatusOK, messages)
 }
@@ -538,6 +541,7 @@ func (h *MessageHandler) Sent(c *gin.Context) {
 	}
 
 	h.populateListReactions(ctx, messages)
+	h.populateListEdits(ctx, messages)
 
 	c.JSON(http.StatusOK, messages)
 }
@@ -699,6 +703,15 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	if msg.Reactions == nil {
 		msg.Reactions = []models.Reaction{}
 	}
+	if editShape(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, len(msg.Attachments)) {
+		_, msg.Edit = h.editSubject(ctx, msgID)
+	}
+	if eff := h.loadEffectiveEdits(ctx, []int64{msgID})[msgID]; eff != nil {
+		msg.Edited = eff.edited()
+		if eff.applied {
+			msg.ShortText = h.shortTextOf(eff.data, msg.Type)
+		}
+	}
 
 	// Populate per-recipient read state for the calling user. The sender
 	// has no read state of their own.
@@ -767,6 +780,24 @@ func (h *MessageHandler) DownloadData(c *gin.Context) {
 			) r`, msgID, addrs,
 		).Scan(&recipientCount); err != nil || recipientCount == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+			return
+		}
+	}
+
+	// FMSG-008: an edited message downloads as edited unless the original
+	// is asked for.
+	if c.Query("original") != "true" {
+		if eff := h.loadEffectiveEdits(ctx, []int64{msgID})[msgID]; eff != nil && eff.applied {
+			name := "data"
+			if dataPath != "" {
+				name = filepath.Base(dataPath)
+			}
+			contentType := mime.TypeByExtension(filepath.Ext(name))
+			if contentType == "" {
+				contentType = "application/octet-stream"
+			}
+			c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+			c.Data(http.StatusOK, contentType, eff.data)
 			return
 		}
 	}
@@ -1551,6 +1582,15 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 	item.Reactions = h.loadReactions(ctx, []int64{msgID})[msgID]
 	if item.Reactions == nil {
 		item.Reactions = []models.Reaction{}
+	}
+	if editShape(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, len(item.Attachments)) {
+		_, item.Edit = h.editSubject(ctx, msgID)
+	}
+	if eff := h.loadEffectiveEdits(ctx, []int64{msgID})[msgID]; eff != nil {
+		item.Edited = eff.edited()
+		if eff.applied {
+			item.ShortText = h.shortTextOf(eff.data, item.Type)
+		}
 	}
 
 	// Populate the recipient's per-recipient read state, mirroring Get.

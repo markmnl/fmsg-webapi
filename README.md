@@ -360,6 +360,7 @@ the application.
 | `POST`   | `/fmsg/:id/restore`              | Take a message or thread out of the trash |
 | `POST`   | `/fmsg/:id/add-to`               | Add recipients           |
 | `POST`   | `/fmsg/:id/react`                | Set or clear an emoji reaction (FMSG-005) |
+| `POST`   | `/fmsg/:id/edit`                 | Edit or revert the data of your own sent message (FMSG-008) |
 | `POST`   | `/fmsg/:id/indicate`             | Show or clear an indicator, such as composing a reply (FMSG-006) |
 | `GET`    | `/fmsg/:id/data`                 | Download message data    |
 | `GET`    | `/fmsg/:id/thread`               | Render direct ancestry as plain text |
@@ -563,11 +564,12 @@ event types can be added without breaking clients:
 
 | `type`     | `data` | Sent when |
 | ---------- | ------ | --------- |
-| `new_msg`  | A message object, same shape as an item in the `GET /fmsg` list response (includes `id`). | A new message arrives for the authenticated user. Not sent for reactions. |
+| `new_msg`  | A message object, same shape as an item in the `GET /fmsg` list response (includes `id`). | A new message arrives for the authenticated user. Not sent for reactions or edits. |
 | `delivered` | The refreshed message object. | A recipient's delivery state changed on a message the user sent. |
 | `recipients_added` | The refreshed message object. | An add-to batch was recorded on a message the user participates in. |
 | `read` | The message object, with `read` and `time_read` set. | The user marked a message read (`POST /fmsg/:id/read`), on this or any other connection, so every tab and device can stop showing it as unread. Sent once, when the message first becomes read. |
 | `reaction` | The refreshed **subject** message object, with its `reactions` up to date. | A reaction (FMSG-005) on a message the user participates in arrives. The reaction message itself is not pushed as `new_msg` and triggers no Web Push. |
+| `edit` | The refreshed **subject** message object, with its `edited` and `short_text` up to date. | An edit (FMSG-008) of a message the user participates in arrives. The edit message itself is not pushed as `new_msg` and triggers no Web Push. |
 | `indicator` | `{"id": <int>, "root_id": <int>, "from": "<address>", "emoji": "<emoji, or empty>", "ttl": <seconds>}`: `from`'s state on message `id` (in the thread starting at `root_id`), valid for `ttl` seconds unless a later one replaces it. An empty `emoji` clears it. | A participant of a message the user is on [shows or clears an indicator](#post-fmsgidindicate) on it, on this host or another. Never stored, and no Web Push. |
 | `trash` | The message object with its `trash` state, or `{"id": <int>, "trash": "purged"}` for a message deleted for good. | The user moved a message into or out of their [trash](#trash), or deleted it for good, on this or any other connection. |
 
@@ -724,7 +726,9 @@ Retrieves a single message by ID. The authenticated identity must be a participa
   "reaction": null,
   "reactions": [
     { "emoji": "👍", "from": ["@bob@example.com", "@carol@example.com"] }
-  ]
+  ],
+  "edit": false,
+  "edited": null
 }
 ```
 
@@ -744,6 +748,23 @@ other message, so clients can hide reaction messages from message lists.
 `reactions` lists the effective reactions on this message: each participant's
 latest reaction, grouped by emoji in order of first reaction, with the
 reactors of each. It is `[]` when there are none.
+
+`edit` and `edited` implement
+[FMSG-008 Edits](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md). An edit is an ordinary message: a reply from the
+subject's author with `no_reply` and `terminal` set, type
+`application/vnd.fmsg.edit`, no attachments, and a body that is empty (revert)
+or a well-formed edit document for the subject's data. `edit` is `true` for
+such a message and `false` for every other, so clients can hide edit messages
+from message lists. `edited` describes the edit in force on this message:
+`{"id": <int>, "time": <number>, "size": <int or null>}` — the latest edit
+message and the byte length of the edited data — or `null` when the message
+has no edit or its latest one reverts to the original.
+
+The server applies the effective edit for clients: when `edited` is non-null,
+`short_text`, `GET /fmsg/:id/data` and the thread routes present the edited
+data, while `type`, `size`, `sha256` and every other field still describe the
+original message, which is never altered. `"size": null` means the edit is too
+large for this server to apply and the original data is presented.
 
 `add_to` is an array of add-to batches, one per `POST /fmsg/:id/add-to` call.
 Each batch has a stable `batch_id` (unique within the database and referenced
@@ -983,7 +1004,8 @@ in `to` or `add_to` — and the message must be sent and not terminal.
 
 The reaction is sent immediately as a reaction message: a reply to `:id` with
 `no_reply` and `terminal` set, type `text/plain;charset=UTF-8`, body the emoji,
-addressed to every other participant of the message. Delivery then proceeds
+addressed to every other participant of the message, or to the caller alone
+for a message they sent only to themselves. Delivery then proceeds
 exactly as for any sent message, and like any message it counts against the
 reactor's send limits and each local recipient's receive limits (see
 [Quotas](#quotas)). A reaction message cannot be replied to, reacted to, or
@@ -1008,8 +1030,50 @@ the caller has no reaction returns `200 OK` with `null` values.
 | `400`  | `emoji` is not a single emoji |
 | `403`  | Authenticated identity is not a participant |
 | `404`  | Message not found |
-| `409`  | Message is a draft, is terminal, has no other participants, or a remote recipient host cannot accept the reaction because it does not hold the message |
+| `409`  | Message is a draft, is terminal, or a remote recipient host cannot accept the reaction because it does not hold the message |
 | `413`, `422`, `429` | The reaction would exceed one of the reactor's send limits, as for send |
+| `503`  | fmsgid unavailable, so the send limits can't be checked |
+
+### POST `/fmsg/:id/edit`
+
+Edits, or reverts an edit of, the data of a message, per
+[FMSG-008 Edits](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md). The authenticated identity must be the message's sender
+(`from`), and the message must be sent and not terminal. A draft is changed
+with `PUT /fmsg/:id` instead. `no_reply` on the message does not prevent
+editing it.
+
+The caller supplies the complete new body; the server derives the edit
+document (copy and insert operations against the original data) and sends it
+immediately as an edit message: a reply to `:id` with `no_reply` and `terminal`
+set and type `application/vnd.fmsg.edit`. One is sent for the original,
+addressed to every other participant (or to the caller alone for a message
+sent only to themselves), and one for each add-to batch, addressed to the
+recipients that batch added. Delivery then proceeds exactly as for any sent
+message, and each counts against the sender's send limits and each local
+recipient's receive limits (see [Quotas](#quotas)). The original message is
+not altered and stays available through `GET /fmsg/:id/data?original=true`.
+
+**Request body (JSON):**
+
+| Field  | Type     | Required | Description |
+| ------ | -------- | -------- | ----------- |
+| `data` | `string` | no       | The complete new UTF-8 body, in the message's existing media type. `null` or absent reverts to the original data. `""` edits the body to empty. |
+
+An edit that would leave the message's effective data unchanged is idempotent:
+nothing is sent and the edit message in force is returned with `200 OK`, or
+`null` values when the message has none.
+
+**Response:** `201 Created` with `{"id": <int>, "time": <number>, "sha256": "<64 hex characters>"}` of the edit message sent for the original.
+
+**Errors:**
+
+| Status | Condition |
+| ------ | --------- |
+| `403`  | Authenticated identity is not the message's sender |
+| `404`  | Message not found |
+| `409`  | Message is a draft or is terminal, or a remote recipient host cannot accept the edit because it does not hold the message |
+| `413`  | `data` exceeds the maximum body size, or the edit would exceed one of the sender's send limits |
+| `422`, `429` | The edit would exceed one of the sender's send limits, as for send |
 | `503`  | fmsgid unavailable, so the send limits can't be checked |
 
 ### POST `/fmsg/:id/indicate`
@@ -1052,6 +1116,10 @@ accepted but dropped; clears always go through.
 ### GET `/fmsg/:id/data`
 
 Downloads the binary body of a message. The authenticated identity must be a participant — the sender (`from`) or a recipient (listed in `to` or `add_to`).
+
+When the message has an effective [FMSG-008](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md) edit (`edited` is non-null
+with a `size`), the edited data is returned. Add `?original=true` for the
+original body, which stays available to every participant.
 
 **Response:** The raw message body file with `Content-Disposition: attachment` header. The `Content-Type` is inferred from the stored file extension.
 
@@ -1129,6 +1197,11 @@ truncated.
   ]
 }
 ```
+
+A message with an effective [FMSG-008](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md)
+edit carries `edited` (as on a message object) and its `body` is the edited
+data, with a `cache_key` derived from the edit message's hash rather than the
+message's own.
 
 **Errors:**
 
