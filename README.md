@@ -677,6 +677,7 @@ Add-to recipients are not part of this body — they are added later via `POST /
 | `400`  | Missing/invalid fields, empty `to`, `topic` set together with `pid`, or `pid` not found |
 | `403`  | `from` does not match authenticated user |
 | `409`  | `pid` references a terminal message, which cannot be replied to |
+| `409`  | A `to` recipient is not a participant of the message `pid` names (see [send](#post-fmsgidsend)) |
 | `413`  | `data` is larger than `FMSG_API_MAX_DATA_SIZE` |
 
 ### GET `/fmsg/:id`
@@ -814,6 +815,7 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 | `409`  | `pid` references a terminal message, which cannot be replied to |
+| `409`  | A `to` recipient is not a participant of the message `pid` names (see [send](#post-fmsgidsend)) |
 | `413`  | `data` is larger than `FMSG_API_MAX_DATA_SIZE`, or `data` plus attachments is larger than `FMSG_API_MAX_MSG_SIZE` |
 
 ### DELETE `/fmsg/:id`
@@ -911,8 +913,16 @@ be *sent* when it is a complete, valid fmsg message — at least one
 well-formed recipient, a `type`, and a supported `version`. An incomplete
 draft is refused with `400` listing every problem.
 
-For a reply (a draft with `pid`), the route first verifies that every remote
-recipient domain can actually accept it: per the fmsg spec a host rejects a
+For a reply (a draft with `pid`), every `to` recipient must be a participant
+of the message it replies to: that message's sender and recipients or, when
+`pid` names an add-to batch by its sha256, also the batch's adder and the
+recipients it added. Someone only added in a batch has the batch, not the
+original, so a reply that includes them must name the batch. Otherwise the
+send is refused with `409` naming who isn't a participant. Create and update
+refuse the same reply, so that a draft that could never be sent isn't written.
+
+The route then verifies that the domain of every remote `to` recipient can
+actually accept the reply: per the fmsg spec a host rejects a
 reply whose parent it has not stored (response code 6), so if the parent was
 never addressed to a recipient's domain — or every delivery attempt of the
 parent to that domain by this host concluded in rejection — the send is
@@ -924,6 +934,10 @@ third-party delivery's outcome, so the reply is attempted and the wire's
 "parent not found" rejection remains the arbiter. The reply's parent's own
 originating domain always passes (it retains its outgoing messages). Local
 recipients are unaffected.
+
+Recipients added to the reply itself (`POST /fmsg/:id/add-to` on the draft)
+are outside both checks: they are sent the reply as an add-to message, which
+their host accepts in full without holding the reply's parent.
 
 The sender's send limits are then checked against the message's size, the
 body plus its attachments (see [Quotas](#quotas)). A refusal leaves the
@@ -943,6 +957,7 @@ a recipient over one is not delivered and its `response_code` is `101`.
 | `403`  | Not the owner, or the sender is no longer in fmsgid or accepting new messages |
 | `404`  | Message not found |
 | `409`  | Message already sent |
+| `409`  | A reply's `to` recipient is not a participant of the message it replies to |
 | `409`  | Reply can never be accepted by one or more remote recipient domains (parent never addressed there, or its delivery there failed) |
 | `413`  | Message is bigger than the sender's per-message send size (`send_size_per_msg_limit`) |
 | `422`  | Sender's total sent bytes would exceed its limit, `storage limit reached` (`send_size_total_limit`) |

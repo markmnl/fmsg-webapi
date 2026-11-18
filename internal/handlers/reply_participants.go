@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -21,6 +22,12 @@ import (
 // domain, SPEC "Notes on Adding Recipients"). Someone only added in a batch
 // has the batch, not the original, so a reply that includes them must name
 // the batch by its sha256; anyone new is brought in with add-to.
+//
+// That is the rule for the reply's to. Recipients added to the reply itself
+// (add-to, on the draft or once sent) are outside it: they get the reply as
+// an add-to message, whose pid names the reply rather than the reply's
+// parent, and a host that doesn't hold a message someone is added to takes
+// it as a full delivery (SPEC §10.3 step 7).
 
 // replyParticipants returns the lower-cased participants of the parent a
 // reply names: parentID, or the add-to batch of it whose hash is psha256.
@@ -76,13 +83,16 @@ func (h *MessageHandler) replyParticipants(ctx context.Context, parentID int64, 
 }
 
 // checkReplyRecipients answers 409 and reports false when a reply has a
-// recipient who isn't a participant of the parent it names.
+// recipient who isn't a participant of the parent it names. Send is the gate;
+// create and update check too, so that a draft that could never be sent
+// isn't written.
 func (h *MessageHandler) checkReplyRecipients(c *gin.Context, msg *models.Message) bool {
 	if msg.PID == nil {
 		return true
 	}
 	parts, err := h.replyParticipants(c.Request.Context(), *msg.PID, msg.PSHA256)
 	if err != nil {
+		log.Printf("verify reply recipients against parent %d: %v", *msg.PID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify reply recipients"})
 		return false
 	}
