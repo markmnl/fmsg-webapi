@@ -350,3 +350,39 @@ func TestFinalizationCommitFailureDoesNotReturnSuccess(t *testing.T) {
 		t.Fatal("rejected commit changed draft", got)
 	}
 }
+
+// A reply's recipients must all hold the message it names: someone only added
+// in a batch holds the batch, not the original.
+func TestReplyRecipientsMustHoldParent(t *testing.T) {
+	a := newFinalizationAPI(t)
+	alice, bob, carol, dave := "@alice@example.com", "@bob@example.com", "@carol@example.com", "@dave@example.com"
+	orig := a.sendAs(t, alice, []string{bob}, "hello", nil)
+	batch := jsonResponse(t, a.request(alice, "POST", "/fmsg/"+orig+"/add-to", map[string]any{"add_to": []string{carol}}), 200)
+	batchHash := batch["sha256"].(string)
+	got := jsonResponse(t, a.request(alice, "GET", "/fmsg/"+orig, nil), 200)
+	origHash := got["sha256"].(string)
+
+	send := func(from string, to []string, pid any) *httptest.ResponseRecorder {
+		v := jsonResponse(t, a.request(from, "POST", "/fmsg", map[string]any{
+			"version": 1, "from": from, "to": to, "type": "text/plain;charset=UTF-8", "data": "re", "pid": pid,
+		}), 201)
+		return a.request(from, "POST", fmt.Sprintf("/fmsg/%.0f/send", v["id"]), map[string]any{})
+	}
+	for _, pid := range []any{mustID(t, orig), origHash} {
+		if w := send(alice, []string{bob, carol}, pid); w.Code != 409 || !strings.Contains(w.Body.String(), carol) {
+			t.Fatalf("added recipient on a reply to the original: %d %s", w.Code, w.Body)
+		}
+	}
+	if w := send(alice, []string{bob, dave}, batchHash); w.Code != 409 || !strings.Contains(w.Body.String(), dave) {
+		t.Fatalf("stranger on a reply to the batch: %d %s", w.Code, w.Body)
+	}
+	if w := send(alice, []string{bob, carol}, batchHash); w.Code != 200 {
+		t.Fatalf("reply to the batch: %d %s", w.Code, w.Body)
+	}
+	if w := send(bob, []string{alice}, mustID(t, orig)); w.Code != 200 {
+		t.Fatalf("reply to the original: %d %s", w.Code, w.Body)
+	}
+	if w := send(carol, []string{alice, bob}, batchHash); w.Code != 200 {
+		t.Fatalf("added recipient's reply to the batch: %d %s", w.Code, w.Body)
+	}
+}

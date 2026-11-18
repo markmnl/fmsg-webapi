@@ -1059,6 +1059,11 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
+	// Every recipient of a reply must have the parent it names.
+	if !h.checkReplyRecipients(c, existing) {
+		return
+	}
+
 	// A reply can only be accepted by hosts that store its parent (SPEC
 	// §10.3, reject code 6). Refuse now — with the reason — when a remote
 	// recipient domain can never accept it, rather than letting the reply
