@@ -699,10 +699,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 	// Compute ShortText only after authorization has been confirmed.
 	msg.ShortText = h.extractShortText(dataPath, msg.Type)
 	msg.Reaction = h.reactionOf(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, msg.Size, len(msg.Attachments), dataPath)
-	msg.Reactions = h.loadReactions(ctx, []int64{msgID})[msgID]
-	if msg.Reactions == nil {
-		msg.Reactions = []models.Reaction{}
-	}
+	msg.Reactions = applyReactions(h.loadReactions(ctx, []int64{msgID}), msgID, msg.AddTo)
 	if editShape(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, len(msg.Attachments)) {
 		_, msg.Edit = h.editSubject(ctx, msgID)
 	}
@@ -1579,10 +1576,7 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 		dataPath:    dataPath,
 	}
 	item.Reaction = h.reactionOf(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, item.Size, len(item.Attachments), dataPath)
-	item.Reactions = h.loadReactions(ctx, []int64{msgID})[msgID]
-	if item.Reactions == nil {
-		item.Reactions = []models.Reaction{}
-	}
+	item.Reactions = applyReactions(h.loadReactions(ctx, []int64{msgID}), msgID, item.AddTo)
 	if editShape(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, len(item.Attachments)) {
 		_, item.Edit = h.editSubject(ctx, msgID)
 	}

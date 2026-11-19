@@ -178,7 +178,7 @@ func TestLocalDeliveryChecksAndRecordsReceiveQuota(t *testing.T) {
 	// usage recorded; adding recipients sends no new message.
 	erin, frank := "@erin@example.com", "@frank@example.com"
 	id.set(frank, map[string]any{"limitRecvSizePer1d": 10})
-	jsonResponse(t, a.request("@alice@example.com", "POST", "/fmsg/"+msg+"/add-to", map[string]any{"add_to": []string{erin, frank}}), 200)
+	batch := jsonResponse(t, a.request("@alice@example.com", "POST", "/fmsg/"+msg+"/add-to", map[string]any{"add_to": []string{erin, frank}}), 200)
 	rows = a.recipientRows(t, "msg_add_to", msg)
 	wantRow(t, rows, erin, true, responseCodeAccept)
 	wantRow(t, rows, frank, false, responseCodeUserFull)
@@ -195,17 +195,26 @@ func TestLocalDeliveryChecksAndRecordsReceiveQuota(t *testing.T) {
 	if len(send) != 2 || send[1].Address != bob || send[1].Size != int64(len("👍")) {
 		t.Fatalf("reaction send usage: %+v", send)
 	}
-	// carol is still full, and nobody unknown; alice, dave, erin and frank
-	// each have room for the reaction.
-	recv = id.posted("recv")[2:]
-	gotRecv := map[string]int64{}
-	for _, u := range recv {
-		gotRecv[u.Address] = u.Size
+	// The reaction goes to the message's participants: carol is still full,
+	// nobody unknown, and alice and dave each have room. erin and frank were
+	// added in a batch, a message of its own: they don't get it.
+	wantRecv := func(from int, want map[string]int64) {
+		t.Helper()
+		recv := id.posted("recv")[from:]
+		gotRecv := map[string]int64{}
+		for _, u := range recv {
+			gotRecv[u.Address] = u.Size
+		}
+		if fmt.Sprint(gotRecv) != fmt.Sprint(want) || len(recv) != len(want) {
+			t.Fatalf("reaction recv usage: %+v, want %v", recv, want)
+		}
 	}
-	want := map[string]int64{"@alice@example.com": 4, dave: 4, erin: 4, frank: 4}
-	if fmt.Sprint(gotRecv) != fmt.Sprint(want) || len(recv) != len(want) {
-		t.Fatalf("reaction recv usage: %+v, want %v", recv, want)
-	}
+	wantRecv(2, map[string]int64{"@alice@example.com": 4, dave: 4})
+	// A reaction on the batch goes to its participants: the message's and
+	// those it added.
+	n := len(id.posted("recv"))
+	jsonResponse(t, a.request(bob, "POST", "/fmsg/"+batch["sha256"].(string)+"/react", map[string]any{"emoji": "👍"}), 201)
+	wantRecv(n, map[string]int64{"@alice@example.com": 4, dave: 4, erin: 4, frank: 4})
 }
 
 func TestSendRefusedOverSendQuota(t *testing.T) {

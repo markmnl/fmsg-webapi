@@ -24,6 +24,10 @@ type AddToBatch struct {
 	To         []string            `json:"to"`
 	ToDelivery []RecipientDelivery `json:"to_delivery"`
 	Time       float64             `json:"time"`
+	// FMSG-005: effective reactions on this batch. A batch is a message of
+	// its own (its own hash and audience), reacted to separately from the
+	// original and from other batches.
+	Reactions []Reaction `json:"reactions,omitempty"`
 }
 
 // Message represents a fmsg message as exchanged over the HTTP API.
