@@ -747,7 +747,9 @@ such a message carries (`""` for a clearing reaction) and `null` for every
 other message, so clients can hide reaction messages from message lists.
 `reactions` lists the effective reactions on this message: each participant's
 latest reaction, grouped by emoji in order of first reaction, with the
-reactors of each. It is `[]` when there are none.
+reactors of each. It is `[]` when there are none. An add-to batch is a message
+of its own (its own `sha256` and participants), so its reactions are listed on
+it, as `add_to[].reactions` (omitted when there are none), not on the message.
 
 `edit` and `edited` implement
 [FMSG-008 Edits](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md). An edit is an ordinary message: a reply from the
@@ -999,13 +1001,21 @@ recipients isn't counted against the caller's send limits (see
 
 Sets or clears the authenticated identity's reaction on a message, per
 [FMSG-005 Reactions](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-005-reactions.md).
-The identity must be a participant of the message — the sender or a recipient
-in `to` or `add_to` — and the message must be sent and not terminal.
+`:id` names the message reacted to: a message id or `sha256`, or the `sha256`
+of an add-to batch. An add-to batch is a message of its own — the original's
+contents with a wider audience — so a reaction to it is to that batch, not to
+the original. Named by id, a message the identity was only added to (in a
+batch) is that batch, the only one of them they have. The identity must be a
+participant of the message reacted to — its sender or a recipient in `to`, and
+for a batch also its adder or a recipient it added — and the message must be
+sent and not terminal.
 
-The reaction is sent immediately as a reaction message: a reply to `:id` with
-`no_reply` and `terminal` set, type `text/plain;charset=UTF-8`, body the emoji,
-addressed to every other participant of the message, or to the caller alone
-for a message they sent only to themselves. Delivery then proceeds
+The reaction is sent immediately as a reaction message: a reply to that
+message (`psha256` its hash) with `no_reply` and `terminal` set, type
+`text/plain;charset=UTF-8`, body the emoji, addressed to every other
+participant of that message — for the original not those only added in
+batches, for a batch also its adder and the recipients it added — or to the
+caller alone for a message they sent only to themselves. Delivery then proceeds
 exactly as for any sent message, and like any message it counts against the
 reactor's send limits and each local recipient's receive limits (see
 [Quotas](#quotas)). A reaction message cannot be replied to, reacted to, or
@@ -1017,7 +1027,8 @@ have recipients added.
 | ------- | -------- | -------- | ----------- |
 | `emoji` | `string` | no       | A single emoji (a Unicode `RGI_Emoji` sequence, or any single well-formed emoji sequence). `""` or `null` clears the caller's reaction. |
 
-Setting the same reaction the caller already has is idempotent: nothing is
+Each message — the original and each batch — has its own reactions.
+Setting the same reaction the caller already has on it is idempotent: nothing is
 sent and the existing reaction message is returned with `200 OK`. Clearing when
 the caller has no reaction returns `200 OK` with `null` values.
 

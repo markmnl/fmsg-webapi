@@ -86,7 +86,9 @@ func atomic(c *gin.Context, database *db.DB, next func(pgx.Tx)) {
 	}
 	defer tx.Rollback(ctx)
 	if c.Param("id") != "" {
-		id, ok := resolveID(c, tx)
+		// An add-to batch's hash locks the message it is stored with; routes
+		// that take one (react) resolve it again themselves.
+		id, _, ok := reactSubject(c, tx)
 		if !ok {
 			return
 		}
