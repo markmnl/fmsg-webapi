@@ -343,6 +343,7 @@ the application.
 | `GET`    | `/fmsg`                          | List messages for the authenticated identity |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/count`                    | Count the identity's threads |
+| `GET`    | `/fmsg/search`                   | Find the identity's threads by words (optional; `501` here) |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
 | `GET`    | `/fmsg/sub-accounts`             | List owned API-access grants |
@@ -645,6 +646,73 @@ from listed messages. Drafts don't count.
 | `trash`   | `exclude` | As for `GET /fmsg`: `exclude`, `include` or `only` |
 
 **Response:** `200 OK` with `{"threads": <int>}`.
+
+### GET `/fmsg/search`
+
+**Optional; this server answers `501 Not Implemented`.** The route, the
+OAuth scope (`fmsg:read`) and the shapes below are defined so that clients can
+rely on one contract, and a deployment that indexes message text can implement
+it. Clients should treat `501` (or `404` from older servers) as "search is not
+available" and offer no search.
+
+Finds the authenticated identity's threads by the words in their messages and
+returns each matching thread whole, so a client can list them without first
+paging in every message.
+
+A thread is grouped as for `GET /fmsg/count`: a message belongs with its
+parent when the identity can see the parent, so the first message the identity
+can see is the thread's root. A thread matches when one of its messages has
+every word of `q`. Each word matches the start of a word in the message's
+topic, sender and recipient addresses, attachment names or text body; case and
+accents don't matter. An
+[FMSG-008](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md)
+edited message is found by its edited words as well as its original ones, and
+its match shows the edited text; edit messages themselves, like reactions, are
+never results. A draft is found by its author only. The other filters apply to
+the thread as a whole.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+| --------- | ------- | ----------- |
+| `q`       | —       | Words to find. Empty lists every thread the filters allow. A `q` with no words in it (only punctuation) matches nothing and answers `200` with no threads |
+| `sort`    | `newest` | `newest` or `oldest`, by each thread's newest message |
+| `files`   | `false` | `true`: only threads with an attachment |
+| `unread`  | `false` | `true`: only threads with a message the identity hasn't read |
+| `scope`   | `all`   | `drafts`: only threads with a draft of the identity's |
+| `trash`   | `exclude` | `exclude`: threads with something outside the trash, matched on those messages. `only`: threads with something in the trash |
+| `limit`   | `25`    | Threads per page, at most 50 |
+| `offset`  | `0`     | Threads to skip |
+
+**Response:** `200 OK`
+
+```json
+{
+  "total": 42,
+  "next_offset": 25,
+  "terms": ["sign", "frag"],
+  "threads": [
+    { "root": 812, "time": 1794300120.5,
+      "match": { "id": 845, "field": "body", "text": "…the sign-in fragment is used…" } }
+  ],
+  "messages": [ { "id": 812, "…": "…" } ]
+}
+```
+
+- `threads` are in order. `time` is the newest message's time (null for a
+  thread of drafts). `match` is the newest message with the words: `field` is
+  `body`, `topic`, `file`, `from` or `to`, and `text` the text to show for it.
+  It is null when `q` is empty.
+- `messages` holds every message of those threads, shaped as in `GET /fmsg`,
+  including ones in the trash (`trash` set) so the thread can be grouped.
+  Reactions are left out.
+- `next_offset` is the `offset` of the next page, null on the last. A page
+  may end early when its threads hold many messages.
+- `terms` are the words of `q` as matched (folded), for highlighting.
+
+`400` for an invalid parameter. A search that runs too long answers `503`.
+Search words are message content, so an implementation should keep `q` out of
+its logs.
 
 ### POST `/fmsg`
 
