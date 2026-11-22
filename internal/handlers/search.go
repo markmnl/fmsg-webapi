@@ -39,6 +39,9 @@ type searchResponse struct {
 	Messages   []messageListItem `json:"messages"`
 }
 
+// The types above are the contract; nothing here builds them yet.
+var _ = searchResponse{Threads: []searchThread{{Match: &searchMatch{}}}}
+
 // Search handles GET /fmsg/search. Not implemented by this server.
 func (h *MessageHandler) Search(c *gin.Context) {
 	if middleware.GetIdentity(c) == "" {
