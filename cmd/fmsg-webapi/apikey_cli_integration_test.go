@@ -301,22 +301,42 @@ func TestAPIKeyExchangeRejectsUnregisteredDerivedAddress(t *testing.T) {
 }
 
 // TestAPIKeyCLICreateReinstates creates a derived sub-account whose address was
-// used before: fmsgid reinstates it, the CLI says so, and when the grant can't
-// be created the address is stopped accepting new messages again.
+// used before: fmsgid reinstates it, the CLI says so; when the grant can't be
+// created due to a non-conflict error (e.g. limit exceeded), the address is
+// stopped accepting new messages again; on conflict (ErrAlreadyExists, such as
+// a concurrent winner), the active address is left untouched.
 func TestAPIKeyCLICreateReinstates(t *testing.T) {
-	for _, conflict := range []bool{false, true} {
-		t.Run(fmt.Sprintf("conflict=%v", conflict), func(t *testing.T) {
+	for _, mode := range []string{"success", "limit_exceeded", "conflict"} {
+		t.Run(mode, func(t *testing.T) {
 			database := newAPIKeyCLIDB(t)
 			const owner = "@alice@example.com"
 			const target = "@alice_bot@example.com"
-			if conflict {
+			store := apiauth.NewStore(database)
+			switch mode {
+			case "conflict":
 				key, err := apiauth.GenerateAPIKey()
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := apiauth.NewStore(database).Create(context.Background(), owner, "bot", target, key.ID,
+				if err := store.Create(context.Background(), owner, "bot", target, key.ID,
 					apiauth.HashAPIKey(key.Value), []string{"127.0.0.0/8"}, time.Now().Add(time.Hour)); err != nil {
 					t.Fatal(err)
+				}
+			case "limit_exceeded":
+				for i := range apiauth.DefaultMaxSubAccounts {
+					key, err := apiauth.GenerateAPIKey()
+					if err != nil {
+						t.Fatal(err)
+					}
+					agent := fmt.Sprintf("other%d", i)
+					addr, err := apiauth.DeriveSubAccountAddr(owner, agent)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := store.Create(context.Background(), owner, agent, addr, key.ID,
+						apiauth.HashAPIKey(key.Value), []string{"127.0.0.0/8"}, time.Now().Add(time.Hour)); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			var mu sync.Mutex
@@ -357,17 +377,25 @@ func TestAPIKeyCLICreateReinstates(t *testing.T) {
 				"-expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
 			mu.Lock()
 			defer mu.Unlock()
-			if conflict {
+			switch mode {
+			case "limit_exceeded":
 				if err == nil {
-					t.Fatal("create succeeded despite an existing grant")
+					t.Fatal("create succeeded despite exceeding sub-account limit")
 				}
 				if accepting {
 					t.Fatal("address left reinstated although its grant wasn't created")
 				}
-				return
-			}
-			if err != nil || !strings.Contains(output, "\nreinstated=true\n") || !accepting {
-				t.Fatalf("create: err=%v accepting=%v output=%q", err, accepting, output)
+			case "conflict":
+				if err == nil {
+					t.Fatal("create succeeded despite an existing grant")
+				}
+				if !accepting {
+					t.Fatal("conflicting create disabled an already-granted address")
+				}
+			default:
+				if err != nil || !strings.Contains(output, "\nreinstated=true\n") || !accepting {
+					t.Fatalf("create: err=%v accepting=%v output=%q", err, accepting, output)
+				}
 			}
 		})
 	}

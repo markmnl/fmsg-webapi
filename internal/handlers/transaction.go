@@ -75,6 +75,43 @@ func afterCommit(c *gin.Context, f func()) {
 		f()
 	}
 }
+// beginOrReuseTx returns q directly when it is already a pgx.Tx (inside Atomic),
+// avoiding a redundant SAVEPOINT round-trip. When reusing an outer transaction,
+// commit and rollback are no-ops because Atomic commits on <400 responses and
+// rolls back on >=400 responses.
+func beginOrReuseTx(ctx context.Context, q queries) (pgx.Tx, func() error, func(), error) {
+	if existing, ok := q.(pgx.Tx); ok {
+		return existing, func() error { return nil }, func() {}, nil
+	}
+	tx, err := q.Begin(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return tx, func() error { return tx.Commit(ctx) }, func() { _ = tx.Rollback(ctx) }, nil
+}
+
+// limitRequestBody bounds c.Request.Body with http.MaxBytesReader when limit > 0.
+func limitRequestBody(c *gin.Context, limit int64) {
+	if limit > 0 && c.Request != nil && c.Request.Body != nil {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+	}
+}
+
+// limitJSONBody bounds a JSON message request body carrying a data string of up
+// to maxDataSize decoded bytes. A 6x multiplier accommodates worst-case JSON
+// string escaping (e.g. HTML characters escaped as \u003c or ASCII-escaped
+// non-ASCII runes) plus 1 MiB for envelope metadata.
+func limitJSONBody(c *gin.Context, maxDataSize int64) {
+	if maxDataSize > 0 {
+		limitRequestBody(c, maxDataSize*6+(1<<20))
+	}
+}
+
+func isMaxBytesError(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
+}
+
 func createdFile(c *gin.Context, path string) { onRollback(c, func() { _ = os.Remove(path) }) }
 
 func atomic(c *gin.Context, database *db.DB, next func(pgx.Tx)) {

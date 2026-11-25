@@ -33,14 +33,19 @@ func (h *MessageHandler) Count(c *gin.Context) {
 	}
 	var threads int64
 	err = h.q().QueryRow(ctx,
-		`WITH vis AS (
+		`WITH candidate AS (
+		     SELECT id FROM msg WHERE lower(from_addr) = ANY($1)
+		     UNION
+		     SELECT msg_id AS id FROM msg_to WHERE lower(addr) = ANY($1)
+		     UNION
+		     SELECT msg_id AS id FROM msg_add_to WHERE lower(addr) = ANY($1)
+		 ),
+		 vis AS (
 		     SELECT m.id, m.pid
-		       FROM msg m
+		       FROM candidate c
+		       JOIN msg m ON m.id = c.id
 		       CROSS JOIN LATERAL (SELECT CASE WHEN $2 THEN fmsg_api_trash_state($3, m.id) END AS state) t
 		      WHERE m.time_sent IS NOT NULL
-		        AND (lower(m.from_addr) = ANY($1)
-		          OR EXISTS (SELECT 1 FROM msg_to mt WHERE mt.msg_id = m.id AND lower(mt.addr) = ANY($1))
-		          OR EXISTS (SELECT 1 FROM msg_add_to mat WHERE mat.msg_id = m.id AND lower(mat.addr) = ANY($1)))
 		        AND `+trashFilter+`
 		 )
 		 SELECT count(*) FROM vis v

@@ -44,13 +44,13 @@ func trashStateQ(ctx context.Context, q queries, addr string, msgID int64) (stri
 }
 
 // purgedFor reports whether msgID is deleted for good by addr. Lookup errors
-// are logged and treated as not purged.
-func purgedFor(ctx context.Context, q queries, addr string, msgID int64) bool {
+// are propagated so callers fail closed instead of exposing purged messages.
+func purgedFor(ctx context.Context, q queries, addr string, msgID int64) (bool, error) {
 	state, err := trashStateQ(ctx, q, addr, msgID)
 	if err != nil {
-		log.Printf("trash state of %d for %s: %v", msgID, addr, err)
+		return false, err
 	}
-	return state == trashPurged
+	return state == trashPurged, nil
 }
 
 // hasTrash reports whether addr has deleted anything.
@@ -136,10 +136,14 @@ func (h *MessageHandler) trashSubtree(ctx context.Context, addr string, msgID in
 // notifyTrash tells addr's connections that ids moved in or out of the trash.
 // The notifications are sent when the transaction commits.
 func (h *MessageHandler) notifyTrash(ctx context.Context, addr string, ids []int64) {
-	for _, id := range ids {
-		if _, err := h.q().Exec(ctx, `SELECT pg_notify('msg_trash', $1)`, fmt.Sprintf("%d,%s", id, addr)); err != nil {
-			log.Printf("trash %d: notify: %v", id, err)
-		}
+	if len(ids) == 0 {
+		return
+	}
+	if _, err := h.q().Exec(ctx,
+		`SELECT pg_notify('msg_trash', id::text || ',' || $2) FROM unnest($1::bigint[]) AS id`,
+		ids, addr,
+	); err != nil {
+		log.Printf("trash notify %s: %v", addr, err)
 	}
 }
 
@@ -217,7 +221,17 @@ func (h *MessageHandler) Restore(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore message"})
 		return
 	}
-	if !ok || purgedFor(ctx, h.q(), identity, msgID) {
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+	purged, err := purgedFor(ctx, h.q(), identity, msgID)
+	if err != nil {
+		log.Printf("restore %d: trash state: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore message"})
+		return
+	}
+	if purged {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
@@ -295,12 +309,13 @@ func (h *MessageHandler) purge(c *gin.Context, identity string, msgID int64, thr
 	if h.IDURL != "" && len(releases) > 0 {
 		idURL := h.IDURL
 		afterCommit(c, func() {
+			postCtx := context.WithoutCancel(ctx)
 			for _, r := range releases {
 				var err error
 				if r.send {
-					err = middleware.ReleaseFmsgIDSend(idURL, identity, now, r.size)
+					err = middleware.ReleaseFmsgIDSendContext(postCtx, idURL, identity, now, r.size)
 				} else {
-					err = middleware.ReleaseFmsgIDRecv(idURL, identity, now, r.size)
+					err = middleware.ReleaseFmsgIDRecvContext(postCtx, idURL, identity, now, r.size)
 				}
 				if err != nil {
 					log.Printf("release usage of %s: %v", identity, err)
@@ -351,15 +366,66 @@ func (h *MessageHandler) markPurged(ctx context.Context, identity string, ids []
 // delete once the transaction commits.
 func (h *MessageHandler) removeUnheld(ctx context.Context, ids []int64) (int, []string, error) {
 	var removed int
-	var files []string
+	purgeEnabled := false
+	type pathPair struct {
+		raw   string
+		clean string
+	}
+	seenPaths := make(map[string]struct{})
+	var candidates []pathPair
+	var rawPaths []string
 	for _, id := range ids {
-		gone, paths, err := h.removeIfUnheld(ctx, id)
+		gone, paths, err := h.removeIfUnheld(ctx, id, &purgeEnabled)
 		if err != nil {
 			return 0, nil, err
 		}
 		if gone {
 			removed++
-			files = append(files, paths...)
+			for _, p := range paths {
+				clean, ok := safeDataPath(p, h.DataDir)
+				if !ok {
+					continue
+				}
+				if _, dup := seenPaths[p]; dup {
+					continue
+				}
+				seenPaths[p] = struct{}{}
+				candidates = append(candidates, pathPair{raw: p, clean: clean})
+				rawPaths = append(rawPaths, p)
+			}
+		}
+	}
+	if len(rawPaths) == 0 {
+		return removed, nil, nil
+	}
+	// Check in one batched query which candidate filepaths are still referenced
+	// by any remaining message or attachment row.
+	rows, err := h.q().Query(ctx, `
+		SELECT DISTINCT p FROM (
+			SELECT filepath AS p FROM msg WHERE filepath = ANY($1)
+			UNION ALL
+			SELECT filepath AS p FROM msg_attachment WHERE filepath = ANY($1)
+		) used`, rawPaths)
+	if err != nil {
+		return 0, nil, err
+	}
+	shared := make(map[string]bool)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		shared[p] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	var files []string
+	for _, c := range candidates {
+		if !shared[c.raw] {
+			files = append(files, c.clean)
 		}
 	}
 	return removed, files, nil
@@ -482,7 +548,7 @@ func (h *MessageHandler) retryMaxAge() float64 {
 // in dd.sql). A delivery fmsgd has given up on doesn't keep the message. It
 // returns whether it was removed and the stored files to delete once the
 // transaction commits.
-func (h *MessageHandler) removeIfUnheld(ctx context.Context, msgID int64) (bool, []string, error) {
+func (h *MessageHandler) removeIfUnheld(ctx context.Context, msgID int64, purgeEnabled *bool) (bool, []string, error) {
 	var held, pending bool
 	now := float64(time.Now().UnixMicro()) / 1e6
 	err := h.q().QueryRow(ctx, `SELECT
@@ -520,11 +586,19 @@ func (h *MessageHandler) removeIfUnheld(ctx context.Context, msgID int64) (bool,
 		paths = append(paths, p)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, nil, err
+	}
 
 	// fmsgd keeps sent messages immutable unless the transaction says it is
-	// purging (fmsgd dd.sql, protect_msg_parts).
+	// purging (fmsgd dd.sql, protect_msg_parts). Enable once per transaction.
+	if !*purgeEnabled {
+		if _, err := h.q().Exec(ctx, `SET LOCAL fmsg.purge = 'on'`); err != nil {
+			return false, nil, fmt.Errorf("SET LOCAL fmsg.purge = 'on': %w", err)
+		}
+		*purgeEnabled = true
+	}
 	for _, q := range []string{
-		`SET LOCAL fmsg.purge = 'on'`,
 		`UPDATE msg SET pid = NULL WHERE pid = $1`,
 		`DELETE FROM msg_add_to_notify WHERE batch_id IN (SELECT id FROM msg_add_to_batch WHERE msg_id = $1)`,
 		`DELETE FROM msg_add_to WHERE msg_id = $1`,
@@ -533,33 +607,10 @@ func (h *MessageHandler) removeIfUnheld(ctx context.Context, msgID int64) (bool,
 		`DELETE FROM msg_attachment WHERE msg_id = $1`,
 		`DELETE FROM msg WHERE id = $1`,
 	} {
-		var err error
-		if strings.Contains(q, "$1") {
-			_, err = h.q().Exec(ctx, q, msgID)
-		} else {
-			_, err = h.q().Exec(ctx, q)
-		}
-		if err != nil {
+		if _, err := h.q().Exec(ctx, q, msgID); err != nil {
 			return false, nil, fmt.Errorf("%s: %w", q, err)
 		}
 	}
 
-	// Only delete files inside the data directory that no other message
-	// still uses.
-	var files []string
-	for _, p := range paths {
-		clean, ok := safeDataPath(p, h.DataDir)
-		if !ok {
-			continue
-		}
-		var shared bool
-		if err := h.q().QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM msg WHERE filepath = $1)
-			OR EXISTS (SELECT 1 FROM msg_attachment WHERE filepath = $1)`, p).Scan(&shared); err != nil {
-			return false, nil, err
-		}
-		if !shared {
-			files = append(files, clean)
-		}
-	}
-	return true, files, nil
+	return true, paths, nil
 }
