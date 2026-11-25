@@ -97,6 +97,16 @@ func limitRequestBody(c *gin.Context, limit int64) {
 	}
 }
 
+// limitJSONBody bounds a JSON message request body carrying a data string of up
+// to maxDataSize decoded bytes. A 6x multiplier accommodates worst-case JSON
+// string escaping (e.g. HTML characters escaped as \u003c or ASCII-escaped
+// non-ASCII runes) plus 1 MiB for envelope metadata.
+func limitJSONBody(c *gin.Context, maxDataSize int64) {
+	if maxDataSize > 0 {
+		limitRequestBody(c, maxDataSize*6+(1<<20))
+	}
+}
+
 func isMaxBytesError(err error) bool {
 	var maxErr *http.MaxBytesError
 	return errors.As(err, &maxErr)

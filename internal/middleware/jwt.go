@@ -609,23 +609,23 @@ func (c *boundedFmsgIDCache) set(key string, entry fmsgIDEntry, now time.Time) {
 			}
 		}
 		if len(c.entries) >= maxEntries {
-			// Evict the soonest-to-expire entries so the cache stays strictly bounded.
+			// Evict the soonest-to-expire entries in a single pass so the cache
+			// stays strictly bounded without repeated full-map scans under lock.
 			target := maxEntries - max(1, maxEntries/8)
-			for len(c.entries) > target {
-				var oldestKey string
-				var oldestExp time.Time
-				first := true
-				for k, e := range c.entries {
-					if first || e.expires.Before(oldestExp) {
-						oldestKey = k
-						oldestExp = e.expires
-						first = false
-					}
-				}
-				if first {
-					break
-				}
-				delete(c.entries, oldestKey)
+			evictCount := len(c.entries) - target
+			type keyExp struct {
+				key     string
+				expires time.Time
+			}
+			items := make([]keyExp, 0, len(c.entries))
+			for k, e := range c.entries {
+				items = append(items, keyExp{key: k, expires: e.expires})
+			}
+			slices.SortFunc(items, func(a, b keyExp) int {
+				return a.expires.Compare(b.expires)
+			})
+			for i := 0; i < evictCount && i < len(items); i++ {
+				delete(c.entries, items[i].key)
 			}
 		}
 	}

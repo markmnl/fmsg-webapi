@@ -176,10 +176,13 @@ func main() {
 		// The hub also dispatches a Web Push for every new_msg notification.
 		hub.SetPushNotifier(pushHandler.NotifyNewMsg)
 	}
+	// The hub runs on its own context so it keeps LISTENing for notifications
+	// from in-flight HTTP requests while the server drains on shutdown.
+	hubCtx, cancelHub := context.WithCancel(context.Background())
 	hubDone := make(chan struct{})
 	go func() {
 		defer close(hubDone)
-		hub.Run(ctx)
+		hub.Run(hubCtx)
 	}()
 	wsHandler := handlers.NewWSHandler(jwtVerifier, hub, corsOrigins)
 
@@ -228,22 +231,32 @@ func main() {
 	select {
 	case err := <-serveErr:
 		stop()
+		cancelHub()
 		<-hubDone
-		hub.Close()
+		pushDrainCtx, cancelPushDrain := context.WithTimeout(context.Background(), 5*time.Second)
+		if closeErr := hub.CloseContext(pushDrainCtx); closeErr != nil {
+			log.Printf("push shutdown error: %v", closeErr)
+		}
+		cancelPushDrain()
 		if err != nil {
 			log.Fatalf("server error: %v", err)
 		}
 	case <-ctx.Done():
 		log.Println("fmsg-webapi shutting down...")
 		stop()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutCtx); err != nil {
 			log.Printf("server shutdown error: %v", err)
 		}
 		<-serveErr
+		cancelHub()
 		<-hubDone
-		hub.Close()
+		pushDrainCtx, cancelPushDrain := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelPushDrain()
+		if err := hub.CloseContext(pushDrainCtx); err != nil {
+			log.Printf("push shutdown error: %v", err)
+		}
 	}
 }
 

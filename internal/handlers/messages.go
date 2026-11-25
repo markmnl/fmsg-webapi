@@ -129,6 +129,11 @@ func formatDeliveredISO(t *float64) *string {
 // lookup), since usage changes with every message. Errors talking to fmsgid
 // are logged and left pending (no status written) rather than treated as a
 // delivery failure; a failure to record usage is only logged.
+// localDeliveryOpTimeout bounds each individual database operation inside
+// resolveLocalDelivery so one stalled query cannot hang indefinitely while
+// large recipient fan-outs are not cut short by a single shared deadline.
+const localDeliveryOpTimeout = 5 * time.Second
+
 func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string, msgID int64, localDomain string, addrs []string) {
 	now := float64(time.Now().UnixMicro()) / 1e6
 	query := "UPDATE " + table + " SET time_delivered = $1, response_code = $2 WHERE msg_id = $3 AND addr = $4 AND time_delivered IS NULL AND response_code IS NULL"
@@ -144,7 +149,10 @@ func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string,
 			continue
 		}
 		if size < 0 && status == http.StatusOK {
-			if size, err = h.messageStoredSize(ctx, msgID); err != nil {
+			sizeCtx, cancelSize := context.WithTimeout(ctx, localDeliveryOpTimeout)
+			size, err = h.messageStoredSize(sizeCtx, msgID)
+			cancelSize()
+			if err != nil {
 				log.Printf("resolve local delivery: size of msg %d: %v", msgID, err)
 				size = -1
 				continue
@@ -161,7 +169,9 @@ func (h *MessageHandler) resolveLocalDelivery(ctx context.Context, table string,
 		} else if code == responseCodeUserFull {
 			log.Printf("resolve local delivery: msg %d to %s refused: over a receive limit", msgID, addr)
 		}
-		tag, err := h.q().Exec(ctx, query, delivered, code, msgID, addr)
+		updateCtx, cancelUpdate := context.WithTimeout(ctx, localDeliveryOpTimeout)
+		tag, err := h.q().Exec(updateCtx, query, delivered, code, msgID, addr)
+		cancelUpdate()
 		if err != nil {
 			log.Printf("resolve local delivery: update %s msg %d addr %s: %v", table, msgID, addr, err)
 			continue
@@ -560,9 +570,7 @@ func (h *MessageHandler) enrichMessageList(ctx context.Context, messages []messa
 func (h *MessageHandler) Create(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
 
-	if h.MaxDataSize > 0 {
-		limitRequestBody(c, h.MaxDataSize*2+1<<20)
-	}
+	limitJSONBody(c, h.MaxDataSize)
 
 	var msg messageInput
 	if err := c.ShouldBindJSON(&msg); err != nil {
@@ -720,7 +728,7 @@ func (h *MessageHandler) Get(c *gin.Context) {
 		msg.Reactions = []models.Reaction{}
 	}
 	if editShape(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, len(msg.Attachments)) {
-		_, msg.Edit = h.editSubject(ctx, msgID)
+		_, msg.Edit, _ = h.editSubject(ctx, msgID)
 	}
 	editsMap, err := h.loadEffectiveEdits(ctx, []int64{msgID})
 	if err != nil {
@@ -888,9 +896,7 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if h.MaxDataSize > 0 {
-		limitRequestBody(c, h.MaxDataSize*2+1<<20)
-	}
+	limitJSONBody(c, h.MaxDataSize)
 
 	var msg messageInput
 	if err := c.ShouldBindJSON(&msg); err != nil {
@@ -1172,8 +1178,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	// fmsgd's outbound sender skips the local domain entirely, so local
 	// recipients need their delivery status resolved here instead.
 	afterCommit(c, func() {
-		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		defer cancel()
+		postCtx := context.WithoutCancel(ctx)
 		plain := *h
 		plain.query = nil
 		plain.recordSend(postCtx, existing.From, now, size)
@@ -1465,8 +1470,7 @@ func (h *MessageHandler) AddRecipients(c *gin.Context) {
 	// federated participant on a different domain than the recipients they add.
 	if timeSent != nil {
 		afterCommit(c, func() {
-			postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-			defer cancel()
+			postCtx := context.WithoutCancel(ctx)
 			plain := *h
 			plain.query = nil
 			plain.resolveLocalDelivery(postCtx, "msg_add_to", msgID, h.LocalDomain, input.AddTo)
@@ -1685,7 +1689,7 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 		item.Reactions = []models.Reaction{}
 	}
 	if editShape(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, len(item.Attachments)) {
-		_, item.Edit = h.editSubject(ctx, msgID)
+		_, item.Edit, _ = h.editSubject(ctx, msgID)
 	}
 	editsMap, err := h.loadEffectiveEdits(ctx, []int64{msgID})
 	if err != nil {

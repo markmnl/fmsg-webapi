@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	syncatomic "sync/atomic"
 	"testing"
 	"time"
@@ -132,13 +133,13 @@ func TestParseNotifyPayload(t *testing.T) {
 func TestHubRoute_SkipsClassificationWhenNoPushAndNoClients(t *testing.T) {
 	var reactCalls, editCalls int
 	hub := newTestHub()
-	hub.reactionSubject = func(_ context.Context, _ int64) (int64, bool) {
+	hub.reactionSubject = func(_ context.Context, _ int64) (int64, bool, error) {
 		reactCalls++
-		return 0, false
+		return 0, false, nil
 	}
-	hub.editSubject = func(_ context.Context, _ int64) (int64, bool) {
+	hub.editSubject = func(_ context.Context, _ int64) (int64, bool, error) {
 		editCalls++
-		return 0, false
+		return 0, false, nil
 	}
 
 	hub.route(context.Background(), "new_msg", 42, "@offline@x")
@@ -150,16 +151,16 @@ func TestHubRoute_SkipsClassificationWhenNoPushAndNoClients(t *testing.T) {
 func TestHubRoute_CachesClassificationAcrossRecipients(t *testing.T) {
 	var reactCalls, editCalls int
 	hub := newTestHub()
-	hub.reactionSubject = func(_ context.Context, id int64) (int64, bool) {
+	hub.reactionSubject = func(_ context.Context, id int64) (int64, bool, error) {
 		reactCalls++
 		if id == 100 {
-			return 10, true
+			return 10, true, nil
 		}
-		return 0, false
+		return 0, false, nil
 	}
-	hub.editSubject = func(_ context.Context, _ int64) (int64, bool) {
+	hub.editSubject = func(_ context.Context, _ int64) (int64, bool, error) {
 		editCalls++
-		return 0, false
+		return 0, false, nil
 	}
 
 	alice := newTestClient("@alice@x")
@@ -200,11 +201,104 @@ func TestHubRoute_CachesClassificationAcrossRecipients(t *testing.T) {
 	}
 }
 
+func TestHubRoute_DoesNotCacheTransientClassificationError(t *testing.T) {
+	var reactCalls, editCalls int
+	transientErr := errors.New("transient db timeout")
+
+	hub := newTestHub()
+	hub.reactionSubject = func(_ context.Context, id int64) (int64, bool, error) {
+		reactCalls++
+		if id == 300 {
+			if reactCalls == 1 {
+				return 0, false, transientErr
+			}
+			return 10, true, nil
+		}
+		return 0, false, nil
+	}
+	hub.editSubject = func(_ context.Context, id int64) (int64, bool, error) {
+		editCalls++
+		if id == 400 {
+			if editCalls == 1 {
+				return 0, false, transientErr
+			}
+			return 20, true, nil
+		}
+		return 0, false, nil
+	}
+
+	alice := newTestClient("@alice@x")
+	bob := newTestClient("@bob@x")
+	carol := newTestClient("@carol@x")
+	hub.Register(alice)
+	hub.Register(bob)
+	hub.Register(carol)
+
+	// First recipient hits a transient reaction classification error: must NOT cache.
+	hub.route(context.Background(), "new_msg", 300, "@alice@x")
+	// Second recipient re-runs classification, succeeds as a reaction, and caches.
+	hub.route(context.Background(), "new_msg", 300, "@bob@x")
+	// Third recipient uses the cached reaction classification.
+	hub.route(context.Background(), "new_msg", 300, "@carol@x")
+
+	if reactCalls != 2 {
+		t.Fatalf("reactionSubject calls = %d, want 2 (retry after transient error, then cache)", reactCalls)
+	}
+	for _, c := range []*wsClient{bob, carol} {
+		select {
+		case raw := <-c.send:
+			var env struct {
+				Type string          `json:"type"`
+				Data messageListItem `json:"data"`
+			}
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if env.Type != eventReaction || env.Data.ID != 10 {
+				t.Fatalf("%s got (%s, %d), want (%s, 10)", c.addr, env.Type, env.Data.ID, eventReaction)
+			}
+		default:
+			t.Fatalf("%s did not receive reaction event", c.addr)
+		}
+	}
+
+	// Drain alice's fallback frame from the transient error.
+	<-alice.send
+
+	// Transient edit classification error is also not cached.
+	editCalls = 0
+	hub.route(context.Background(), "new_msg", 400, "@alice@x")
+	hub.route(context.Background(), "new_msg", 400, "@bob@x")
+	hub.route(context.Background(), "new_msg", 400, "@carol@x")
+	if editCalls != 2 {
+		t.Fatalf("editSubject calls = %d, want 2 (retry after transient error, then cache)", editCalls)
+	}
+	for _, c := range []*wsClient{bob, carol} {
+		select {
+		case raw := <-c.send:
+			var env struct {
+				Type string          `json:"type"`
+				Data messageListItem `json:"data"`
+			}
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if env.Type != eventEdit || env.Data.ID != 20 {
+				t.Fatalf("%s got (%s, %d), want (%s, 20)", c.addr, env.Type, env.Data.ID, eventEdit)
+			}
+		default:
+			t.Fatalf("%s did not receive edit event", c.addr)
+		}
+	}
+}
+
 func TestHubPushWorkerPool_BoundedConcurrencyAndDrain(t *testing.T) {
 	hub := newTestHub()
 	hub.pushWorkers = 2
 	hub.pushQueueSize = 16
 
+	const total = 8
+	allDone := make(chan struct{})
 	var inFlight, maxInFlight, completed syncatomic.Int32
 	hub.SetPushNotifier(func(_ context.Context, _ int64, _ string) {
 		cur := inFlight.Add(1)
@@ -216,19 +310,93 @@ func TestHubPushWorkerPool_BoundedConcurrencyAndDrain(t *testing.T) {
 		}
 		time.Sleep(15 * time.Millisecond)
 		inFlight.Add(-1)
-		completed.Add(1)
+		if completed.Add(1) == total {
+			close(allDone)
+		}
 	})
 
-	const total = 8
 	for i := int64(1); i <= total; i++ {
 		hub.route(context.Background(), "new_msg", i, "@offline@x")
+	}
+	select {
+	case <-allDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for pushes: completed=%d/%d", completed.Load(), total)
 	}
 	hub.Close()
 
 	if got := completed.Load(); got != total {
-		t.Fatalf("completed pushes = %d, want %d (Close must drain worker pool)", got, total)
+		t.Fatalf("completed pushes = %d, want %d", got, total)
 	}
 	if got := maxInFlight.Load(); got > 2 {
 		t.Fatalf("max concurrent pushes = %d, exceeds worker pool bound 2", got)
+	}
+}
+
+func TestHubCloseContext_CancelsQueuedAndInFlightPushes(t *testing.T) {
+	hub := newTestHub()
+	hub.pushWorkers = 2
+	hub.pushQueueSize = 4
+
+	started := make(chan struct{}, 2)
+	var called, cancelled syncatomic.Int32
+	hub.SetPushNotifier(func(ctx context.Context, _ int64, _ string) {
+		called.Add(1)
+		started <- struct{}{}
+		<-ctx.Done()
+		cancelled.Add(1)
+	})
+
+	// Fill both workers, fill the 4-slot queue, and trigger 2 drops.
+	for i := int64(1); i <= 8; i++ {
+		hub.route(context.Background(), "new_msg", i, "@offline@x")
+		if i == 2 {
+			// Wait until both workers have pulled their jobs before filling the queue.
+			<-started
+			<-started
+		}
+	}
+	if got := hub.PushDrops(); got != 2 {
+		t.Fatalf("PushDrops() = %d, want 2", got)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := hub.CloseContext(closeCtx); err != nil {
+		t.Fatalf("CloseContext returned error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("CloseContext took %s, expected prompt cancellation well before deadline", elapsed)
+	}
+	if got := called.Load(); got != 2 {
+		t.Fatalf("notifyPush called %d times, want 2 (queued jobs should be skipped after cancel)", got)
+	}
+	if got := cancelled.Load(); got != 2 {
+		t.Fatalf("in-flight pushes observing cancellation = %d, want 2", got)
+	}
+}
+
+func TestHubCloseContext_RespectsDeadlineWhenWorkerBlocks(t *testing.T) {
+	hub := newTestHub()
+	hub.pushWorkers = 1
+	hub.pushQueueSize = 1
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	hub.SetPushNotifier(func(_ context.Context, _ int64, _ string) {
+		close(started)
+		<-release
+	})
+
+	hub.route(context.Background(), "new_msg", 1, "@offline@x")
+	<-started
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := hub.CloseContext(closeCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext err = %v, want context.DeadlineExceeded", err)
 	}
 }

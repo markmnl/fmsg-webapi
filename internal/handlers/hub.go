@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	syncatomic "sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -94,7 +95,6 @@ func (c *msgClassCache) put(id int64, cls msgClassification) {
 }
 
 type pushJob struct {
-	ctx   context.Context
 	msgID int64
 	addr  string
 }
@@ -118,12 +118,14 @@ type Hub struct {
 	// reactionSubject, when non-nil, reports the subject message of msgID
 	// when msgID is an FMSG-005 reaction. A reaction is pushed to its
 	// recipients as a reaction event carrying the refreshed subject, never
-	// as new_msg.
-	reactionSubject func(ctx context.Context, msgID int64) (int64, bool)
+	// as new_msg. Transient errors are returned so the hub does not cache a
+	// false negative.
+	reactionSubject func(ctx context.Context, msgID int64) (int64, bool, error)
 	// editSubject, when non-nil, reports the subject message of msgID when
 	// msgID is an FMSG-008 edit. An edit is pushed to its recipients as an
 	// edit event carrying the refreshed subject, never as a new message.
-	editSubject func(ctx context.Context, msgID int64) (int64, bool)
+	// Transient errors are returned so the hub does not cache a false negative.
+	editSubject func(ctx context.Context, msgID int64) (int64, bool, error)
 
 	// indicatorParticipants and threadRoot split indicator audience lookup so
 	// routeIndicator can skip the recursive root CTE when no participant has a
@@ -139,8 +141,11 @@ type Hub struct {
 	pushQueueSize int
 	pushMu        sync.Mutex
 	pushCh        chan pushJob
+	pushCtx       context.Context
+	pushCancel    context.CancelFunc
 	pushClosed    bool
 	pushWG        sync.WaitGroup
+	pushDrops     syncatomic.Uint64
 
 	mu sync.RWMutex
 	// registry maps a lower-cased user address to the set of that user's
@@ -154,21 +159,52 @@ func (h *Hub) SetPushNotifier(fn func(ctx context.Context, msgID int64, addr str
 	h.notifyPush = fn
 }
 
-// Close shuts down the bounded Web Push worker pool and waits for queued and
-// in-flight pushes to finish.
+// PushDrops returns the total number of Web Push jobs dropped because the
+// bounded push queue was full.
+func (h *Hub) PushDrops() uint64 {
+	return h.pushDrops.Load()
+}
+
+// Close shuts down the bounded Web Push worker pool, cancelling queued and
+// in-flight pushes and waiting until all workers have exited.
 func (h *Hub) Close() {
+	_ = h.CloseContext(context.Background())
+}
+
+// CloseContext shuts down the bounded Web Push worker pool, cancelling its
+// push context so queued jobs are skipped and in-flight pushes abort promptly,
+// and waits for workers to exit until ctx is cancelled.
+func (h *Hub) CloseContext(ctx context.Context) error {
 	h.pushMu.Lock()
 	if !h.pushClosed {
 		h.pushClosed = true
+		if h.pushCancel != nil {
+			h.pushCancel()
+		}
 		if h.pushCh != nil {
 			close(h.pushCh)
 		}
 	}
 	h.pushMu.Unlock()
-	h.pushWG.Wait()
+
+	if ctx == nil {
+		h.pushWG.Wait()
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		h.pushWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func (h *Hub) enqueuePush(ctx context.Context, msgID int64, addr string) {
+func (h *Hub) enqueuePush(msgID int64, addr string) {
 	h.pushMu.Lock()
 	if h.pushClosed {
 		h.pushMu.Unlock()
@@ -183,24 +219,29 @@ func (h *Hub) enqueuePush(ctx context.Context, msgID int64, addr string) {
 		if qsize <= 0 {
 			qsize = defaultPushQueueSize
 		}
+		h.pushCtx, h.pushCancel = context.WithCancel(context.Background())
 		h.pushCh = make(chan pushJob, qsize)
 		h.pushWG.Add(workers)
 		for range workers {
-			go h.pushWorker()
+			go h.pushWorker(h.pushCtx)
 		}
 	}
 	select {
-	case h.pushCh <- pushJob{ctx: ctx, msgID: msgID, addr: addr}:
+	case h.pushCh <- pushJob{msgID: msgID, addr: addr}:
 	default:
-		log.Printf("ws hub: push queue full, dropping push for msg %d to %s", msgID, addr)
+		drops := h.pushDrops.Add(1)
+		log.Printf("ws hub: push queue full, dropping push for msg %d to %s (total dropped: %d)", msgID, addr, drops)
 	}
 	h.pushMu.Unlock()
 }
 
-func (h *Hub) pushWorker() {
+func (h *Hub) pushWorker(pushCtx context.Context) {
 	defer h.pushWG.Done()
 	for job := range h.pushCh {
-		h.notifyPush(job.ctx, job.msgID, job.addr)
+		if pushCtx.Err() != nil {
+			return
+		}
+		h.notifyPush(pushCtx, job.msgID, job.addr)
 	}
 }
 
@@ -318,7 +359,8 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 }
 
 // classifyNewMsg classifies an immutable sent message once and caches the
-// result so multi-recipient fan-out avoids repeated DB/disk queries.
+// result so multi-recipient fan-out avoids repeated DB/disk queries. Transient
+// classification errors are not cached so subsequent recipients retry.
 func (h *Hub) classifyNewMsg(ctx context.Context, msgID int64) msgClassification {
 	if h.reactionSubject == nil && h.editSubject == nil {
 		return msgClassification{kind: msgClassNormal}
@@ -327,17 +369,26 @@ func (h *Hub) classifyNewMsg(ctx context.Context, msgID int64) msgClassification
 		return cls
 	}
 	cls := msgClassification{kind: msgClassNormal}
+	cacheable := true
 	if h.reactionSubject != nil {
-		if subject, ok := h.reactionSubject(ctx, msgID); ok {
+		subject, ok, err := h.reactionSubject(ctx, msgID)
+		if err != nil {
+			cacheable = false
+		} else if ok {
 			cls = msgClassification{kind: msgClassReaction, subject: subject}
 		}
 	}
 	if cls.kind == msgClassNormal && h.editSubject != nil {
-		if subject, ok := h.editSubject(ctx, msgID); ok {
+		subject, ok, err := h.editSubject(ctx, msgID)
+		if err != nil {
+			cacheable = false
+		} else if ok {
 			cls = msgClassification{kind: msgClassEdit, subject: subject}
 		}
 	}
-	h.classCache.put(msgID, cls)
+	if cacheable {
+		h.classCache.put(msgID, cls)
+	}
 	return cls
 }
 
@@ -367,7 +418,7 @@ func (h *Hub) route(ctx context.Context, channel string, msgID int64, addr strin
 		// dispatched here, alongside (not inside) dispatch, so a push is
 		// sent even when the recipient has no live WebSocket.
 		if h.notifyPush != nil {
-			h.enqueuePush(ctx, msgID, addr)
+			h.enqueuePush(msgID, addr)
 		}
 		h.dispatch(ctx, msgID, addr, eventNewMsg)
 	case "delivered":

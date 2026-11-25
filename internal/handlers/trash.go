@@ -309,8 +309,7 @@ func (h *MessageHandler) purge(c *gin.Context, identity string, msgID int64, thr
 	if h.IDURL != "" && len(releases) > 0 {
 		idURL := h.IDURL
 		afterCommit(c, func() {
-			postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-			defer cancel()
+			postCtx := context.WithoutCancel(ctx)
 			for _, r := range releases {
 				var err error
 				if r.send {

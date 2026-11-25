@@ -150,12 +150,14 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	}
 	// Undo registration or reinstatement if no grant comes of it, so a
 	// newly-registered or deleted address doesn't stay accepting new messages
-	// without a grant. An already-active address (conflicting create) is left
-	// untouched.
+	// without a grant. An already-active address or a concurrent create that
+	// won the race (ErrAlreadyExists) is left untouched so an active grant is
+	// never disabled.
 	granted := false
+	conflict := false
 	if created || reinstated {
 		defer func() {
-			if !granted {
+			if !granted && !conflict {
 				disableAfterFailedCreate(h.idURL, subAddr)
 			}
 		}()
@@ -168,6 +170,9 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 		return
 	}
 	if err := h.store.Create(c.Request.Context(), owner, in.Agent, subAddr, key.ID, hash, in.AllowedCIDRs, expires); err != nil {
+		if errors.Is(err, apiauth.ErrAlreadyExists) {
+			conflict = true
+		}
 		respondSubAccountStoreError(c, err)
 		return
 	}

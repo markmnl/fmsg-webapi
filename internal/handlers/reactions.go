@@ -49,35 +49,43 @@ func reactionShape(hasPid, noReply, terminal, important, hasAddTo bool, mediaTyp
 		isReactionMediaType(mediaType)
 }
 
-// readReactionData reads a shape-matching message's body and returns the emoji
-// it carries ("" clears) and whether the body is a valid reaction body.
-func (h *MessageHandler) readReactionData(dataPath string, size int) (string, bool) {
+// readReactionDataErr reads a shape-matching message's body and returns the
+// emoji it carries ("" clears), whether the body is a valid reaction body, and
+// any disk I/O error encountered while reading it.
+func (h *MessageHandler) readReactionDataErr(dataPath string, size int) (string, bool, error) {
 	if size == 0 {
-		return "", true
+		return "", true, nil
 	}
 	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
 	if !ok {
-		return "", false
+		return "", false, nil
 	}
 	f, err := os.Open(cleanPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("reaction data: open %s: %v", cleanPath, err)
 		}
-		return "", false
+		return "", false, err
 	}
 	defer f.Close()
 	buf := make([]byte, maxReactionBytes+1)
 	n, err := io.ReadFull(f, buf)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		log.Printf("reaction data: read %s: %v", cleanPath, err)
-		return "", false
+		return "", false, err
 	}
 	s := string(buf[:n])
 	if !emoji.IsSingle(s) {
-		return "", false
+		return "", false, nil
 	}
-	return s, true
+	return s, true, nil
+}
+
+// readReactionData reads a shape-matching message's body and returns the emoji
+// it carries ("" clears) and whether the body is a valid reaction body.
+func (h *MessageHandler) readReactionData(dataPath string, size int) (string, bool) {
+	s, ok, _ := h.readReactionDataErr(dataPath, size)
+	return s, ok
 }
 
 // reactionOf returns the reaction a message carries, or nil when the message
@@ -93,9 +101,10 @@ func (h *MessageHandler) reactionOf(hasPid, noReply, terminal, important, hasAdd
 	return &s
 }
 
-// reactionSubject reports the subject of msgID when msgID is a reaction. Used
-// by the WebSocket hub to route an arriving reaction as a reaction event.
-func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int64, bool) {
+// reactionSubject reports the subject of msgID when msgID is a reaction.
+// Transient DB or disk errors are returned so callers (such as the WebSocket
+// hub classification cache) do not pin a false negative.
+func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int64, bool, error) {
 	var pid *int64
 	var noReply, terminal, important, hasAddTo bool
 	var mediaType, dataPath string
@@ -107,15 +116,23 @@ func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int6
 		FROM msg m WHERE m.id = $1`, msgID,
 	).Scan(&pid, &noReply, &terminal, &important, &mediaType, &size, &dataPath, &attachments, &hasAddTo)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Printf("reaction subject of %d: %v", msgID, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
 		}
-		return 0, false
+		log.Printf("reaction subject of %d: %v", msgID, err)
+		return 0, false, err
 	}
-	if pid == nil || h.reactionOf(true, noReply, terminal, important, hasAddTo, mediaType, size, attachments, dataPath) == nil {
-		return 0, false
+	if pid == nil || !reactionShape(true, noReply, terminal, important, hasAddTo, mediaType, size, attachments) {
+		return 0, false, nil
 	}
-	return *pid, true
+	_, ok, err := h.readReactionDataErr(dataPath, size)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	return *pid, true, nil
 }
 
 // reactionRow is one stored reaction message on a subject.
@@ -478,8 +495,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 	// fmsgd's outbound sender skips the local domain, so local recipients
 	// have their delivery resolved here, as Send does.
 	afterCommit(c, func() {
-		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		defer cancel()
+		postCtx := context.WithoutCancel(ctx)
 		plain := *h
 		plain.query = nil
 		plain.recordSend(postCtx, identity, now, size)

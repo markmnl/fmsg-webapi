@@ -41,43 +41,58 @@ func editShape(hasPid, noReply, terminal, important, hasAddTo bool, mediaType st
 		attachments == 0 && isEditMediaType(mediaType)
 }
 
-// readBody reads a stored message body. An empty path is an empty body.
-func (h *MessageHandler) readBody(dataPath string) ([]byte, bool) {
+// readBodyErr reads a stored message body, distinguishing disk I/O errors
+// from unsafe paths. An empty path is an empty body.
+func (h *MessageHandler) readBodyErr(dataPath string) ([]byte, bool, error) {
 	if dataPath == "" {
-		return nil, true
+		return nil, true, nil
 	}
 	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("edit: read %s: %v", cleanPath, err)
 		}
-		return nil, false
+		return nil, false, err
 	}
-	return data, true
+	return data, true, nil
 }
 
-// bodyLen returns the byte length of a stored message body without reading its
-// contents. An empty path is an empty body.
-func (h *MessageHandler) bodyLen(dataPath string) (int, bool) {
+// readBody reads a stored message body. An empty path is an empty body.
+func (h *MessageHandler) readBody(dataPath string) ([]byte, bool) {
+	data, ok, _ := h.readBodyErr(dataPath)
+	return data, ok
+}
+
+// bodyLenErr returns the byte length of a stored message body without reading
+// its contents, distinguishing disk I/O errors from unsafe paths. An empty path
+// is an empty body.
+func (h *MessageHandler) bodyLenErr(dataPath string) (int, bool, error) {
 	if dataPath == "" {
-		return 0, true
+		return 0, true, nil
 	}
 	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
 	fi, err := os.Stat(cleanPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("edit: stat %s: %v", cleanPath, err)
 		}
-		return 0, false
+		return 0, false, err
 	}
-	return int(fi.Size()), true
+	return int(fi.Size()), true, nil
+}
+
+// bodyLen returns the byte length of a stored message body without reading its
+// contents. An empty path is an empty body.
+func (h *MessageHandler) bodyLen(dataPath string) (int, bool) {
+	n, ok, _ := h.bodyLenErr(dataPath)
+	return n, ok
 }
 
 // editLimit bounds the size of edited data this server will produce for a
@@ -87,9 +102,9 @@ func (h *MessageHandler) editLimit(subjectLen int) int64 {
 }
 
 // editSubject reports the subject of msgID when msgID is an edit message.
-// Used to flag edit messages and by the WebSocket hub to route an arriving
-// edit as an edit event.
-func (h *MessageHandler) editSubject(ctx context.Context, msgID int64) (int64, bool) {
+// Transient DB or disk errors are returned so callers (such as the WebSocket
+// hub classification cache) do not pin a false negative.
+func (h *MessageHandler) editSubject(ctx context.Context, msgID int64) (int64, bool, error) {
 	var pid int64
 	var size int
 	var dataPath, subjectPath string
@@ -99,26 +114,33 @@ func (h *MessageHandler) editSubject(ctx context.Context, msgID int64) (int64, b
 		WHERE r.id = $1 AND `+editRowFilter, msgID, edit.MediaType,
 	).Scan(&pid, &size, &dataPath, &subjectPath)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Printf("edit subject of %d: %v", msgID, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
 		}
-		return 0, false
+		log.Printf("edit subject of %d: %v", msgID, err)
+		return 0, false, err
 	}
 	if size == 0 {
-		return pid, true
+		return pid, true, nil
 	}
-	subjectLen, ok := h.bodyLen(subjectPath)
-	if !ok {
-		return 0, false
+	subjectLen, ok, err := h.bodyLenErr(subjectPath)
+	if err != nil {
+		return 0, false, err
 	}
-	doc, ok := h.readBody(dataPath)
 	if !ok {
-		return 0, false
+		return 0, false, nil
+	}
+	doc, ok, err := h.readBodyErr(dataPath)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
 	}
 	if _, err := edit.Check(doc, subjectLen); err != nil {
-		return 0, false
+		return 0, false, nil
 	}
-	return pid, true
+	return pid, true, nil
 }
 
 // editRowFilter selects sent messages r having the shape of an edit of their
@@ -408,9 +430,7 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 		return
 	}
 
-	if h.MaxDataSize > 0 {
-		limitRequestBody(c, h.MaxDataSize*2+1<<20)
-	}
+	limitJSONBody(c, h.MaxDataSize)
 
 	var in editInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -596,8 +616,7 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 	// fmsgd's outbound sender skips the local domain, so local recipients
 	// have their delivery resolved here, as Send does.
 	afterCommit(c, func() {
-		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		defer cancel()
+		postCtx := context.WithoutCancel(ctx)
 		plain := *h
 		plain.query = nil
 		for i, t := range targets {

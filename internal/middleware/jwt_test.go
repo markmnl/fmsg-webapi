@@ -466,7 +466,7 @@ func TestDualAuth_APITokenFastPathSkipsJWKS(t *testing.T) {
 }
 
 func TestFmsgIDCache_CaseInsensitiveAndBounded(t *testing.T) {
-	// 1. Bounded eviction on boundedFmsgIDCache.
+	// 1. Bounded eviction on boundedFmsgIDCache evicts soonest-to-expire entries.
 	cache := newBoundedFmsgIDCache(4)
 	now := time.Unix(1000, 0)
 	for i := range 10 {
@@ -477,6 +477,16 @@ func TestFmsgIDCache_CaseInsensitiveAndBounded(t *testing.T) {
 		}, now)
 		if got := len(cache.entries); got > 4 {
 			t.Fatalf("cache size = %d after insert %d, exceeds max 4", got, i)
+		}
+	}
+	for _, k := range []string{"k0", "k1", "k2", "k3", "k4", "k5"} {
+		if _, ok := cache.get(k, now); ok {
+			t.Fatalf("expected earlier-expiring entry %s to be evicted", k)
+		}
+	}
+	for _, k := range []string{"k6", "k7", "k8", "k9"} {
+		if _, ok := cache.get(k, now); !ok {
+			t.Fatalf("expected later-expiring entry %s to remain cached", k)
 		}
 	}
 	// Expired entries are evicted on lookup and on insert.

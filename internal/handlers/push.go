@@ -19,8 +19,9 @@ import (
 	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
-// pushTimeout caps how long a single new_msg push fan-out may take. It runs on
-// a fresh context so a listener reconnect cannot cancel in-flight sends.
+// pushTimeout caps how long a single new_msg push fan-out may take. It derives
+// from the hub's push context so listener reconnects cannot cancel in-flight
+// sends while graceful shutdown aborts them promptly.
 const pushTimeout = 30 * time.Second
 
 // pushRequestTimeout caps each individual HTTP request to a Web Push endpoint.
@@ -152,8 +153,11 @@ func (h *PushHandler) Unsubscribe(c *gin.Context) {
 // recipient addr. It is invoked by the WebSocket hub for each new_msg
 // notification and runs independently of WebSocket fan-out, so a recipient with
 // no live WebSocket is still notified.
-func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) {
-	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+func (h *PushHandler) NotifyNewMsg(ctx context.Context, msgID int64, addr string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
 	defer cancel()
 
 	// Load the recipient's subscriptions first; an address with none costs
@@ -217,7 +221,7 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 		return // FMSG-005: a reaction does not warrant a notification
 	}
 	if editShape(pid != nil, noReply, terminal, important, hasAddTo, mediaType, attCount) {
-		if _, isEdit := h.msgs.editSubject(ctx, msgID); isEdit {
+		if _, isEdit, _ := h.msgs.editSubject(ctx, msgID); isEdit {
 			return // FMSG-008: nor does an edit
 		}
 	}
@@ -239,6 +243,9 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 	}
 
 	for _, s := range subs {
+		if ctx.Err() != nil {
+			return
+		}
 		sub := &webpush.Subscription{
 			Endpoint: s.endpoint,
 			Keys:     webpush.Keys{P256dh: s.p256dh, Auth: s.auth},
