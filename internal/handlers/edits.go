@@ -41,23 +41,58 @@ func editShape(hasPid, noReply, terminal, important, hasAddTo bool, mediaType st
 		attachments == 0 && isEditMediaType(mediaType)
 }
 
-// readBody reads a stored message body. An empty path is an empty body.
-func (h *MessageHandler) readBody(dataPath string) ([]byte, bool) {
+// readBodyErr reads a stored message body, distinguishing disk I/O errors
+// from unsafe paths. An empty path is an empty body.
+func (h *MessageHandler) readBodyErr(dataPath string) ([]byte, bool, error) {
 	if dataPath == "" {
-		return nil, true
+		return nil, true, nil
 	}
 	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("edit: read %s: %v", cleanPath, err)
 		}
-		return nil, false
+		return nil, false, err
 	}
-	return data, true
+	return data, true, nil
+}
+
+// readBody reads a stored message body. An empty path is an empty body.
+func (h *MessageHandler) readBody(dataPath string) ([]byte, bool) {
+	data, ok, _ := h.readBodyErr(dataPath)
+	return data, ok
+}
+
+// bodyLenErr returns the byte length of a stored message body without reading
+// its contents, distinguishing disk I/O errors from unsafe paths. An empty path
+// is an empty body.
+func (h *MessageHandler) bodyLenErr(dataPath string) (int, bool, error) {
+	if dataPath == "" {
+		return 0, true, nil
+	}
+	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
+	if !ok {
+		return 0, false, nil
+	}
+	fi, err := os.Stat(cleanPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("edit: stat %s: %v", cleanPath, err)
+		}
+		return 0, false, err
+	}
+	return int(fi.Size()), true, nil
+}
+
+// bodyLen returns the byte length of a stored message body without reading its
+// contents. An empty path is an empty body.
+func (h *MessageHandler) bodyLen(dataPath string) (int, bool) {
+	n, ok, _ := h.bodyLenErr(dataPath)
+	return n, ok
 }
 
 // editLimit bounds the size of edited data this server will produce for a
@@ -67,9 +102,9 @@ func (h *MessageHandler) editLimit(subjectLen int) int64 {
 }
 
 // editSubject reports the subject of msgID when msgID is an edit message.
-// Used to flag edit messages and by the WebSocket hub to route an arriving
-// edit as an edit event.
-func (h *MessageHandler) editSubject(ctx context.Context, msgID int64) (int64, bool) {
+// Transient DB or disk errors are returned so callers (such as the WebSocket
+// hub classification cache) do not pin a false negative.
+func (h *MessageHandler) editSubject(ctx context.Context, msgID int64) (int64, bool, error) {
 	var pid int64
 	var size int
 	var dataPath, subjectPath string
@@ -79,26 +114,33 @@ func (h *MessageHandler) editSubject(ctx context.Context, msgID int64) (int64, b
 		WHERE r.id = $1 AND `+editRowFilter, msgID, edit.MediaType,
 	).Scan(&pid, &size, &dataPath, &subjectPath)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Printf("edit subject of %d: %v", msgID, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
 		}
-		return 0, false
+		log.Printf("edit subject of %d: %v", msgID, err)
+		return 0, false, err
 	}
 	if size == 0 {
-		return pid, true
+		return pid, true, nil
 	}
-	subject, ok := h.readBody(subjectPath)
+	subjectLen, ok, err := h.bodyLenErr(subjectPath)
+	if err != nil {
+		return 0, false, err
+	}
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
-	doc, ok := h.readBody(dataPath)
+	doc, ok, err := h.readBodyErr(dataPath)
+	if err != nil {
+		return 0, false, err
+	}
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
-	if _, err := edit.Check(doc, len(subject)); err != nil {
-		return 0, false
+	if _, err := edit.Check(doc, subjectLen); err != nil {
+		return 0, false, nil
 	}
-	return pid, true
+	return pid, true, nil
 }
 
 // editRowFilter selects sent messages r having the shape of an edit of their
@@ -146,9 +188,9 @@ func (e *effectiveEdit) edited() *models.Edited {
 // loadEffectiveEdits returns the effective edit of each of the given subjects
 // that has one. Edit-shaped messages whose data is not a well-formed edit
 // document for the subject are ordinary messages and are skipped.
-func (h *MessageHandler) loadEffectiveEdits(ctx context.Context, subjectIDs []int64) map[int64]*effectiveEdit {
+func (h *MessageHandler) loadEffectiveEdits(ctx context.Context, subjectIDs []int64) (map[int64]*effectiveEdit, error) {
 	if len(subjectIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 	rows, err := h.q().Query(ctx, `
 		SELECT r.pid, r.id, r.time_sent, r.sha256, r.size, r.filepath, s.filepath
@@ -157,8 +199,7 @@ func (h *MessageHandler) loadEffectiveEdits(ctx context.Context, subjectIDs []in
 		subjectIDs, edit.MediaType,
 	)
 	if err != nil {
-		log.Printf("load edits: %v", err)
-		return nil
+		return nil, err
 	}
 	bySubject := make(map[int64][]editRow)
 	subjectPaths := make(map[int64]string)
@@ -168,16 +209,14 @@ func (h *MessageHandler) loadEffectiveEdits(ctx context.Context, subjectIDs []in
 		var subjectPath string
 		if err := rows.Scan(&subjectID, &r.msgID, &r.time, &r.hash, &r.size, &r.dataPath, &subjectPath); err != nil {
 			rows.Close()
-			log.Printf("load edits: scan: %v", err)
-			return nil
+			return nil, err
 		}
 		bySubject[subjectID] = append(bySubject[subjectID], r)
 		subjectPaths[subjectID] = subjectPath
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		log.Printf("load edits: %v", err)
-		return nil
+		return nil, err
 	}
 
 	result := make(map[int64]*effectiveEdit, len(bySubject))
@@ -224,7 +263,7 @@ func (h *MessageHandler) loadEffectiveEdits(ctx context.Context, subjectIDs []in
 			break
 		}
 	}
-	return result
+	return result, nil
 }
 
 // shortTextOf returns the short_text preview of in-memory body data, as
@@ -242,26 +281,87 @@ func (h *MessageHandler) shortTextOf(data []byte, mimeType string) string {
 	return string(data)
 }
 
-// populateListEdits fills Edit and Edited on every list item and replaces the
-// preview of an edited item with one of its edited data.
-func (h *MessageHandler) populateListEdits(ctx context.Context, items []messageListItem) {
+// populateListEdits fills Edit and Edited on every list item and sets the
+// preview of an edited item from its edited data. It returns the set of item
+// IDs whose preview was populated from an applied edit so callers can skip
+// reading the unedited body from disk.
+func (h *MessageHandler) populateListEdits(ctx context.Context, items []messageListItem) (map[int64]bool, error) {
 	ids := make([]int64, len(items))
-	for i := range items {
-		ids[i] = items[i].ID
-	}
-	edits := h.loadEffectiveEdits(ctx, ids)
+	var editCandidates []int64
 	for i := range items {
 		it := &items[i]
+		ids[i] = it.ID
 		if editShape(it.HasPid, it.NoReply, it.Terminal, it.Important, it.HasAddTo, it.Type, len(it.Attachments)) {
-			_, it.Edit = h.editSubject(ctx, it.ID)
+			editCandidates = append(editCandidates, it.ID)
 		}
+	}
+
+	isEdit := make(map[int64]bool, len(editCandidates))
+	if len(editCandidates) > 0 {
+		type candidateRow struct {
+			id          int64
+			size        int
+			dataPath    string
+			subjectPath string
+		}
+		rows, err := h.q().Query(ctx, `
+			SELECT r.id, r.size, r.filepath, s.filepath
+			FROM msg r JOIN msg s ON s.id = r.pid
+			WHERE r.id = ANY($1) AND `+editRowFilter,
+			editCandidates, edit.MediaType,
+		)
+		if err != nil {
+			return nil, err
+		}
+		var candRows []candidateRow
+		for rows.Next() {
+			var cr candidateRow
+			if err := rows.Scan(&cr.id, &cr.size, &cr.dataPath, &cr.subjectPath); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			candRows = append(candRows, cr)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		for _, cr := range candRows {
+			if cr.size == 0 {
+				isEdit[cr.id] = true
+				continue
+			}
+			subjectLen, ok := h.bodyLen(cr.subjectPath)
+			if !ok {
+				continue
+			}
+			doc, ok := h.readBody(cr.dataPath)
+			if !ok {
+				continue
+			}
+			if _, err := edit.Check(doc, subjectLen); err == nil {
+				isEdit[cr.id] = true
+			}
+		}
+	}
+
+	edits, err := h.loadEffectiveEdits(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	applied := make(map[int64]bool)
+	for i := range items {
+		it := &items[i]
+		it.Edit = isEdit[it.ID]
 		if eff := edits[it.ID]; eff != nil {
 			it.Edited = eff.edited()
 			if eff.applied {
 				it.ShortText = h.shortTextOf(eff.data, it.Type)
+				applied[it.ID] = true
 			}
 		}
 	}
+	return applied, nil
 }
 
 // without returns addrs less addr, deduplicated case-insensitively, in order.
@@ -330,8 +430,14 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 		return
 	}
 
+	limitJSONBody(c, h.MaxDataSize)
+
 	var in editInput
 	if err := c.ShouldBindJSON(&in); err != nil {
+		if isMaxBytesError(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -351,7 +457,17 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 		}
 		return
 	}
-	if draftHidden([]string{identity}, subject.From, subject.Time) || purgedFor(ctx, h.q(), identity, msgID) {
+	if draftHidden([]string{identity}, subject.From, subject.Time) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+	purged, err := purgedFor(ctx, h.q(), identity, msgID)
+	if err != nil {
+		log.Printf("edit %d: trash state: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
+	if purged {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
@@ -381,7 +497,13 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message data not available"})
 		return
 	}
-	current := h.loadEffectiveEdits(ctx, []int64{msgID})[msgID]
+	editsMap, err := h.loadEffectiveEdits(ctx, []int64{msgID})
+	if err != nil {
+		log.Printf("edit %d: load edits: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load edits"})
+		return
+	}
+	current := editsMap[msgID]
 
 	// Idempotency: nothing is sent when the effective data would not change.
 	var doc []byte
@@ -431,13 +553,13 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 		return
 	}
 	now := float64(time.Now().UnixMicro()) / 1e6
-	tx, err := h.q().Begin(ctx)
+	tx, commit, rollback, err := beginOrReuseTx(ctx, h.q())
 	if err != nil {
 		log.Printf("edit %d: begin: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send edit"})
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer rollback()
 
 	var files message.Files
 	onRollback(c, func() { files.Cleanup() })
@@ -467,9 +589,9 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send edit"})
 			return
 		}
-		for _, addr := range t.to {
-			if _, err := tx.Exec(ctx, "INSERT INTO msg_to (msg_id, addr) VALUES ($1, $2)", editID, addr); err != nil {
-				log.Printf("edit %d: insert recipient %s: %v", msgID, addr, err)
+		if len(t.to) > 0 {
+			if _, err := tx.Exec(ctx, "INSERT INTO msg_to (msg_id, addr) SELECT $1, unnest($2::text[])", editID, t.to); err != nil {
+				log.Printf("edit %d: insert recipients: %v", msgID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send edit"})
 				return
 			}
@@ -485,7 +607,7 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 			firstHash = hash
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := commit(); err != nil {
 		log.Printf("edit %d: commit: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send edit"})
 		return
@@ -494,11 +616,12 @@ func (h *MessageHandler) Edit(c *gin.Context) {
 	// fmsgd's outbound sender skips the local domain, so local recipients
 	// have their delivery resolved here, as Send does.
 	afterCommit(c, func() {
+		postCtx := context.WithoutCancel(ctx)
 		plain := *h
 		plain.query = nil
 		for i, t := range targets {
-			plain.recordSend(identity, now, size)
-			plain.resolveLocalDelivery(ctx, "msg_to", editIDs[i], h.LocalDomain, t.to)
+			plain.recordSend(postCtx, identity, now, size)
+			plain.resolveLocalDelivery(postCtx, "msg_to", editIDs[i], h.LocalDomain, t.to)
 		}
 	})
 

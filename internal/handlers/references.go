@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -12,6 +13,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
+
+const resolvedMsgIDKey = "resolvedMsgID"
+
+type cachedResolvedID struct {
+	raw string
+	id  int64
+}
 
 func decodeHash(s string) ([]byte, error) {
 	if len(s) != 64 {
@@ -22,8 +30,17 @@ func decodeHash(s string) ([]byte, error) {
 
 func resolveID(c *gin.Context, q queries) (int64, bool) {
 	s := c.Param("id")
+	if v, ok := c.Get(resolvedMsgIDKey); ok {
+		if cached, ok := v.(cachedResolvedID); ok && cached.raw == s {
+			return cached.id, true
+		}
+	}
 	if len(s) != 64 {
-		return parseID(c)
+		id, ok := parseID(c)
+		if ok {
+			c.Set(resolvedMsgIDKey, cachedResolvedID{raw: s, id: id})
+		}
+		return id, ok
 	}
 	hash, err := decodeHash(s)
 	if err != nil {
@@ -40,6 +57,7 @@ func resolveID(c *gin.Context, q queries) (int64, bool) {
 		c.JSON(500, gin.H{"error": "failed to resolve message"})
 		return 0, false
 	}
+	c.Set(resolvedMsgIDKey, cachedResolvedID{raw: s, id: id})
 	return id, true
 }
 
@@ -78,9 +96,19 @@ func (h *MessageHandler) resolveParent(c *gin.Context, in *messageInput) bool {
 	var terminal bool
 	var batchID *int64
 	if hash != nil {
-		err = h.q().QueryRow(ctx, `SELECT m.id,m.sha256,m.time_sent,m.is_terminal,b.id
-		 FROM msg m LEFT JOIN msg_add_to_batch b ON b.msg_id=m.id AND b.sha256=$1
-		 WHERE m.sha256=$1 OR b.id IS NOT NULL ORDER BY b.id NULLS FIRST LIMIT 1`, hash).Scan(&id, &canonical, &sent, &terminal, &batchID)
+		err = h.q().QueryRow(ctx, `SELECT id, sha256, time_sent, is_terminal, batch_id
+		 FROM (
+		     SELECT m.id, m.sha256, m.time_sent, m.is_terminal, NULL::bigint AS batch_id
+		       FROM msg m
+		      WHERE m.sha256 = $1
+		     UNION ALL
+		     SELECT m.id, m.sha256, m.time_sent, m.is_terminal, b.id AS batch_id
+		       FROM msg_add_to_batch b
+		       JOIN msg m ON m.id = b.msg_id
+		      WHERE b.sha256 = $1
+		 ) p
+		 ORDER BY batch_id NULLS FIRST
+		 LIMIT 1`, hash).Scan(&id, &canonical, &sent, &terminal, &batchID)
 	} else {
 		err = h.q().QueryRow(ctx, `SELECT sha256,time_sent,is_terminal FROM msg WHERE id=$1`, id).Scan(&canonical, &sent, &terminal)
 	}
@@ -105,7 +133,13 @@ func (h *MessageHandler) resolveParent(c *gin.Context, in *messageInput) bool {
 		return false
 	}
 	// A parent deleted for good no longer exists for the caller.
-	if purgedFor(ctx, h.q(), middleware.GetIdentity(c), id) {
+	purged, err := purgedFor(ctx, h.q(), middleware.GetIdentity(c), id)
+	if err != nil {
+		log.Printf("resolve parent %d: trash state: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate parent"})
+		return false
+	}
+	if purged {
 		c.JSON(400, gin.H{"error": "parent message not found"})
 		return false
 	}

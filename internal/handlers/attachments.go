@@ -57,7 +57,7 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
-	if fromAddr != identity {
+	if !sameAddr(fromAddr, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may upload attachments"})
 		return
 	}
@@ -66,9 +66,19 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
+	// Bound request body before parsing multipart form data (allow 1 MiB for
+	// multipart framing overhead while rejecting unbounded uploads).
+	if h.MaxAttachSize > 0 {
+		limitRequestBody(c, h.MaxAttachSize+1<<20)
+	}
+
 	// Expect multipart file upload with field "file".
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
+		if isMaxBytesError(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "attachment exceeds maximum size"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file field required"})
 		return
 	}
@@ -89,11 +99,8 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
-	// Resolve collision-safe filepath.
-	finalPath := resolveFilePath(dir, intendedFilename)
-
-	// Write file to disk (limit read to MaxAttachSize + 1 to detect oversized uploads).
-	dst, err := os.OpenFile(finalPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0640)
+	// Atomically create a collision-safe file to avoid Stat-then-Open TOCTOU races.
+	dst, finalPath, err := createUniqueAttachmentFile(dir, intendedFilename)
 	if err != nil {
 		log.Printf("upload attachment: open file: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save attachment"})
@@ -103,6 +110,10 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 	closeErr := dst.Close()
 	if err != nil || closeErr != nil {
 		_ = os.Remove(finalPath)
+		if isMaxBytesError(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "attachment exceeds maximum size"})
+			return
+		}
 		log.Printf("upload attachment: write: %v / %v", err, closeErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write attachment"})
 		return
@@ -117,22 +128,25 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 	createdFile(c, finalPath)
 	// Check total message size and persist attachment in a transaction to
 	// prevent concurrent uploads from exceeding MaxMsgSize.
-	tx, err := h.q().Begin(ctx)
+	tx, commit, rollback, err := beginOrReuseTx(ctx, h.q())
 	if err != nil {
 		_ = os.Remove(finalPath)
 		log.Printf("upload attachment: begin tx: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record attachment"})
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer rollback()
 
-	// Lock the message row and compute current total size.
+	// Lock the message row and compute current total size excluding any
+	// attachment being overwritten with the same filename.
 	var currentTotal int64
+	var prevPath string
 	if err = tx.QueryRow(ctx,
-		`SELECT m.size + COALESCE((SELECT SUM(filesize) FROM msg_attachment WHERE msg_id = m.id), 0)
+		`SELECT m.size + COALESCE((SELECT SUM(filesize) FROM msg_attachment WHERE msg_id = m.id AND filename <> $2), 0),
+		        COALESCE((SELECT filepath FROM msg_attachment WHERE msg_id = m.id AND filename = $2), '')
 		 FROM msg m WHERE m.id = $1 FOR UPDATE`,
-		msgID,
-	).Scan(&currentTotal); err != nil {
+		msgID, intendedFilename,
+	).Scan(&currentTotal, &prevPath); err != nil {
 		_ = os.Remove(finalPath)
 		log.Printf("upload attachment: total size check: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check message size"})
@@ -158,11 +172,17 @@ func (h *AttachmentHandler) Upload(c *gin.Context) {
 		return
 	}
 
-	if err = tx.Commit(ctx); err != nil {
+	if err = commit(); err != nil {
 		_ = os.Remove(finalPath)
 		log.Printf("upload attachment: commit: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record attachment"})
 		return
+	}
+
+	if prevPath != "" && prevPath != finalPath {
+		if cleanPrev, ok := safeDataPath(prevPath, h.DataDir); ok {
+			afterCommit(c, func() { _ = os.Remove(cleanPrev) })
+		}
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"filename": intendedFilename, "size": written})
@@ -198,13 +218,23 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 		}
 		return
 	}
-	if draftHidden([]string{identity}, fromAddr, timeSent) || purgedFor(ctx, h.q(), identity, msgID) {
+	if draftHidden([]string{identity}, fromAddr, timeSent) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+	purged, err := purgedFor(ctx, h.q(), identity, msgID)
+	if err != nil {
+		log.Printf("download attachment: trash state %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
+	if purged {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
 
 	// Check recipients (to or add_to) if not owner.
-	if fromAddr != identity {
+	if !sameAddr(fromAddr, identity) {
 		var recipientCount int
 		if err = h.q().QueryRow(ctx,
 			`SELECT COUNT(*) FROM (
@@ -235,9 +265,8 @@ func (h *AttachmentHandler) Download(c *gin.Context) {
 	}
 
 	// Path traversal protection: ensure the stored path is within DataDir.
-	cleanPath := filepath.Clean(storedPath)
-	cleanDataDir := filepath.Clean(h.DataDir)
-	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+	cleanPath, ok := safeDataPath(storedPath, h.DataDir)
+	if !ok {
 		log.Printf("download attachment: path traversal attempt: %s", storedPath)
 		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
@@ -277,7 +306,7 @@ func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 		return
 	}
 
-	if fromAddr != identity {
+	if !sameAddr(fromAddr, identity) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only the owner may delete attachments"})
 		return
 	}
@@ -311,28 +340,35 @@ func (h *AttachmentHandler) DeleteAttachment(c *gin.Context) {
 	}
 
 	// Remove file from disk.
-	cleanPath := filepath.Clean(storedPath)
-	cleanDataDir := filepath.Clean(h.DataDir)
-	if strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+	if cleanPath, ok := safeDataPath(storedPath, h.DataDir); ok {
 		afterCommit(c, func() { _ = os.Remove(cleanPath) })
 	}
 
 	c.Status(http.StatusNoContent)
 }
 
-// resolveFilePath returns a path under dir for filename, incrementing a suffix
-// until no collision is found.
-func resolveFilePath(dir, filename string) string {
+// createUniqueAttachmentFile atomically creates a new file under dir for
+// filename, appending an incrementing numeric suffix on collision.
+func createUniqueAttachmentFile(dir, filename string) (*os.File, string, error) {
 	candidate := filepath.Join(dir, filename)
-	if _, err := os.Stat(candidate); os.IsNotExist(err) {
-		return candidate
+	f, err := os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0640)
+	if err == nil {
+		return f, candidate, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return nil, "", err
 	}
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
-	for i := 1; ; i++ {
+	for i := 1; i <= 10000; i++ {
 		candidate = filepath.Join(dir, fmt.Sprintf("%s_%d%s", base, i, ext))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+		f, err = os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0640)
+		if err == nil {
+			return f, candidate, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
 		}
 	}
+	return nil, "", fmt.Errorf("too many attachment filename collisions for %q", filename)
 }

@@ -46,7 +46,7 @@ HTTP API providing user/client message handling for an fmsg host. Exposes CRUD o
 | `FMSG_API_PORT`     | `443` (TLS) / `8000` (plain) | TCP port to listen on. |
 | `FMSG_ID_URL`       | `http://127.0.0.1:8080`  | Base URL of the fmsgid identity service                 |
 | `FMSG_API_MAX_DATA_SIZE`| `10`                 | Maximum message data size in megabytes                  |
-| `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes               |
+| `FMSG_API_MAX_ATTACH_SIZE`| `10`               | Maximum attachment file size in megabytes (HTTP `ReadTimeout` of 60s and `WriteTimeout` of 65s bound upload/download duration) |
 | `FMSG_API_MAX_MSG_SIZE`| `20`                  | Maximum total message size (data + attachments) in megabytes |
 | `FMSG_API_SHORT_TEXT_SIZE`| `768`               | Maximum bytes of message body returned inline as `short_text` for `text/*` UTF-8 messages |
 | `FMSG_RETRY_MAX_AGE` | `86400`                  | Seconds fmsgd keeps retrying a delivery after the message was sent (its `FMSG_RETRY_MAX_AGE`; set both the same). A delivery older than this has been given up on and no longer keeps a deleted-for-good message on the host. |
@@ -1167,6 +1167,7 @@ and send time. Ancestors the caller is not a participant of appear as
 | ------ | --------- |
 | `404`  | Message not found |
 | `403`  | Authenticated user is not a participant of the requested message |
+| `413`  | Aggregate inline text exceeds 32 MiB (`thread_too_large`) |
 
 ### GET `/fmsg/:id/thread/messages`
 

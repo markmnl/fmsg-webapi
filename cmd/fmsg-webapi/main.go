@@ -7,8 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v3"
@@ -83,8 +85,12 @@ func main() {
 	pushIconURL := envOrDefault("FMSG_PUSH_ICON_URL", "/icon-192.png")
 	pushEnabled := vapidPublic != "" && vapidPrivate != "" && vapidSubject != ""
 
+	// Root context cancelled on SIGINT/SIGTERM for graceful shutdown of the
+	// HTTP server, JWKS refresher, LISTEN/NOTIFY hub, and Web Push workers.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Connect to PostgreSQL (uses standard PG* environment variables).
-	ctx := context.Background()
 	database, err := db.New(ctx, "")
 	if err != nil {
 		log.Fatalf("failed to connect to database: %v", err)
@@ -170,7 +176,14 @@ func main() {
 		// The hub also dispatches a Web Push for every new_msg notification.
 		hub.SetPushNotifier(pushHandler.NotifyNewMsg)
 	}
-	go hub.Run(context.Background())
+	// The hub runs on its own context so it keeps LISTENing for notifications
+	// from in-flight HTTP requests while the server drains on shutdown.
+	hubCtx, cancelHub := context.WithCancel(context.Background())
+	hubDone := make(chan struct{})
+	go func() {
+		defer close(hubDone)
+		hub.Run(hubCtx)
+	}()
 	wsHandler := handlers.NewWSHandler(jwtVerifier, hub, corsOrigins)
 
 	var tokenHandler *handlers.TokenHandler
@@ -185,25 +198,64 @@ func main() {
 	srv := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      65 * time.Second, // generous, to allow large file transfers
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
+	serveErr := make(chan error, 1)
 	if tlsEnabled {
 		port := envOrDefault("FMSG_API_PORT", "443")
 		srv.Addr = ":" + port
 		log.Printf("fmsg-webapi starting on :%s (HTTPS)", port)
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		if err = srv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server error: %v", err)
-		}
+		go func() {
+			if err := srv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serveErr <- err
+			}
+			close(serveErr)
+		}()
 	} else {
 		port := envOrDefault("FMSG_API_PORT", "8000")
 		srv.Addr = ":" + port
 		log.Printf("fmsg-webapi starting on :%s (plain HTTP)", port)
-		if err = srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serveErr <- err
+			}
+			close(serveErr)
+		}()
+	}
+
+	select {
+	case err := <-serveErr:
+		stop()
+		cancelHub()
+		<-hubDone
+		pushDrainCtx, cancelPushDrain := context.WithTimeout(context.Background(), 5*time.Second)
+		if closeErr := hub.CloseContext(pushDrainCtx); closeErr != nil {
+			log.Printf("push shutdown error: %v", closeErr)
+		}
+		cancelPushDrain()
+		if err != nil {
 			log.Fatalf("server error: %v", err)
+		}
+	case <-ctx.Done():
+		log.Println("fmsg-webapi shutting down...")
+		stop()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Printf("server shutdown error: %v", err)
+		}
+		<-serveErr
+		cancelHub()
+		<-hubDone
+		pushDrainCtx, cancelPushDrain := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelPushDrain()
+		if err := hub.CloseContext(pushDrainCtx); err != nil {
+			log.Printf("push shutdown error: %v", err)
 		}
 	}
 }

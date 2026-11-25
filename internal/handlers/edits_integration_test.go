@@ -229,7 +229,7 @@ func TestEditIgnoresForgedAndMalformed(t *testing.T) {
 		t.Fatalf("data = %q", got)
 	}
 	for _, rid := range []int64{forged, malformed} {
-		if _, ok := a.h.editSubject(ctx, rid); ok {
+		if _, ok, _ := a.h.editSubject(ctx, rid); ok {
 			t.Errorf("message %d recognised as an edit", rid)
 		}
 	}

@@ -55,10 +55,7 @@ func NewWSHandler(verifier *middleware.Verifier, hub *Hub, allowedOrigins []stri
 					// Non-browser client (no Origin header).
 					return true
 				}
-				if len(allowedOrigins) == 0 {
-					return true
-				}
-				if slices.Contains(allowedOrigins, origin) {
+				if len(allowedOrigins) == 0 || slices.Contains(allowedOrigins, "*") || slices.Contains(allowedOrigins, origin) {
 					return true
 				}
 				log.Printf("ws: rejected upgrade from origin %q", origin)
@@ -159,6 +156,7 @@ func (c *wsClient) close() {
 func (c *wsClient) writePump() {
 	ticker := time.NewTicker(wsPingPeriod)
 	defer ticker.Stop()
+	defer c.close()
 	for {
 		select {
 		case payload := <-c.send:

@@ -187,3 +187,35 @@ func TestCheckFmsgIDEscapesAddress(t *testing.T) {
 		t.Fatalf("lookup: code=%d, accepting=%v, err=%v", code, accepting, err)
 	}
 }
+
+func TestRegisterLinkedFmsgIDContextReportsCreatedAndReinstated(t *testing.T) {
+	cases := []struct {
+		name           string
+		status         int
+		body           string
+		wantCreated    bool
+		wantReinstated bool
+	}{
+		{name: "created json", status: http.StatusCreated, body: `{"created":true,"reinstated":false}`, wantCreated: true},
+		{name: "reinstated json", status: http.StatusOK, body: `{"created":false,"reinstated":true}`, wantReinstated: true},
+		{name: "already active json", status: http.StatusOK, body: `{"created":false,"reinstated":false}`},
+		{name: "legacy 201 empty body", status: http.StatusCreated, body: "", wantCreated: true},
+		{name: "legacy 200 empty body", status: http.StatusOK, body: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			created, reinstated, err := RegisterLinkedFmsgIDContext(t.Context(), srv.URL, "@alice_bot@example.com", "@alice@example.com")
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if created != tc.wantCreated || reinstated != tc.wantReinstated {
+				t.Fatalf("got (created=%v, reinstated=%v), want (%v, %v)", created, reinstated, tc.wantCreated, tc.wantReinstated)
+			}
+		})
+	}
+}
