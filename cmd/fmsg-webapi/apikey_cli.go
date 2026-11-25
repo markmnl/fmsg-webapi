@@ -61,6 +61,9 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("registering derived address with fmsgid: %w", err)
 	}
+	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
+		return err
+	}
 	granted := false
 	if created || reinstated {
 		defer func() {
@@ -70,9 +73,6 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 				}
 			}
 		}()
-	}
-	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
-		return err
 	}
 	database, err := db.New(ctx, "")
 	if err != nil {
