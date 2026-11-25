@@ -165,20 +165,20 @@ func TestHubDispatch_ReactionRoutesToSubject(t *testing.T) {
 			built = append(built, msgID)
 			return &messageListItem{ID: msgID}, nil
 		},
-		reactionSubject: func(_ context.Context, msgID int64) (int64, bool) {
+		reactionSubject: func(_ context.Context, msgID int64) (int64, bool, error) {
 			if msgID == 42 {
-				return 7, true
+				return 7, true, nil
 			}
-			return 0, false
+			return 0, false, nil
 		},
 		registry: make(map[string]map[*wsClient]struct{}),
 	}
 	c := &wsClient{addr: "@bob@example.com", send: make(chan []byte, 4)}
 	hub.Register(c)
 
-	subject, ok := hub.reactionSubject(context.Background(), 42)
-	if !ok || subject != 7 {
-		t.Fatalf("reactionSubject(42) = %d,%v", subject, ok)
+	subject, ok, err := hub.reactionSubject(context.Background(), 42)
+	if err != nil || !ok || subject != 7 {
+		t.Fatalf("reactionSubject(42) = %d,%v,%v", subject, ok, err)
 	}
 	hub.dispatch(context.Background(), subject, "@bob@example.com", eventReaction)
 	select {

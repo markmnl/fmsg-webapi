@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -57,22 +58,25 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	// Match the self-service sub-account flow: derived addresses are created in
 	// fmsgid, in the owner's quota pool, before their API key is persisted, and
 	// one used before is reinstated.
-	reinstated, err := middleware.RegisterLinkedFmsgID(idURL, subAddr, *owner)
+	created, reinstated, err := middleware.RegisterLinkedFmsgIDContext(ctx, idURL, subAddr, *owner)
 	if err != nil {
 		return fmt.Errorf("registering derived address with fmsgid: %w", err)
 	}
+	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
+		return err
+	}
 	granted := false
-	if reinstated {
+	conflict := false
+	if created || reinstated {
 		defer func() {
-			if !granted {
-				if err := middleware.DisableFmsgID(idURL, subAddr); err != nil {
-					fmt.Fprintf(os.Stderr, "re-disabling reinstated address %s: %v\n", subAddr, err)
+			if !granted && !conflict {
+				disableCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := middleware.DisableFmsgIDContext(disableCtx, idURL, subAddr); err != nil {
+					fmt.Fprintf(os.Stderr, "disabling address %s after failed create: %v\n", subAddr, err)
 				}
 			}
 		}()
-	}
-	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
-		return err
 	}
 	database, err := db.New(ctx, "")
 	if err != nil {
@@ -82,6 +86,9 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 
 	store := apiauth.NewStore(database)
 	if err := store.Create(ctx, *owner, *agent, subAddr, key.ID, hash, allowed, expires); err != nil {
+		if errors.Is(err, apiauth.ErrAlreadyExists) {
+			conflict = true
+		}
 		return err
 	}
 	granted = true

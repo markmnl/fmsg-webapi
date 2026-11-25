@@ -56,8 +56,9 @@ type indicateInput struct {
 // indicatorThrottle drops indicators set more often than indicatorMinInterval
 // for one address on one message. Clears are never throttled.
 type indicatorThrottle struct {
-	mu   sync.Mutex
-	last map[string]time.Time
+	mu        sync.Mutex
+	last      map[string]time.Time
+	lastSweep time.Time
 }
 
 var throttle = &indicatorThrottle{last: map[string]time.Time{}}
@@ -65,15 +66,19 @@ var throttle = &indicatorThrottle{last: map[string]time.Time{}}
 func (t *indicatorThrottle) allow(key string, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.last == nil {
+		t.last = make(map[string]time.Time)
+	}
 	if prev, ok := t.last[key]; ok && now.Sub(prev) < indicatorMinInterval {
 		return false
 	}
-	if len(t.last) > 10000 {
+	if len(t.last) > 10000 && (t.lastSweep.IsZero() || now.Sub(t.lastSweep) >= indicatorMinInterval) {
 		for k, v := range t.last {
 			if now.Sub(v) >= indicatorMinInterval {
 				delete(t.last, k)
 			}
 		}
+		t.lastSweep = now
 	}
 	t.last[key] = now
 	return true
@@ -113,7 +118,19 @@ func (h *MessageHandler) Indicate(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	subject, _, err := h.fetchMessage(ctx, msgID)
+	var fromAddr string
+	var timeSent *float64
+	var terminal, participant bool
+	var trashState *string
+	err := h.q().QueryRow(ctx, `
+		SELECT m.from_addr, m.time_sent, m.is_terminal,
+		       (lower(m.from_addr) = $2
+		        OR EXISTS (SELECT 1 FROM msg_to WHERE msg_id = m.id AND lower(addr) = $2)
+		        OR EXISTS (SELECT 1 FROM msg_add_to WHERE msg_id = m.id AND lower(addr) = $2)),
+		       CASE WHEN EXISTS (SELECT 1 FROM fmsg_api_trash WHERE addr = $2)
+		            THEN fmsg_api_trash_state($2, m.id) END
+		FROM msg m WHERE m.id = $1`, msgID, strings.ToLower(identity),
+	).Scan(&fromAddr, &timeSent, &terminal, &participant, &trashState)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
@@ -123,19 +140,19 @@ func (h *MessageHandler) Indicate(c *gin.Context) {
 		}
 		return
 	}
-	if draftHidden([]string{identity}, subject.From, subject.Time) || purgedFor(ctx, h.q(), identity, msgID) {
+	if draftHidden([]string{identity}, fromAddr, timeSent) || (trashState != nil && *trashState == trashPurged) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
-	if !strings.EqualFold(subject.From, identity) && !isRecipient(subject.To, identity) && !addToContains(subject.AddTo, identity) {
+	if !participant {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only participants may show an indicator on a message"})
 		return
 	}
-	if subject.Time == nil {
+	if timeSent == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "cannot show an indicator on a draft"})
 		return
 	}
-	if subject.Terminal {
+	if terminal {
 		c.JSON(http.StatusConflict, gin.H{"error": "message is terminal; it cannot be replied to"})
 		return
 	}
@@ -157,33 +174,37 @@ func (h *MessageHandler) Indicate(c *gin.Context) {
 	c.Status(http.StatusAccepted)
 }
 
-// indicatorAudience returns every participant of message msgID (its sender,
-// recipients, and each add-to batch's adder and added recipients) and the id
-// of its thread's first message.
-func (h *MessageHandler) indicatorAudience(ctx context.Context, msgID int64) ([]string, int64, error) {
+// indicatorParticipants returns every participant of message msgID (its sender,
+// recipients, and each add-to batch's adder and added recipients).
+func (h *MessageHandler) indicatorParticipants(ctx context.Context, msgID int64) ([]string, error) {
 	rows, err := h.q().Query(ctx, `
 		SELECT from_addr FROM msg WHERE id = $1
 		UNION SELECT addr FROM msg_to WHERE msg_id = $1
 		UNION SELECT add_to_from FROM msg_add_to_batch WHERE msg_id = $1
 		UNION SELECT addr FROM msg_add_to WHERE msg_id = $1`, msgID)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	var addrs []string
 	for rows.Next() {
 		var a string
 		if err := rows.Scan(&a); err != nil {
 			rows.Close()
-			return nil, 0, err
+			return nil, err
 		}
 		addrs = append(addrs, a)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
+	return addrs, nil
+}
+
+// threadRoot returns the id of msgID's thread's first message.
+func (h *MessageHandler) threadRoot(ctx context.Context, msgID int64) (int64, error) {
 	var root int64
-	err = h.q().QueryRow(ctx, `
+	err := h.q().QueryRow(ctx, `
 		WITH RECURSIVE chain AS (
 		    SELECT id, pid, 0 AS depth FROM msg WHERE id = $1
 		    UNION ALL
@@ -191,10 +212,25 @@ func (h *MessageHandler) indicatorAudience(ctx context.Context, msgID int64) ([]
 		)
 		SELECT id FROM chain ORDER BY depth DESC LIMIT 1`, msgID).Scan(&root)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, 0, err
+		return 0, err
 	}
 	if root == 0 {
 		root = msgID
+	}
+	return root, nil
+}
+
+// indicatorAudience returns every participant of message msgID (its sender,
+// recipients, and each add-to batch's adder and added recipients) and the id
+// of its thread's first message.
+func (h *MessageHandler) indicatorAudience(ctx context.Context, msgID int64) ([]string, int64, error) {
+	addrs, err := h.indicatorParticipants(ctx, msgID)
+	if err != nil {
+		return nil, 0, err
+	}
+	root, err := h.threadRoot(ctx, msgID)
+	if err != nil {
+		return nil, 0, err
 	}
 	return addrs, root, nil
 }

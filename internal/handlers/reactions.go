@@ -49,35 +49,43 @@ func reactionShape(hasPid, noReply, terminal, important, hasAddTo bool, mediaTyp
 		isReactionMediaType(mediaType)
 }
 
-// readReactionData reads a shape-matching message's body and returns the emoji
-// it carries ("" clears) and whether the body is a valid reaction body.
-func (h *MessageHandler) readReactionData(dataPath string, size int) (string, bool) {
+// readReactionDataErr reads a shape-matching message's body and returns the
+// emoji it carries ("" clears), whether the body is a valid reaction body, and
+// any disk I/O error encountered while reading it.
+func (h *MessageHandler) readReactionDataErr(dataPath string, size int) (string, bool, error) {
 	if size == 0 {
-		return "", true
+		return "", true, nil
 	}
 	cleanPath, ok := safeDataPath(dataPath, h.DataDir)
 	if !ok {
-		return "", false
+		return "", false, nil
 	}
 	f, err := os.Open(cleanPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("reaction data: open %s: %v", cleanPath, err)
 		}
-		return "", false
+		return "", false, err
 	}
 	defer f.Close()
 	buf := make([]byte, maxReactionBytes+1)
 	n, err := io.ReadFull(f, buf)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		log.Printf("reaction data: read %s: %v", cleanPath, err)
-		return "", false
+		return "", false, err
 	}
 	s := string(buf[:n])
 	if !emoji.IsSingle(s) {
-		return "", false
+		return "", false, nil
 	}
-	return s, true
+	return s, true, nil
+}
+
+// readReactionData reads a shape-matching message's body and returns the emoji
+// it carries ("" clears) and whether the body is a valid reaction body.
+func (h *MessageHandler) readReactionData(dataPath string, size int) (string, bool) {
+	s, ok, _ := h.readReactionDataErr(dataPath, size)
+	return s, ok
 }
 
 // reactionOf returns the reaction a message carries, or nil when the message
@@ -93,9 +101,10 @@ func (h *MessageHandler) reactionOf(hasPid, noReply, terminal, important, hasAdd
 	return &s
 }
 
-// reactionSubject reports the subject of msgID when msgID is a reaction. Used
-// by the WebSocket hub to route an arriving reaction as a reaction event.
-func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int64, bool) {
+// reactionSubject reports the subject of msgID when msgID is a reaction.
+// Transient DB or disk errors are returned so callers (such as the WebSocket
+// hub classification cache) do not pin a false negative.
+func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int64, bool, error) {
 	var pid *int64
 	var noReply, terminal, important, hasAddTo bool
 	var mediaType, dataPath string
@@ -107,15 +116,23 @@ func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int6
 		FROM msg m WHERE m.id = $1`, msgID,
 	).Scan(&pid, &noReply, &terminal, &important, &mediaType, &size, &dataPath, &attachments, &hasAddTo)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Printf("reaction subject of %d: %v", msgID, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
 		}
-		return 0, false
+		log.Printf("reaction subject of %d: %v", msgID, err)
+		return 0, false, err
 	}
-	if pid == nil || h.reactionOf(true, noReply, terminal, important, hasAddTo, mediaType, size, attachments, dataPath) == nil {
-		return 0, false
+	if pid == nil || !reactionShape(true, noReply, terminal, important, hasAddTo, mediaType, size, attachments) {
+		return 0, false, nil
 	}
-	return *pid, true
+	_, ok, err := h.readReactionDataErr(dataPath, size)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	return *pid, true, nil
 }
 
 // reactionKey names a reaction's subject: a message, or one add-to batch of
@@ -243,13 +260,12 @@ func (h *MessageHandler) loadReactionRows(ctx context.Context, subjectIDs []int6
 
 // loadReactions returns the effective reactions on each of the given messages
 // and on each of their add-to batches.
-func (h *MessageHandler) loadReactions(ctx context.Context, subjectIDs []int64) map[reactionKey][]models.Reaction {
+func (h *MessageHandler) loadReactions(ctx context.Context, subjectIDs []int64) (map[reactionKey][]models.Reaction, error) {
 	rows, err := h.loadReactionRows(ctx, subjectIDs, "")
 	if err != nil {
-		log.Printf("load reactions: %v", err)
-		return nil
+		return nil, err
 	}
-	return effectiveReactions(rows)
+	return effectiveReactions(rows), nil
 }
 
 // applyReactions sets each add-to batch's own reactions and returns the
@@ -267,17 +283,21 @@ func applyReactions(set map[reactionKey][]models.Reaction, msgID int64, addTo []
 }
 
 // populateListReactions fills Reaction and Reactions on every list item.
-func (h *MessageHandler) populateListReactions(ctx context.Context, items []messageListItem) {
+func (h *MessageHandler) populateListReactions(ctx context.Context, items []messageListItem) error {
 	ids := make([]int64, len(items))
 	for i := range items {
 		it := &items[i]
 		it.Reaction = h.reactionOf(it.HasPid, it.NoReply, it.Terminal, it.Important, it.HasAddTo, it.Type, it.Size, len(it.Attachments), it.dataPath)
 		ids[i] = it.ID
 	}
-	reactions := h.loadReactions(ctx, ids)
+	reactions, err := h.loadReactions(ctx, ids)
+	if err != nil {
+		return err
+	}
 	for i := range items {
 		items[i].Reactions = applyReactions(reactions, items[i].ID, items[i].AddTo)
 	}
+	return nil
 }
 
 // reactionRecipients returns a subject's participants other than the reactor,
@@ -374,7 +394,17 @@ func (h *MessageHandler) React(c *gin.Context) {
 		return
 	}
 
-	if draftHidden([]string{identity}, subject.From, subject.Time) || purgedFor(ctx, h.q(), identity, msgID) {
+	if draftHidden([]string{identity}, subject.From, subject.Time) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		return
+	}
+	purged, err := purgedFor(ctx, h.q(), identity, msgID)
+	if err != nil {
+		log.Printf("react to %d: trash state: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
+		return
+	}
+	if purged {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
@@ -474,13 +504,13 @@ func (h *MessageHandler) React(c *gin.Context) {
 		return
 	}
 	now := float64(time.Now().UnixMicro()) / 1e6
-	tx, err := h.q().Begin(ctx)
+	tx, commit, rollback, err := beginOrReuseTx(ctx, h.q())
 	if err != nil {
 		log.Printf("react to %d: begin: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer rollback()
 
 	var reactionID int64
 	if err := tx.QueryRow(ctx,
@@ -505,9 +535,9 @@ func (h *MessageHandler) React(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
 		return
 	}
-	for _, addr := range recipients {
-		if _, err := tx.Exec(ctx, "INSERT INTO msg_to (msg_id, addr) VALUES ($1, $2)", reactionID, addr); err != nil {
-			log.Printf("react to %d: insert recipient %s: %v", msgID, addr, err)
+	if len(recipients) > 0 {
+		if _, err := tx.Exec(ctx, "INSERT INTO msg_to (msg_id, addr) SELECT $1, unnest($2::text[])", reactionID, recipients); err != nil {
+			log.Printf("react to %d: insert recipients: %v", msgID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
 			return
 		}
@@ -520,7 +550,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "failed to finalize reaction"})
 		return
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := commit(); err != nil {
 		log.Printf("react to %d: commit: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send reaction"})
 		return
@@ -529,10 +559,11 @@ func (h *MessageHandler) React(c *gin.Context) {
 	// fmsgd's outbound sender skips the local domain, so local recipients
 	// have their delivery resolved here, as Send does.
 	afterCommit(c, func() {
+		postCtx := context.WithoutCancel(ctx)
 		plain := *h
 		plain.query = nil
-		plain.recordSend(identity, now, size)
-		plain.resolveLocalDelivery(ctx, "msg_to", reactionID, h.LocalDomain, recipients)
+		plain.recordSend(postCtx, identity, now, size)
+		plain.resolveLocalDelivery(postCtx, "msg_to", reactionID, h.LocalDomain, recipients)
 	})
 
 	c.JSON(http.StatusCreated, gin.H{"id": reactionID, "time": now, "sha256": hex.EncodeToString(hash)})
