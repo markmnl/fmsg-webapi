@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +97,7 @@ type Verifier struct {
 	addressClaim string
 	apiParser    *jwt.Parser
 	apiPublicKey ed25519.PublicKey
+	apiIssuer    string
 	apiKeys      APIKeyChecker
 	idURL        string
 }
@@ -150,6 +152,7 @@ func NewVerifier(cfg Config) (*Verifier, error) {
 			cfg.APIAudience = apiauth.DefaultTokenAudience
 		}
 		v.apiPublicKey = cfg.APIPublicKey
+		v.apiIssuer = cfg.APIIssuer
 		v.apiKeys = cfg.APIKeys
 		v.apiParser = jwt.NewParser(
 			jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
@@ -176,6 +179,28 @@ func (v *Verifier) Authenticate(tokenStr string) (addr string, status int, msg s
 }
 
 func (v *Verifier) AuthenticateRequest(ctx context.Context, tokenStr, remoteAddr, actAs string) (authResult, int, string) {
+	// When both IdP JWKS and first-party API token auth are configured, peek
+	// at the unverified header/claims to route first-party API tokens directly
+	// to local Ed25519 verification instead of scanning the JWKS key set first.
+	if v.idpParser != nil && v.apiParser != nil && looksLikeAPIToken(tokenStr, v.apiIssuer) {
+		res, err := v.authenticateAPIToken(ctx, tokenStr, remoteAddr, actAs)
+		if err == nil {
+			return res, http.StatusOK, ""
+		}
+		if status, msg, ok := authFailureFromError(err); ok {
+			return authResult{}, status, msg
+		}
+		res, err = v.authenticateIdP(ctx, tokenStr, actAs)
+		if err == nil {
+			return res, http.StatusOK, ""
+		}
+		if status, msg, ok := authFailureFromError(err); ok {
+			return authResult{}, status, msg
+		}
+		log.Printf("auth rejected: reason=parse_error")
+		return authResult{}, http.StatusUnauthorized, "invalid token"
+	}
+
 	if v.idpParser != nil {
 		res, err := v.authenticateIdP(ctx, tokenStr, actAs)
 		if err == nil {
@@ -198,6 +223,44 @@ func (v *Verifier) AuthenticateRequest(ctx context.Context, tokenStr, remoteAddr
 	return authResult{}, http.StatusUnauthorized, "invalid token"
 }
 
+// looksLikeAPIToken inspects the unverified JWT header and payload to detect
+// first-party API tokens (which carry no kid header and have iss == apiIssuer).
+// The token is still cryptographically verified before being accepted.
+func looksLikeAPIToken(tokenStr, apiIssuer string) bool {
+	if apiIssuer == "" {
+		return false
+	}
+	hdrB64, rest, ok := strings.Cut(tokenStr, ".")
+	if !ok {
+		return false
+	}
+	payloadB64, sigB64, ok := strings.Cut(rest, ".")
+	if !ok || strings.Contains(sigB64, ".") {
+		return false
+	}
+	hdrRaw, err := base64.RawURLEncoding.DecodeString(hdrB64)
+	if err != nil {
+		return false
+	}
+	var hdr struct {
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(hdrRaw, &hdr); err != nil || hdr.Kid != "" {
+		return false
+	}
+	payloadRaw, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		return false
+	}
+	var claims struct {
+		Iss string `json:"iss"`
+	}
+	if err := json.Unmarshal(payloadRaw, &claims); err != nil {
+		return false
+	}
+	return claims.Iss == apiIssuer
+}
+
 func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) (authResult, error) {
 	claims := jwt.MapClaims{}
 	if _, err := v.idpParser.ParseWithClaims(tokenStr, claims, v.idpKeyFunc); err != nil {
@@ -215,7 +278,7 @@ func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) 
 		log.Printf("auth rejected: reason=no_address_claim claim=%q sub=%q", v.addressClaim, sub)
 		return authResult{}, authError{status: http.StatusForbidden, msg: "no fmsg account for this identity"}
 	}
-	if status, msg := validateIdentity(owner, v.idURL); status != http.StatusOK {
+	if status, msg := validateIdentity(ctx, owner, v.idURL); status != http.StatusOK {
 		return authResult{}, authError{status: status, msg: msg}
 	}
 	res := authResult{Addr: owner, OwnerAddr: owner, AuthType: AuthTypeIdP}
@@ -256,7 +319,7 @@ func (v *Verifier) authenticateIdP(ctx context.Context, tokenStr, actAs string) 
 	if err := v.apiKeys.ValidateActAs(ctx, owner, actAs); err != nil {
 		return authResult{}, err
 	}
-	if status, msg := validateIdentity(actAs, v.idURL); status != http.StatusOK {
+	if status, msg := validateIdentity(ctx, actAs, v.idURL); status != http.StatusOK {
 		return authResult{}, authError{status: status, msg: msg}
 	}
 	res.Addr = actAs
@@ -319,7 +382,7 @@ func (v *Verifier) authenticateAPIToken(ctx context.Context, tokenStr, remoteAdd
 	if err := v.apiKeys.ValidateToken(ctx, claims.APIKeyID, claims.OwnerAddr, subAddr, remoteAddr); err != nil {
 		return authResult{}, err
 	}
-	if status, msg := validateIdentity(subAddr, v.idURL); status != http.StatusOK {
+	if status, msg := validateIdentity(ctx, subAddr, v.idURL); status != http.StatusOK {
 		return authResult{}, authError{status: status, msg: msg}
 	}
 	return authResult{Addr: subAddr, OwnerAddr: claims.OwnerAddr, AuthType: AuthTypeAPI}, nil
@@ -353,12 +416,12 @@ func authFailureFromError(err error) (int, string, bool) {
 	return 0, "", false
 }
 
-func validateIdentity(addr, idURL string) (int, string) {
+func validateIdentity(ctx context.Context, addr, idURL string) (int, string) {
 	if !IsValidAddr(addr) {
 		log.Printf("auth rejected: reason=invalid_addr addr=%q", addr)
 		return http.StatusUnauthorized, "invalid identity"
 	}
-	code, accepting, err := CheckFmsgID(idURL, addr)
+	code, accepting, err := CheckFmsgIDContext(ctx, idURL, addr)
 	if err != nil {
 		log.Printf("fmsgid check error for %s: %v", addr, err)
 		return http.StatusServiceUnavailable, "identity service unavailable"
@@ -469,11 +532,32 @@ func IsValidAddr(addr string) bool {
 	return strings.Contains(rest, "@")
 }
 
-// fmsgIDClient is a dedicated HTTP client with a bounded timeout so that a
-// slow or hung fmsgid never blocks an API request goroutine indefinitely.
-var fmsgIDClient = &http.Client{Timeout: 5 * time.Second}
+// fmsgIDClient is a dedicated HTTP client with a bounded timeout and pooled
+// per-host idle connections so fmsgid lookups reuse keep-alive sockets and never
+// block an API request goroutine indefinitely.
+var fmsgIDClient = newFmsgIDClient()
 
-const fmsgIDCacheTTL = 30 * time.Second
+func newFmsgIDClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = 32
+	return &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: tr,
+	}
+}
+
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
+	_ = body.Close()
+}
+
+const (
+	fmsgIDCacheTTL        = 30 * time.Second
+	fmsgIDCacheMaxEntries = 4096
+)
 
 type fmsgIDEntry struct {
 	expires      time.Time
@@ -481,7 +565,80 @@ type fmsgIDEntry struct {
 	acceptingNew bool
 }
 
-var fmsgIDCache sync.Map // map[string]fmsgIDEntry, key = address lookup URL
+type boundedFmsgIDCache struct {
+	mu         sync.RWMutex
+	entries    map[string]fmsgIDEntry
+	maxEntries int
+}
+
+func newBoundedFmsgIDCache(maxEntries int) *boundedFmsgIDCache {
+	return &boundedFmsgIDCache{
+		entries:    make(map[string]fmsgIDEntry),
+		maxEntries: maxEntries,
+	}
+}
+
+func (c *boundedFmsgIDCache) get(key string, now time.Time) (fmsgIDEntry, bool) {
+	c.mu.RLock()
+	entry, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok {
+		return fmsgIDEntry{}, false
+	}
+	if !now.Before(entry.expires) {
+		c.delete(key)
+		return fmsgIDEntry{}, false
+	}
+	return entry, true
+}
+
+func (c *boundedFmsgIDCache) set(key string, entry fmsgIDEntry, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]fmsgIDEntry)
+	}
+	maxEntries := c.maxEntries
+	if maxEntries <= 0 {
+		maxEntries = fmsgIDCacheMaxEntries
+	}
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= maxEntries {
+		for k, e := range c.entries {
+			if !now.Before(e.expires) {
+				delete(c.entries, k)
+			}
+		}
+		if len(c.entries) >= maxEntries {
+			// Evict the soonest-to-expire entries so the cache stays strictly bounded.
+			target := maxEntries - max(1, maxEntries/8)
+			for len(c.entries) > target {
+				var oldestKey string
+				var oldestExp time.Time
+				first := true
+				for k, e := range c.entries {
+					if first || e.expires.Before(oldestExp) {
+						oldestKey = k
+						oldestExp = e.expires
+						first = false
+					}
+				}
+				if first {
+					break
+				}
+				delete(c.entries, oldestKey)
+			}
+		}
+	}
+	c.entries[key] = entry
+}
+
+func (c *boundedFmsgIDCache) delete(key string) {
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
+}
+
+var fmsgIDCache = newBoundedFmsgIDCache(fmsgIDCacheMaxEntries)
 
 var fmsgIDGroup singleflight.Group
 
@@ -492,23 +649,30 @@ type fmsgIDResult struct {
 
 // CheckFmsgID queries the fmsgid service for a user address.
 func CheckFmsgID(idURL, addr string) (int, bool, error) {
-	lookupURL := fmsgIDAddressURL(idURL, addr)
-	if v, ok := fmsgIDCache.Load(lookupURL); ok {
-		entry := v.(fmsgIDEntry)
-		if time.Now().Before(entry.expires) {
-			return entry.code, entry.acceptingNew, nil
-		}
-		fmsgIDCache.Delete(lookupURL)
+	return CheckFmsgIDContext(context.Background(), idURL, addr)
+}
+
+// CheckFmsgIDContext queries the fmsgid service for a user address using ctx.
+func CheckFmsgIDContext(ctx context.Context, idURL, addr string) (int, bool, error) {
+	cacheKey := fmsgIDCacheKey(idURL, addr)
+	now := time.Now()
+	if entry, ok := fmsgIDCache.get(cacheKey, now); ok {
+		return entry.code, entry.acceptingNew, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
 	}
 
-	v, err, _ := fmsgIDGroup.Do(lookupURL, func() (any, error) {
-		if v, ok := fmsgIDCache.Load(lookupURL); ok {
-			entry := v.(fmsgIDEntry)
-			if time.Now().Before(entry.expires) {
-				return fmsgIDResult{code: entry.code, acceptingNew: entry.acceptingNew}, nil
-			}
+	lookupURL := fmsgIDAddressURL(idURL, addr)
+	v, err, _ := fmsgIDGroup.Do(cacheKey, func() (any, error) {
+		if entry, ok := fmsgIDCache.get(cacheKey, time.Now()); ok {
+			return fmsgIDResult{code: entry.code, acceptingNew: entry.acceptingNew}, nil
 		}
-		return fetchFmsgID(lookupURL)
+		// Detach cancellation inside singleflight so one caller cancelling
+		// cannot fail another caller sharing the same in-flight lookup.
+		reqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		return fetchFmsgID(reqCtx, lookupURL, cacheKey)
 	})
 	if err != nil {
 		return 0, false, err
@@ -555,20 +719,36 @@ var errFmsgIDNoAcceptingNew = errors.New("fmsgid does not support accepting_new 
 // ErrLinkedAddressTaken. reinstated reports whether it had stopped accepting
 // new messages (e.g. its grant was deleted).
 func RegisterLinkedFmsgID(idURL, addr, owner string) (reinstated bool, err error) {
+	_, reinstated, err = RegisterLinkedFmsgIDContext(context.Background(), idURL, addr, owner)
+	return reinstated, err
+}
+
+// RegisterLinkedFmsgIDContext is like RegisterLinkedFmsgID, using ctx and
+// reporting both whether the address was newly created and whether it was
+// reinstated from disabled state.
+func RegisterLinkedFmsgIDContext(ctx context.Context, idURL, addr, owner string) (created, reinstated bool, err error) {
 	accepting := true
-	resp, err := postFmsgIDAddress(idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting, QuotaPool: owner, Claim: true})
+	resp, status, err := postFmsgIDAddress(ctx, idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting, QuotaPool: owner, Claim: true})
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return resp != nil && resp.Reinstated, nil
+	if resp == nil {
+		return status == http.StatusCreated, false, nil
+	}
+	return resp.Created, resp.Reinstated, nil
 }
 
 // DisableFmsgID stops addr accepting new messages in fmsgid, so fmsg hosts
 // refuse new messages to it. The address, its messages and its usage are kept,
 // so its owner can reinstate it with RegisterLinkedFmsgID.
 func DisableFmsgID(idURL, addr string) error {
+	return DisableFmsgIDContext(context.Background(), idURL, addr)
+}
+
+// DisableFmsgIDContext is like DisableFmsgID, using ctx for the HTTP request.
+func DisableFmsgIDContext(ctx context.Context, idURL, addr string) error {
 	accepting := false
-	resp, err := postFmsgIDAddress(idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting})
+	resp, _, err := postFmsgIDAddress(ctx, idURL, fmsgIDAddressReq{Address: addr, AcceptingNew: &accepting})
 	if err != nil {
 		return err
 	}
@@ -580,52 +760,65 @@ func DisableFmsgID(idURL, addr string) error {
 
 // postFmsgIDAddress POSTs req to fmsgid's /fmsgid and drops the cached lookup
 // of the address. The response is nil when fmsgid answers without a body.
-func postFmsgIDAddress(idURL string, req fmsgIDAddressReq) (*fmsgIDAddressResp, error) {
+func postFmsgIDAddress(ctx context.Context, idURL string, req fmsgIDAddressReq) (*fmsgIDAddressResp, int, error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	url := strings.TrimRight(idURL, "/") + "/fmsgid"
-	resp, err := fmsgIDClient.Post(url, "application/json", bytes.NewReader(payload)) //nolint:gosec // URL constructed from trusted config
+	u := strings.TrimRight(idURL, "/") + "/fmsgid"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := doFmsgID(httpReq)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer drainAndClose(resp.Body)
 
 	// whatever fmsgid did, the cached lookup may now be stale
-	fmsgIDCache.Delete(fmsgIDAddressURL(idURL, req.Address))
+	fmsgIDCache.delete(fmsgIDCacheKey(idURL, req.Address))
 
 	if resp.StatusCode == http.StatusConflict && req.Claim {
-		return nil, ErrLinkedAddressTaken
+		return nil, resp.StatusCode, ErrLinkedAddressTaken
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("fmsgid registration failed: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
-		return nil, fmt.Errorf("reading fmsgid registration response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("reading fmsgid registration response: %w", err)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, nil
+		return nil, resp.StatusCode, nil
 	}
 	var out fmsgIDAddressResp
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("decoding fmsgid registration response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("decoding fmsgid registration response: %w", err)
 	}
-	return &out, nil
+	return &out, resp.StatusCode, nil
 }
 
 func fmsgIDAddressURL(idURL, addr string) string {
 	return strings.TrimRight(idURL, "/") + "/fmsgid/" + url.PathEscape(addr)
 }
 
-func fetchFmsgID(lookupURL string) (fmsgIDResult, error) {
-	resp, err := fmsgIDClient.Get(lookupURL) //nolint:gosec // URL constructed from trusted config + escaped addr
+func fmsgIDCacheKey(idURL, addr string) string {
+	return fmsgIDAddressURL(idURL, strings.ToLower(addr))
+}
+
+func fetchFmsgID(ctx context.Context, lookupURL, cacheKey string) (fmsgIDResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, lookupURL, nil)
 	if err != nil {
 		return fmsgIDResult{}, err
 	}
-	defer resp.Body.Close()
+	resp, err := doFmsgID(req)
+	if err != nil {
+		return fmsgIDResult{}, err
+	}
+	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
 		return fmsgIDResult{code: http.StatusNotFound}, nil
@@ -644,10 +837,11 @@ func fetchFmsgID(lookupURL string) (fmsgIDResult, error) {
 		return fmsgIDResult{}, errors.New("fmsgid address response is missing acceptingNew")
 	}
 
-	fmsgIDCache.Store(lookupURL, fmsgIDEntry{
-		expires:      time.Now().Add(fmsgIDCacheTTL),
+	now := time.Now()
+	fmsgIDCache.set(cacheKey, fmsgIDEntry{
+		expires:      now.Add(fmsgIDCacheTTL),
 		code:         http.StatusOK,
 		acceptingNew: *result.AcceptingNew,
-	})
+	}, now)
 	return fmsgIDResult{code: http.StatusOK, acceptingNew: *result.AcceptingNew}, nil
 }

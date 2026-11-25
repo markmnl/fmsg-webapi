@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,8 +38,13 @@ type FmsgIDDetail struct {
 // that is 200. A limit fmsgid leaves out is unlimited. A 200 answer also
 // refreshes the cached lookup CheckFmsgID uses.
 func FetchFmsgIDDetail(idURL, addr string) (*FmsgIDDetail, int, error) {
+	return FetchFmsgIDDetailContext(context.Background(), idURL, addr)
+}
+
+// FetchFmsgIDDetailContext is like FetchFmsgIDDetail, using ctx for the HTTP request.
+func FetchFmsgIDDetailContext(ctx context.Context, idURL, addr string) (*FmsgIDDetail, int, error) {
 	lookupURL := fmsgIDAddressURL(idURL, addr)
-	req, err := http.NewRequest(http.MethodGet, lookupURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, lookupURL, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -46,7 +52,7 @@ func FetchFmsgIDDetail(idURL, addr string) (*FmsgIDDetail, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, resp.StatusCode, nil
 	}
@@ -66,46 +72,67 @@ func FetchFmsgIDDetail(idURL, addr string) (*FmsgIDDetail, int, error) {
 	detail := raw.FmsgIDDetail
 	detail.AcceptingNew = *raw.AcceptingNew
 
-	fmsgIDCache.Store(lookupURL, fmsgIDEntry{
-		expires:      time.Now().Add(fmsgIDCacheTTL),
+	now := time.Now()
+	fmsgIDCache.set(fmsgIDCacheKey(idURL, addr), fmsgIDEntry{
+		expires:      now.Add(fmsgIDCacheTTL),
 		code:         http.StatusOK,
 		acceptingNew: detail.AcceptingNew,
-	})
+	}, now)
 	return &detail, http.StatusOK, nil
 }
 
 // RecordFmsgIDRecv records with fmsgid that addr received a message of size
 // bytes at ts (seconds since the Unix epoch).
 func RecordFmsgIDRecv(idURL, addr string, ts float64, size int64) error {
-	return postFmsgIDUsage(idURL, "recv", addr, ts, size)
+	return RecordFmsgIDRecvContext(context.Background(), idURL, addr, ts, size)
+}
+
+// RecordFmsgIDRecvContext is like RecordFmsgIDRecv, using ctx for the HTTP request.
+func RecordFmsgIDRecvContext(ctx context.Context, idURL, addr string, ts float64, size int64) error {
+	return postFmsgIDUsage(ctx, idURL, "recv", addr, ts, size)
 }
 
 // RecordFmsgIDSend records with fmsgid that addr sent a message of size bytes
 // at ts (seconds since the Unix epoch).
 func RecordFmsgIDSend(idURL, addr string, ts float64, size int64) error {
-	return postFmsgIDUsage(idURL, "send", addr, ts, size)
+	return RecordFmsgIDSendContext(context.Background(), idURL, addr, ts, size)
+}
+
+// RecordFmsgIDSendContext is like RecordFmsgIDSend, using ctx for the HTTP request.
+func RecordFmsgIDSendContext(ctx context.Context, idURL, addr string, ts float64, size int64) error {
+	return postFmsgIDUsage(ctx, idURL, "send", addr, ts, size)
 }
 
 // ReleaseFmsgIDSend gives back to addr the storage of a message it sent that
 // is deleted for good: size bytes come off its sent size total, not off its
 // daily usage.
 func ReleaseFmsgIDSend(idURL, addr string, ts float64, size int64) error {
-	return postFmsgIDUsage(idURL, "send/release", addr, ts, size)
+	return ReleaseFmsgIDSendContext(context.Background(), idURL, addr, ts, size)
+}
+
+// ReleaseFmsgIDSendContext is like ReleaseFmsgIDSend, using ctx for the HTTP request.
+func ReleaseFmsgIDSendContext(ctx context.Context, idURL, addr string, ts float64, size int64) error {
+	return postFmsgIDUsage(ctx, idURL, "send/release", addr, ts, size)
 }
 
 // ReleaseFmsgIDRecv gives back to addr the storage of a message it received
 // that is deleted for good: size bytes come off its received size total, not
 // off its daily usage.
 func ReleaseFmsgIDRecv(idURL, addr string, ts float64, size int64) error {
-	return postFmsgIDUsage(idURL, "recv/release", addr, ts, size)
+	return ReleaseFmsgIDRecvContext(context.Background(), idURL, addr, ts, size)
 }
 
-func postFmsgIDUsage(idURL, part, addr string, ts float64, size int64) error {
+// ReleaseFmsgIDRecvContext is like ReleaseFmsgIDRecv, using ctx for the HTTP request.
+func ReleaseFmsgIDRecvContext(ctx context.Context, idURL, addr string, ts float64, size int64) error {
+	return postFmsgIDUsage(ctx, idURL, "recv/release", addr, ts, size)
+}
+
+func postFmsgIDUsage(ctx context.Context, idURL, part, addr string, ts float64, size int64) error {
 	payload, err := json.Marshal(map[string]any{"address": addr, "ts": ts, "size": size})
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(idURL, "/")+"/fmsgid/"+part, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(idURL, "/")+"/fmsgid/"+part, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -114,7 +141,7 @@ func postFmsgIDUsage(idURL, part, addr string, ts float64, size int64) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("POST /fmsgid/%s returned %d", part, resp.StatusCode)
 	}

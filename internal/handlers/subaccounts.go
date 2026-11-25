@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -137,7 +138,7 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	// them in fmsgid automatically, in the owner's quota pool, rather than
 	// requiring a manual step. One already in the owner's pool was theirs
 	// before and is reinstated; one held by anyone else is refused.
-	reinstated, err := middleware.RegisterLinkedFmsgID(h.idURL, subAddr, owner)
+	created, reinstated, err := middleware.RegisterLinkedFmsgIDContext(c.Request.Context(), h.idURL, subAddr, owner)
 	if errors.Is(err, middleware.ErrLinkedAddressTaken) {
 		c.JSON(http.StatusConflict, gin.H{"error": "that name is already taken; choose another"})
 		return
@@ -147,18 +148,17 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 		return
 	}
-	// undo a reinstatement if no grant comes of it, so a deleted address
-	// doesn't start accepting new messages again without one
+	// Undo registration or reinstatement if no grant comes of it, so a
+	// newly-registered or deleted address doesn't stay accepting new messages
+	// without a grant. An already-active address (conflicting create) is left
+	// untouched.
 	granted := false
-	if reinstated {
+	if created || reinstated {
 		defer func() {
 			if !granted {
 				disableAfterFailedCreate(h.idURL, subAddr)
 			}
 		}()
-	}
-	if !checkAcceptingFmsgID(c, h.idURL, subAddr) {
-		return
 	}
 
 	key, hash, err := newPlaintextKey()
@@ -186,12 +186,14 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	})
 }
 
-// disableAfterFailedCreate stops a reinstated derived address accepting new
-// messages again after its grant couldn't be created. It is best effort: the
-// create has already failed, so a failure here is only logged.
+// disableAfterFailedCreate stops a newly-registered or reinstated derived
+// address accepting new messages after its grant couldn't be created. It is
+// best effort: the create has already failed, so a failure here is only logged.
 func disableAfterFailedCreate(idURL, addr string) {
-	if err := middleware.DisableFmsgID(idURL, addr); err != nil {
-		log.Printf("sub-account create: re-disabling reinstated address after failure: addr=%s: %v", addr, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := middleware.DisableFmsgIDContext(ctx, idURL, addr); err != nil {
+		log.Printf("sub-account create: disabling address after failure: addr=%s: %v", addr, err)
 	}
 }
 
@@ -306,7 +308,7 @@ func (h *SubAccountHandler) Delete(c *gin.Context) {
 	// sub-account again reinstates it. A delegated identity is an address in
 	// its own right and is left as it is.
 	if account.GrantType == apiauth.GrantTypeDerivedSubAccount {
-		if err := middleware.DisableFmsgID(h.idURL, account.Addr); err != nil {
+		if err := middleware.DisableFmsgIDContext(c.Request.Context(), h.idURL, account.Addr); err != nil {
 			log.Printf("sub-account delete: fmsgid disable: addr=%s: %v", account.Addr, err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 			return
@@ -350,7 +352,7 @@ func newPlaintextKey() (apiauth.APIKey, []byte, error) {
 }
 
 func checkAcceptingFmsgID(c *gin.Context, idURL, addr string) bool {
-	code, accepting, err := middleware.CheckFmsgID(idURL, addr)
+	code, accepting, err := middleware.CheckFmsgIDContext(c.Request.Context(), idURL, addr)
 	if err != nil {
 		log.Printf("sub-account fmsgid check: addr=%s: %v", addr, err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})

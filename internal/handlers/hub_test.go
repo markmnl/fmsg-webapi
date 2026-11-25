@@ -3,7 +3,9 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	syncatomic "sync/atomic"
 	"testing"
+	"time"
 )
 
 func newTestHub() *Hub {
@@ -124,5 +126,109 @@ func TestParseNotifyPayload(t *testing.T) {
 			t.Errorf("parseNotifyPayload(%q) = (%d,%q,%v), want (%d,%q,%v)",
 				tt.payload, id, addr, ok, tt.id, tt.addr, tt.ok)
 		}
+	}
+}
+
+func TestHubRoute_SkipsClassificationWhenNoPushAndNoClients(t *testing.T) {
+	var reactCalls, editCalls int
+	hub := newTestHub()
+	hub.reactionSubject = func(_ context.Context, _ int64) (int64, bool) {
+		reactCalls++
+		return 0, false
+	}
+	hub.editSubject = func(_ context.Context, _ int64) (int64, bool) {
+		editCalls++
+		return 0, false
+	}
+
+	hub.route(context.Background(), "new_msg", 42, "@offline@x")
+	if reactCalls != 0 || editCalls != 0 {
+		t.Fatalf("classification called for offline user with push disabled: react=%d edit=%d", reactCalls, editCalls)
+	}
+}
+
+func TestHubRoute_CachesClassificationAcrossRecipients(t *testing.T) {
+	var reactCalls, editCalls int
+	hub := newTestHub()
+	hub.reactionSubject = func(_ context.Context, id int64) (int64, bool) {
+		reactCalls++
+		if id == 100 {
+			return 10, true
+		}
+		return 0, false
+	}
+	hub.editSubject = func(_ context.Context, _ int64) (int64, bool) {
+		editCalls++
+		return 0, false
+	}
+
+	alice := newTestClient("@alice@x")
+	bob := newTestClient("@bob@x")
+	carol := newTestClient("@carol@x")
+	hub.Register(alice)
+	hub.Register(bob)
+	hub.Register(carol)
+
+	for _, addr := range []string{"@alice@x", "@bob@x", "@carol@x"} {
+		hub.route(context.Background(), "new_msg", 100, addr)
+	}
+	if reactCalls != 1 || editCalls != 0 {
+		t.Fatalf("reaction classification calls = (%d, %d), want (1, 0)", reactCalls, editCalls)
+	}
+
+	// Normal message across multiple recipients also classifies only once.
+	for _, addr := range []string{"@alice@x", "@bob@x", "@carol@x"} {
+		hub.route(context.Background(), "new_msg", 200, addr)
+	}
+	if reactCalls != 2 || editCalls != 1 {
+		t.Fatalf("normal classification calls = (%d, %d), want (2, 1)", reactCalls, editCalls)
+	}
+
+	// Cache ring remains strictly bounded to msgClassCacheSize.
+	var cache msgClassCache
+	for i := int64(1); i <= msgClassCacheSize+50; i++ {
+		cache.put(i, msgClassification{kind: msgClassNormal})
+	}
+	if got := len(cache.m); got != msgClassCacheSize {
+		t.Fatalf("msgClassCache size = %d, want %d", got, msgClassCacheSize)
+	}
+	if _, ok := cache.get(1); ok {
+		t.Fatal("oldest entry should have been evicted from msgClassCache")
+	}
+	if _, ok := cache.get(msgClassCacheSize + 50); !ok {
+		t.Fatal("newest entry should still be in msgClassCache")
+	}
+}
+
+func TestHubPushWorkerPool_BoundedConcurrencyAndDrain(t *testing.T) {
+	hub := newTestHub()
+	hub.pushWorkers = 2
+	hub.pushQueueSize = 16
+
+	var inFlight, maxInFlight, completed syncatomic.Int32
+	hub.SetPushNotifier(func(_ context.Context, _ int64, _ string) {
+		cur := inFlight.Add(1)
+		for {
+			prev := maxInFlight.Load()
+			if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+		inFlight.Add(-1)
+		completed.Add(1)
+	})
+
+	const total = 8
+	for i := int64(1); i <= total; i++ {
+		hub.route(context.Background(), "new_msg", i, "@offline@x")
+	}
+	hub.Close()
+
+	if got := completed.Load(); got != total {
+		t.Fatalf("completed pushes = %d, want %d (Close must drain worker pool)", got, total)
+	}
+	if got := maxInFlight.Load(); got > 2 {
+		t.Fatalf("max concurrent pushes = %d, exceeds worker pool bound 2", got)
 	}
 }

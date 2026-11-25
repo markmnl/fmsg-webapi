@@ -57,16 +57,16 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	// Match the self-service sub-account flow: derived addresses are created in
 	// fmsgid, in the owner's quota pool, before their API key is persisted, and
 	// one used before is reinstated.
-	reinstated, err := middleware.RegisterLinkedFmsgID(idURL, subAddr, *owner)
+	created, reinstated, err := middleware.RegisterLinkedFmsgIDContext(ctx, idURL, subAddr, *owner)
 	if err != nil {
 		return fmt.Errorf("registering derived address with fmsgid: %w", err)
 	}
 	granted := false
-	if reinstated {
+	if created || reinstated {
 		defer func() {
 			if !granted {
-				if err := middleware.DisableFmsgID(idURL, subAddr); err != nil {
-					fmt.Fprintf(os.Stderr, "re-disabling reinstated address %s: %v\n", subAddr, err)
+				if err := middleware.DisableFmsgIDContext(context.Background(), idURL, subAddr); err != nil {
+					fmt.Fprintf(os.Stderr, "disabling address %s after failed create: %v\n", subAddr, err)
 				}
 			}
 		}()

@@ -138,6 +138,12 @@ func (s *Store) createGrant(ctx context.Context, ownerAddr, agent, subAddr, gran
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Serialize concurrent grant creations for the same owner so max_sub_accounts
+	// cannot be bypassed via a read-then-insert race.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(lower($1)))`, ownerAddr); err != nil {
+		return err
+	}
+
 	max, err := maxSubAccountsTx(ctx, tx, ownerAddr)
 	if err != nil {
 		return err

@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -408,5 +410,95 @@ func TestAPITokenMode_ConfigValidation(t *testing.T) {
 	}
 	if _, err := NewVerifier(Config{APIPublicKey: pub}); err == nil {
 		t.Fatal("missing API key checker: expected error")
+	}
+}
+
+func TestDualAuth_APITokenFastPathSkipsJWKS(t *testing.T) {
+	srv := fmsgIDServer(t, http.StatusOK, true)
+	defer srv.Close()
+
+	idpPriv, baseJWKS := newEdDSAFixture(t)
+	var jwksCalls atomic.Int32
+	countingJWKS := func(tok *jwt.Token) (any, error) {
+		jwksCalls.Add(1)
+		return baseJWKS(tok)
+	}
+
+	_, apiPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiIssuer := apiauth.NewTokenIssuer(apiPriv, apiauth.DefaultTokenIssuer, apiauth.DefaultTokenAudience, time.Hour)
+	apiTok, _, err := apiIssuer.Mint("@alice@example.com", "@alice_bot@example.com", "kid1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mw, err := New(Config{
+		JWKS:         countingJWKS,
+		Issuer:       testIssuer,
+		Audience:     testAudience,
+		AddressClaim: testAddressClaim,
+		APIPublicKey: apiIssuer.PublicKey(),
+		APIIssuer:    apiIssuer.Issuer(),
+		APIAudience:  apiIssuer.Audience(),
+		APIKeys:      fakeAPIKeys{},
+		IDURL:        srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if w := runMiddleware(t, mw, apiTok, ""); w.Code != http.StatusOK {
+		t.Fatalf("API token expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := jwksCalls.Load(); got != 0 {
+		t.Fatalf("JWKS keyfunc was called %d times for a first-party API token, want 0", got)
+	}
+
+	idpTok := signEdDSA(t, idpPriv, "prod-1", providerClaims("@alice@example.com"))
+	if w := runMiddleware(t, mw, idpTok, ""); w.Code != http.StatusOK {
+		t.Fatalf("IdP token expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := jwksCalls.Load(); got != 1 {
+		t.Fatalf("JWKS keyfunc was called %d times for IdP token, want 1", got)
+	}
+}
+
+func TestFmsgIDCache_CaseInsensitiveAndBounded(t *testing.T) {
+	// 1. Bounded eviction on boundedFmsgIDCache.
+	cache := newBoundedFmsgIDCache(4)
+	now := time.Unix(1000, 0)
+	for i := range 10 {
+		cache.set(fmt.Sprintf("k%d", i), fmsgIDEntry{
+			expires:      now.Add(time.Duration(i+1) * time.Second),
+			code:         http.StatusOK,
+			acceptingNew: true,
+		}, now)
+		if got := len(cache.entries); got > 4 {
+			t.Fatalf("cache size = %d after insert %d, exceeds max 4", got, i)
+		}
+	}
+	// Expired entries are evicted on lookup and on insert.
+	if _, ok := cache.get("k9", now.Add(time.Minute)); ok {
+		t.Fatal("expected expired entry to miss")
+	}
+
+	// 2. CheckFmsgID normalizes address case for cache keys.
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"acceptingNew": true})
+	}))
+	defer srv.Close()
+
+	if code, ok, err := CheckFmsgID(srv.URL, "@MixedCase@Example.COM"); err != nil || code != http.StatusOK || !ok {
+		t.Fatalf("first lookup: code=%d ok=%v err=%v", code, ok, err)
+	}
+	if code, ok, err := CheckFmsgID(srv.URL, "@mixedcase@example.com"); err != nil || code != http.StatusOK || !ok {
+		t.Fatalf("second lookup: code=%d ok=%v err=%v", code, ok, err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("fmsgid hits = %d, want 1 (case-insensitive cache hit)", got)
 	}
 }

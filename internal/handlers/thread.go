@@ -26,6 +26,8 @@ const threadMaxHops = 100
 
 const defaultThreadTextBytes int64 = 32 << 20
 
+var errThreadTooLarge = errors.New("thread text exceeds limit")
+
 type threadBody struct {
 	Type      string  `json:"type"`
 	Size      int     `json:"size"`
@@ -96,11 +98,40 @@ func threadDownloadPath(id int64, filename string) string {
 }
 
 func populateThreadBodies(messages []threadMessage, dataDir string, maxTextBytes int64) error {
+	return populateThreadBodiesWithEdits(messages, dataDir, maxTextBytes, nil)
+}
+
+func populateThreadBodiesWithEdits(messages []threadMessage, dataDir string, maxTextBytes int64, edits map[int64]*effectiveEdit) error {
 	var textBytes int64
 	for i := range messages {
 		m := &messages[i]
 		if !m.Visible {
 			continue
+		}
+		if eff := edits[m.ID]; eff != nil {
+			m.Edited = eff.edited()
+			if eff.applied {
+				key := partCacheKey(hex.EncodeToString(eff.hash), "body", 0, "")
+				m.Body = &threadBody{
+					Type:      m.Type,
+					Size:      len(eff.data),
+					Download:  threadDownloadPath(m.ID, ""),
+					CacheKey:  key,
+					Cacheable: key != "",
+				}
+				if isTextType(m.Type) {
+					textBytes += int64(len(eff.data))
+					if textBytes > maxTextBytes {
+						return fmt.Errorf("%w: %d bytes", errThreadTooLarge, maxTextBytes)
+					}
+					if utf8.Valid(eff.data) {
+						text := string(eff.data)
+						m.Body.Text = &text
+						m.Body.Download = ""
+					}
+				}
+				continue
+			}
 		}
 		key := partCacheKey(m.MessageSHA256, "body", 0, "")
 		m.Body = &threadBody{Type: m.Type, Size: m.Size, Download: threadDownloadPath(m.ID, ""), CacheKey: key, Cacheable: key != ""}
@@ -109,7 +140,13 @@ func populateThreadBodies(messages []threadMessage, dataDir string, maxTextBytes
 		}
 		textBytes += int64(m.Size)
 		if textBytes > maxTextBytes {
-			return fmt.Errorf("thread text exceeds %d bytes", maxTextBytes)
+			return fmt.Errorf("%w: %d bytes", errThreadTooLarge, maxTextBytes)
+		}
+		if m.dataPath == "" {
+			empty := ""
+			m.Body.Text = &empty
+			m.Body.Download = ""
+			continue
 		}
 		cleanPath, ok := safeDataPath(m.dataPath, dataDir)
 		if !ok {
@@ -119,11 +156,66 @@ func populateThreadBodies(messages []threadMessage, dataDir string, maxTextBytes
 		if err != nil {
 			return fmt.Errorf("read message %d body: %w", m.ID, err)
 		}
+		if int64(len(raw)) > int64(m.Size) {
+			textBytes += int64(len(raw)) - int64(m.Size)
+			if textBytes > maxTextBytes {
+				return fmt.Errorf("%w: %d bytes", errThreadTooLarge, maxTextBytes)
+			}
+		}
 		if utf8.Valid(raw) {
 			text := string(raw)
 			m.Body.Text = &text
 			m.Body.Download = ""
 		}
+	}
+	return nil
+}
+
+func populateThreadTextEntries(entries []threadEntry, paths map[int64]string, edits map[int64]*effectiveEdit, dataDir string, maxTextBytes int64) error {
+	var textBytes int64
+	for i := range entries {
+		e := &entries[i]
+		if !e.Readable || !isTextType(e.Type) {
+			continue
+		}
+		if eff := edits[e.ID]; eff != nil && eff.applied {
+			// FMSG-008: an edited message renders as edited.
+			textBytes += int64(len(eff.data))
+			if textBytes > maxTextBytes {
+				return fmt.Errorf("%w: %d bytes", errThreadTooLarge, maxTextBytes)
+			}
+			e.Body = string(eff.data)
+			e.Text = true
+			continue
+		}
+		textBytes += int64(e.Size)
+		if textBytes > maxTextBytes {
+			return fmt.Errorf("%w: %d bytes", errThreadTooLarge, maxTextBytes)
+		}
+		dataPath := paths[e.ID]
+		if dataPath == "" {
+			e.Body = ""
+			e.Text = true
+			continue
+		}
+		cleanPath, ok := safeDataPath(dataPath, dataDir)
+		if !ok {
+			log.Printf("thread text: path traversal attempt: %s", dataPath)
+			continue
+		}
+		raw, rerr := os.ReadFile(cleanPath)
+		if rerr != nil {
+			log.Printf("thread text: read %d: %v", e.ID, rerr)
+			continue
+		}
+		if int64(len(raw)) > int64(e.Size) {
+			textBytes += int64(len(raw)) - int64(e.Size)
+			if textBytes > maxTextBytes {
+				return fmt.Errorf("%w: %d bytes", errThreadTooLarge, maxTextBytes)
+			}
+		}
+		e.Body = string(raw)
+		e.Text = true
 	}
 	return nil
 }
@@ -271,41 +363,6 @@ func isTextType(mimeType string) bool {
 // text, root first. The caller must be a participant of the requested
 // message; ancestors the caller is not a participant of appear as
 // placeholders (a recipient added mid-thread cannot read what came before).
-// applyThreadEdits presents each visible message that has an effective
-// FMSG-008 edit as edited: its body becomes the edited data, cached under the
-// edit message's hash since the subject's own hash no longer identifies it.
-func (h *MessageHandler) applyThreadEdits(ctx context.Context, messages []threadMessage) {
-	var ids []int64
-	for i := range messages {
-		if messages[i].Visible {
-			ids = append(ids, messages[i].ID)
-		}
-	}
-	edits := h.loadEffectiveEdits(ctx, ids)
-	for i := range messages {
-		m := &messages[i]
-		eff := edits[m.ID]
-		if !m.Visible || eff == nil {
-			continue
-		}
-		m.Edited = eff.edited()
-		if !eff.applied || m.Body == nil {
-			continue
-		}
-		key := partCacheKey(hex.EncodeToString(eff.hash), "body", 0, "")
-		m.Body.Size = len(eff.data)
-		m.Body.CacheKey = key
-		m.Body.Cacheable = key != ""
-		m.Body.Text = nil
-		m.Body.Download = threadDownloadPath(m.ID, "")
-		if isTextType(m.Type) && utf8.Valid(eff.data) {
-			text := string(eff.data)
-			m.Body.Text = &text
-			m.Body.Download = ""
-		}
-	}
-}
-
 func (h *MessageHandler) ThreadText(c *gin.Context) {
 	addrs, err := h.visibleAddrs(c)
 	if err != nil {
@@ -325,9 +382,17 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		return
 	}
 	// A message deleted for good is not found, as for one that doesn't exist.
-	if hasTrash && purgedFor(ctx, h.q(), addrs[0], msgID) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
-		return
+	if hasTrash {
+		purged, perr := purgedFor(ctx, h.q(), addrs[0], msgID)
+		if perr != nil {
+			log.Printf("thread text: trash state %d: %v", msgID, perr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+			return
+		}
+		if purged {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+			return
+		}
 	}
 
 	rows, err := h.q().Query(ctx, `
@@ -353,7 +418,6 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 		return
 	}
-	defer rows.Close()
 
 	var entries []threadEntry
 	paths := map[int64]string{}
@@ -361,6 +425,7 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		var e threadEntry
 		var dataPath string
 		if err := rows.Scan(&e.ID, &e.From, &e.TimeSent, &e.Type, &e.Size, &dataPath, &e.Readable); err != nil {
+			rows.Close()
 			log.Printf("thread text: scan: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 			return
@@ -368,6 +433,7 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 		paths[e.ID] = dataPath
 		entries = append(entries, e)
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		log.Printf("thread text: rows %d: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
@@ -395,35 +461,21 @@ func (h *MessageHandler) ThreadText(c *gin.Context) {
 			entryIDs = append(entryIDs, entries[i].ID)
 		}
 	}
-	edits := h.loadEffectiveEdits(ctx, entryIDs)
+	edits, err := h.loadEffectiveEdits(ctx, entryIDs)
+	if err != nil {
+		log.Printf("thread text: load edits %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+		return
+	}
 
-	for i := range entries {
-		e := &entries[i]
-		if !e.Readable || !isTextType(e.Type) {
-			continue
+	if err := populateThreadTextEntries(entries, paths, edits, h.DataDir, defaultThreadTextBytes); err != nil {
+		if errors.Is(err, errThreadTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error(), "code": "thread_too_large"})
+			return
 		}
-		if eff := edits[e.ID]; eff != nil && eff.applied {
-			// FMSG-008: an edited message renders as edited.
-			e.Body = string(eff.data)
-			e.Text = true
-			continue
-		}
-		dataPath := paths[e.ID]
-		if dataPath == "" {
-			continue
-		}
-		cleanPath, ok := safeDataPath(dataPath, h.DataDir)
-		if !ok {
-			log.Printf("thread text: path traversal attempt: %s", dataPath)
-			continue
-		}
-		raw, rerr := os.ReadFile(cleanPath)
-		if rerr != nil {
-			log.Printf("thread text: read %d: %v", e.ID, rerr)
-			continue
-		}
-		e.Body = string(raw)
-		e.Text = true
+		log.Printf("thread text: bodies %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+		return
 	}
 
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(renderThreadText(entries)))
@@ -450,9 +502,17 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		return
 	}
 	// A message deleted for good is not found, as for one that doesn't exist.
-	if hasTrash && purgedFor(ctx, h.q(), addrs[0], msgID) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
-		return
+	if hasTrash {
+		purged, perr := purgedFor(ctx, h.q(), addrs[0], msgID)
+		if perr != nil {
+			log.Printf("thread messages: trash state %d: %v", msgID, perr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+			return
+		}
+		if purged {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+			return
+		}
 	}
 	tx, err := h.DB.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -538,12 +598,26 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 		return
 	}
+	var visibleIDs []int64
+	for i := range messages {
+		if messages[i].Visible {
+			visibleIDs = append(visibleIDs, messages[i].ID)
+		}
+	}
+	txHandler := *h
+	txHandler.query = tx
+	edits, err := txHandler.loadEffectiveEdits(ctx, visibleIDs)
+	if err != nil {
+		log.Printf("thread messages: edits %d: %v", msgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
+		return
+	}
 	if err = tx.Commit(ctx); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve thread"})
 		return
 	}
-	if err = populateThreadBodies(messages, h.DataDir, defaultThreadTextBytes); err != nil {
-		if strings.Contains(err.Error(), "exceeds") {
+	if err = populateThreadBodiesWithEdits(messages, h.DataDir, defaultThreadTextBytes, edits); err != nil {
+		if errors.Is(err, errThreadTooLarge) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error(), "code": "thread_too_large"})
 			return
 		}
@@ -551,7 +625,6 @@ func (h *MessageHandler) ThreadMessages(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "thread data is unavailable", "code": "thread_data_unavailable"})
 		return
 	}
-	h.applyThreadEdits(ctx, messages)
 	complete := true
 	for i := range messages {
 		if !messages[i].Visible {

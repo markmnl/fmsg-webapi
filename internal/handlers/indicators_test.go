@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -72,5 +73,87 @@ func TestIndicatorThrottle(t *testing.T) {
 	}
 	if !th.allow("a|1", now.Add(indicatorMinInterval)) {
 		t.Error("allowed again after the interval")
+	}
+}
+
+func TestIndicatorThrottle_SweepThrottled(t *testing.T) {
+	th := &indicatorThrottle{last: make(map[string]time.Time, 10005)}
+	t0 := time.Unix(1000, 0)
+	// Seed >10000 active entries at t0.
+	for i := range 10002 {
+		th.last[fmt.Sprintf("u%d|1", i)] = t0
+	}
+
+	// First call triggers sweep (none expired yet) and records lastSweep = t0+100ms.
+	t1 := t0.Add(100 * time.Millisecond)
+	if !th.allow("fresh1|1", t1) {
+		t.Fatal("fresh1 refused")
+	}
+	if !th.lastSweep.Equal(t1) {
+		t.Fatalf("lastSweep = %v, want %v", th.lastSweep, t1)
+	}
+
+	// At t0 + indicatorMinInterval, the original 10002 entries are expired, but
+	// less than indicatorMinInterval has passed since lastSweep (t1), so sweep
+	// must NOT run yet.
+	t2 := t0.Add(indicatorMinInterval)
+	if !th.allow("fresh2|1", t2) {
+		t.Fatal("fresh2 refused")
+	}
+	if len(th.last) < 10000 {
+		t.Fatalf("sweep ran prematurely before indicatorMinInterval elapsed since lastSweep: len=%d", len(th.last))
+	}
+
+	// Once indicatorMinInterval has elapsed since lastSweep, sweep runs and
+	// evicts the expired entries.
+	t3 := t1.Add(indicatorMinInterval)
+	if !th.allow("fresh3|1", t3) {
+		t.Fatal("fresh3 refused")
+	}
+	if len(th.last) > 5 {
+		t.Fatalf("sweep did not evict expired entries after interval: len=%d", len(th.last))
+	}
+}
+
+func TestHubRouteIndicator_SkipsThreadRootWhenNoParticipantConnected(t *testing.T) {
+	hub := newTestHub()
+	rootCalls := 0
+	hub.indicatorParticipants = func(_ context.Context, _ int64) ([]string, error) {
+		return []string{"@alice@x", "@bob@x"}, nil
+	}
+	hub.threadRoot = func(_ context.Context, _ int64) (int64, error) {
+		rootCalls++
+		return 3, nil
+	}
+
+	// Only an unrelated user (dave) is connected: threadRoot must be skipped.
+	dave := newTestClient("@dave@x")
+	hub.Register(dave)
+	hub.routeIndicator(context.Background(), `{"id":7,"from":"@bob@x","emoji":"✍️","ttl":6}`)
+	if rootCalls != 0 {
+		t.Fatalf("threadRoot called %d times when no participant connected, want 0", rootCalls)
+	}
+
+	// Once alice connects, threadRoot is queried and alice receives the indicator.
+	alice := newTestClient("@alice@x")
+	hub.Register(alice)
+	hub.routeIndicator(context.Background(), `{"id":7,"from":"@bob@x","emoji":"✍️","ttl":6}`)
+	if rootCalls != 1 {
+		t.Fatalf("threadRoot called %d times, want 1", rootCalls)
+	}
+	select {
+	case payload := <-alice.send:
+		var env struct {
+			Type string    `json:"type"`
+			Data Indicator `json:"data"`
+		}
+		if err := json.Unmarshal(payload, &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Type != eventIndicator || env.Data.RootID != 3 {
+			t.Fatalf("unexpected indicator envelope: %+v", env)
+		}
+	default:
+		t.Fatal("alice did not receive indicator")
 	}
 }

@@ -32,6 +32,73 @@ type wsEnvelope struct {
 	Data any    `json:"data"`
 }
 
+const (
+	defaultPushWorkers   = 8
+	defaultPushQueueSize = 256
+	msgClassCacheSize    = 1024
+)
+
+type msgClassKind uint8
+
+const (
+	msgClassNormal msgClassKind = iota
+	msgClassReaction
+	msgClassEdit
+)
+
+type msgClassification struct {
+	kind    msgClassKind
+	subject int64
+}
+
+// msgClassCache is a bounded FIFO cache of immutable sent-message
+// classifications (normal / reaction / edit) so K-recipient fan-out does not
+// repeat DB and disk classification queries for every recipient.
+type msgClassCache struct {
+	mu   sync.Mutex
+	m    map[int64]msgClassification
+	ring [msgClassCacheSize]int64
+	pos  int
+	full bool
+}
+
+func (c *msgClassCache) get(id int64) (msgClassification, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		return msgClassification{}, false
+	}
+	v, ok := c.m[id]
+	return v, ok
+}
+
+func (c *msgClassCache) put(id int64, cls msgClassification) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[int64]msgClassification, msgClassCacheSize)
+	}
+	if _, exists := c.m[id]; exists {
+		return
+	}
+	if c.full {
+		delete(c.m, c.ring[c.pos])
+	}
+	c.ring[c.pos] = id
+	c.m[id] = cls
+	c.pos++
+	if c.pos == len(c.ring) {
+		c.pos = 0
+		c.full = true
+	}
+}
+
+type pushJob struct {
+	ctx   context.Context
+	msgID int64
+	addr  string
+}
+
 // Hub maintains the set of connected WebSocket clients and fans out database
 // notifications to the clients they pertain to. A single dedicated PostgreSQL
 // connection LISTENs on new_msg for the whole process, so the number of
@@ -43,8 +110,9 @@ type Hub struct {
 	buildItem func(ctx context.Context, msgID int64, recipient string) (*messageListItem, error)
 
 	// notifyPush, when non-nil, dispatches a Web Push for a new_msg
-	// notification. It runs independently of WebSocket fan-out so pushes are
-	// delivered even when the recipient has no live WebSocket.
+	// notification. It runs on a bounded worker pool independently of
+	// WebSocket fan-out so pushes are delivered even when the recipient has no
+	// live WebSocket.
 	notifyPush func(ctx context.Context, msgID int64, addr string)
 
 	// reactionSubject, when non-nil, reports the subject message of msgID
@@ -57,9 +125,22 @@ type Hub struct {
 	// edit event carrying the refreshed subject, never as a new message.
 	editSubject func(ctx context.Context, msgID int64) (int64, bool)
 
-	// indicatorAudience reports a message's participants and its thread's
-	// first message, for FMSG-006 indicators.
-	indicatorAudience func(ctx context.Context, msgID int64) ([]string, int64, error)
+	// indicatorParticipants and threadRoot split indicator audience lookup so
+	// routeIndicator can skip the recursive root CTE when no participant has a
+	// connected WebSocket. indicatorAudience is kept as a fallback hook for
+	// tests.
+	indicatorParticipants func(ctx context.Context, msgID int64) ([]string, error)
+	threadRoot            func(ctx context.Context, msgID int64) (int64, error)
+	indicatorAudience     func(ctx context.Context, msgID int64) ([]string, int64, error)
+
+	classCache msgClassCache
+
+	pushWorkers   int
+	pushQueueSize int
+	pushMu        sync.Mutex
+	pushCh        chan pushJob
+	pushClosed    bool
+	pushWG        sync.WaitGroup
 
 	mu sync.RWMutex
 	// registry maps a lower-cased user address to the set of that user's
@@ -73,14 +154,66 @@ func (h *Hub) SetPushNotifier(fn func(ctx context.Context, msgID int64, addr str
 	h.notifyPush = fn
 }
 
+// Close shuts down the bounded Web Push worker pool and waits for queued and
+// in-flight pushes to finish.
+func (h *Hub) Close() {
+	h.pushMu.Lock()
+	if !h.pushClosed {
+		h.pushClosed = true
+		if h.pushCh != nil {
+			close(h.pushCh)
+		}
+	}
+	h.pushMu.Unlock()
+	h.pushWG.Wait()
+}
+
+func (h *Hub) enqueuePush(ctx context.Context, msgID int64, addr string) {
+	h.pushMu.Lock()
+	if h.pushClosed {
+		h.pushMu.Unlock()
+		return
+	}
+	if h.pushCh == nil {
+		workers := h.pushWorkers
+		if workers <= 0 {
+			workers = defaultPushWorkers
+		}
+		qsize := h.pushQueueSize
+		if qsize <= 0 {
+			qsize = defaultPushQueueSize
+		}
+		h.pushCh = make(chan pushJob, qsize)
+		h.pushWG.Add(workers)
+		for range workers {
+			go h.pushWorker()
+		}
+	}
+	select {
+	case h.pushCh <- pushJob{ctx: ctx, msgID: msgID, addr: addr}:
+	default:
+		log.Printf("ws hub: push queue full, dropping push for msg %d to %s", msgID, addr)
+	}
+	h.pushMu.Unlock()
+}
+
+func (h *Hub) pushWorker() {
+	defer h.pushWG.Done()
+	for job := range h.pushCh {
+		h.notifyPush(job.ctx, job.msgID, job.addr)
+	}
+}
+
 // NewHub creates a Hub that builds pushed message payloads via msgs.
 func NewHub(msgs *MessageHandler) *Hub {
 	return &Hub{
-		buildItem:         msgs.messageItemFor,
-		reactionSubject:   msgs.reactionSubject,
-		editSubject:       msgs.editSubject,
-		indicatorAudience: msgs.indicatorAudience,
-		registry:          make(map[string]map[*wsClient]struct{}),
+		buildItem:             msgs.messageItemFor,
+		reactionSubject:       msgs.reactionSubject,
+		editSubject:           msgs.editSubject,
+		indicatorParticipants: msgs.indicatorParticipants,
+		threadRoot:            msgs.threadRoot,
+		indicatorAudience:     msgs.indicatorAudience,
+		registry:              make(map[string]map[*wsClient]struct{}),
 	}
 }
 
@@ -184,33 +317,57 @@ func (h *Hub) listen(ctx context.Context, onConnected func()) error {
 	}
 }
 
+// classifyNewMsg classifies an immutable sent message once and caches the
+// result so multi-recipient fan-out avoids repeated DB/disk queries.
+func (h *Hub) classifyNewMsg(ctx context.Context, msgID int64) msgClassification {
+	if h.reactionSubject == nil && h.editSubject == nil {
+		return msgClassification{kind: msgClassNormal}
+	}
+	if cls, ok := h.classCache.get(msgID); ok {
+		return cls
+	}
+	cls := msgClassification{kind: msgClassNormal}
+	if h.reactionSubject != nil {
+		if subject, ok := h.reactionSubject(ctx, msgID); ok {
+			cls = msgClassification{kind: msgClassReaction, subject: subject}
+		}
+	}
+	if cls.kind == msgClassNormal && h.editSubject != nil {
+		if subject, ok := h.editSubject(ctx, msgID); ok {
+			cls = msgClassification{kind: msgClassEdit, subject: subject}
+		}
+	}
+	h.classCache.put(msgID, cls)
+	return cls
+}
+
 // route handles one notification on channel for message msgID and address
 // addr.
 func (h *Hub) route(ctx context.Context, channel string, msgID int64, addr string) {
 	switch channel {
 	case "new_msg":
-		if h.reactionSubject != nil {
-			if subject, ok := h.reactionSubject(ctx, msgID); ok {
-				// FMSG-005: a reaction is a low-priority event on its
-				// subject, not a new message. No Web Push is sent.
-				h.dispatch(ctx, subject, addr, eventReaction)
-				return
-			}
+		if h.notifyPush == nil && !h.hasClients(addr) {
+			return
 		}
-		if h.editSubject != nil {
-			if subject, ok := h.editSubject(ctx, msgID); ok {
-				// FMSG-008: an edit is a low-priority event on its
-				// subject, not a new message. No Web Push is sent.
-				h.dispatch(ctx, subject, addr, eventEdit)
-				return
-			}
+		cls := h.classifyNewMsg(ctx, msgID)
+		switch cls.kind {
+		case msgClassReaction:
+			// FMSG-005: a reaction is a low-priority event on its
+			// subject, not a new message. No Web Push is sent.
+			h.dispatch(ctx, cls.subject, addr, eventReaction)
+			return
+		case msgClassEdit:
+			// FMSG-008: an edit is a low-priority event on its
+			// subject, not a new message. No Web Push is sent.
+			h.dispatch(ctx, cls.subject, addr, eventEdit)
+			return
 		}
-		// Web Push runs in its own goroutine: it is network I/O to many
+		// Web Push runs on a bounded worker pool: it is network I/O to many
 		// endpoints and must not stall the single listener. It is
 		// dispatched here, alongside (not inside) dispatch, so a push is
 		// sent even when the recipient has no live WebSocket.
 		if h.notifyPush != nil {
-			go h.notifyPush(ctx, msgID, addr)
+			h.enqueuePush(ctx, msgID, addr)
 		}
 		h.dispatch(ctx, msgID, addr, eventNewMsg)
 	case "delivered":
@@ -308,6 +465,20 @@ func (h *Hub) dispatchTrash(ctx context.Context, msgID int64, addr string) {
 	h.send(clients, msgID, wsEnvelope{Type: eventTrash, Data: item})
 }
 
+// hasClients reports whether at least one client is connected as addr.
+func (h *Hub) hasClients(addr string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.registry[strings.ToLower(addr)]) > 0
+}
+
+// hasAnyClients reports whether any WebSocket client is currently connected.
+func (h *Hub) hasAnyClients() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.registry) > 0
+}
+
 // clientsOf lists the clients connected as addr.
 func (h *Hub) clientsOf(addr string) []*wsClient {
 	h.mu.RLock()
@@ -316,6 +487,26 @@ func (h *Hub) clientsOf(addr string) []*wsClient {
 	clients := make([]*wsClient, 0, len(set))
 	for c := range set {
 		clients = append(clients, c)
+	}
+	return clients
+}
+
+// clientsOfParticipants collects connected clients for every unique address in
+// addrs except exclude, under a single RLock acquisition.
+func (h *Hub) clientsOfParticipants(addrs []string, exclude string) []*wsClient {
+	seen := map[string]bool{strings.ToLower(exclude): true}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var clients []*wsClient
+	for _, a := range addrs {
+		k := strings.ToLower(a)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		for c := range h.registry[k] {
+			clients = append(clients, c)
+		}
 	}
 	return clients
 }
@@ -350,26 +541,38 @@ func (h *Hub) routeIndicator(ctx context.Context, payload string) {
 		log.Printf("ws hub: ignoring malformed indicator payload %q", payload)
 		return
 	}
-	if h.indicatorAudience == nil {
+	if !h.hasAnyClients() {
 		return
 	}
-	addrs, root, err := h.indicatorAudience(ctx, ind.ID)
-	if err != nil {
-		log.Printf("ws hub: indicator on %d: %v", ind.ID, err)
-		return
-	}
-	ind.RootID = root
 	var clients []*wsClient
-	seen := map[string]bool{strings.ToLower(ind.From): true}
-	for _, a := range addrs {
-		k := strings.ToLower(a)
-		if seen[k] {
-			continue
+	if h.indicatorParticipants != nil && h.threadRoot != nil {
+		addrs, err := h.indicatorParticipants(ctx, ind.ID)
+		if err != nil {
+			log.Printf("ws hub: indicator on %d: %v", ind.ID, err)
+			return
 		}
-		seen[k] = true
-		clients = append(clients, h.clientsOf(a)...)
-	}
-	if len(clients) == 0 {
+		clients = h.clientsOfParticipants(addrs, ind.From)
+		if len(clients) == 0 {
+			return
+		}
+		root, err := h.threadRoot(ctx, ind.ID)
+		if err != nil {
+			log.Printf("ws hub: indicator root on %d: %v", ind.ID, err)
+			return
+		}
+		ind.RootID = root
+	} else if h.indicatorAudience != nil {
+		addrs, root, err := h.indicatorAudience(ctx, ind.ID)
+		if err != nil {
+			log.Printf("ws hub: indicator on %d: %v", ind.ID, err)
+			return
+		}
+		clients = h.clientsOfParticipants(addrs, ind.From)
+		if len(clients) == 0 {
+			return
+		}
+		ind.RootID = root
+	} else {
 		return
 	}
 	h.send(clients, ind.ID, wsEnvelope{Type: eventIndicator, Data: ind})
