@@ -173,6 +173,35 @@ func (s *Store) createGrant(ctx context.Context, ownerAddr, agent, subAddr, gran
 	return tx.Commit(ctx)
 }
 
+// UnlessGranted runs fn only if no grant exists for subAddr, and reports
+// whether it ran. It holds the lock createGrant takes for ownerAddr while it
+// checks and while fn runs, so a concurrent create for the same owner either
+// commits its grant first (fn is skipped) or inserts after fn has finished.
+func (s *Store) UnlessGranted(ctx context.Context, ownerAddr, subAddr string, fn func() error) (bool, error) {
+	tx, err := s.DB.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(lower($1)))`, ownerAddr); err != nil {
+		return false, err
+	}
+	var granted bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM fmsg_api_sub_account WHERE lower(sub_addr) = lower($1))`,
+		subAddr).Scan(&granted); err != nil {
+		return false, err
+	}
+	if granted {
+		return false, nil
+	}
+	if err := fn(); err != nil {
+		return true, err
+	}
+	return true, tx.Commit(ctx)
+}
+
 func (s *Store) RotateKey(ctx context.Context, ownerAddr, agent, keyID string, keyHash []byte, keyExpiresAt time.Time) (string, error) {
 	var subAddr string
 	err := s.DB.Pool.QueryRow(ctx,
