@@ -171,37 +171,81 @@ func (h *Hub) Close() {
 	_ = h.CloseContext(context.Background())
 }
 
-// CloseContext shuts down the bounded Web Push worker pool, cancelling its
-// push context so queued jobs are skipped and in-flight pushes abort promptly,
-// and waits for workers to exit until ctx is cancelled.
-func (h *Hub) CloseContext(ctx context.Context) error {
-	h.pushMu.Lock()
-	if !h.pushClosed {
-		h.pushClosed = true
-		if h.pushCancel != nil {
-			h.pushCancel()
-		}
-		if h.pushCh != nil {
-			close(h.pushCh)
-		}
-	}
-	h.pushMu.Unlock()
+// pushAbortGrace is how long DrainContext waits for workers to exit after it
+// has cancelled their pushes.
+const pushAbortGrace = time.Second
 
-	if ctx == nil {
-		h.pushWG.Wait()
-		return nil
+// closePushQueue stops the pool accepting jobs. Workers exit once they have
+// taken everything already queued.
+func (h *Hub) closePushQueue() {
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+	if h.pushClosed {
+		return
 	}
+	h.pushClosed = true
+	if h.pushCh != nil {
+		close(h.pushCh)
+	}
+}
+
+// cancelPushes aborts in-flight pushes and makes workers skip what is queued.
+func (h *Hub) cancelPushes() {
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+	if h.pushCancel != nil {
+		h.pushCancel()
+	}
+}
+
+// pushWorkersDone is closed once every push worker has exited.
+func (h *Hub) pushWorkersDone() <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		h.pushWG.Wait()
 		close(done)
 	}()
+	return done
+}
+
+// CloseContext shuts down the bounded Web Push worker pool, cancelling its
+// push context so queued jobs are skipped and in-flight pushes abort promptly,
+// and waits for workers to exit until ctx is cancelled.
+func (h *Hub) CloseContext(ctx context.Context) error {
+	h.closePushQueue()
+	h.cancelPushes()
+
+	if ctx == nil {
+		h.pushWG.Wait()
+		return nil
+	}
 	select {
-	case <-done:
+	case <-h.pushWorkersDone():
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// DrainContext shuts down the bounded Web Push worker pool without losing
+// work: it stops accepting jobs and lets the workers send what is queued and
+// in flight, waiting for them until ctx is done. If ctx ends first it cancels
+// what remains, as CloseContext does, and returns ctx's error.
+func (h *Hub) DrainContext(ctx context.Context) error {
+	h.closePushQueue()
+	done := h.pushWorkersDone()
+	select {
+	case <-done:
+		h.cancelPushes() // nothing left to cancel; releases the push context
+		return nil
+	case <-ctx.Done():
+	}
+	h.cancelPushes()
+	select {
+	case <-done:
+	case <-time.After(pushAbortGrace):
+	}
+	return ctx.Err()
 }
 
 func (h *Hub) enqueuePush(msgID int64, addr string) {
