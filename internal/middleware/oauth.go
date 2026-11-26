@@ -31,6 +31,7 @@ var oauthRouteScopes = map[string]string{
 	"GET /fmsg":                         ScopeRead,
 	"GET /fmsg/sent":                    ScopeRead,
 	"GET /fmsg/count":                   ScopeRead,
+	"GET /fmsg/search":                  ScopeRead,
 	"GET /fmsg/:id":                     ScopeRead,
 	"GET /fmsg/:id/data":                ScopeRead,
 	"GET /fmsg/:id/thread":              ScopeRead,
