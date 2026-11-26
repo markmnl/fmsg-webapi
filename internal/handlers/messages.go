@@ -720,16 +720,13 @@ func (h *MessageHandler) Get(c *gin.Context) {
 
 	// Compute reactions, edits, and ShortText only after authorization has been confirmed.
 	msg.Reaction = h.reactionOf(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, msg.Size, len(msg.Attachments), dataPath)
-	reactionsMap, err := h.loadReactions(ctx, []int64{msgID})
+	reactionSet, err := h.loadReactions(ctx, []int64{msgID})
 	if err != nil {
 		log.Printf("get message %d: reactions: %v", msgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve message"})
 		return
 	}
-	msg.Reactions = reactionsMap[msgID]
-	if msg.Reactions == nil {
-		msg.Reactions = []models.Reaction{}
-	}
+	msg.Reactions = applyReactions(reactionSet, msgID, msg.AddTo)
 	if editShape(msg.HasPid, msg.NoReply, msg.Terminal, msg.Important, msg.HasAddTo, msg.Type, len(msg.Attachments)) {
 		_, msg.Edit, _ = h.editSubject(ctx, msgID)
 	}
@@ -1692,14 +1689,11 @@ func (h *MessageHandler) messageItemFor(ctx context.Context, msgID int64, recipi
 		dataPath:    dataPath,
 	}
 	item.Reaction = h.reactionOf(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, item.Size, len(item.Attachments), dataPath)
-	reactionsMap, err := h.loadReactions(ctx, []int64{msgID})
+	reactionSet, err := h.loadReactions(ctx, []int64{msgID})
 	if err != nil {
 		return nil, err
 	}
-	item.Reactions = reactionsMap[msgID]
-	if item.Reactions == nil {
-		item.Reactions = []models.Reaction{}
-	}
+	item.Reactions = applyReactions(reactionSet, msgID, item.AddTo)
 	if editShape(item.HasPid, item.NoReply, item.Terminal, item.Important, item.HasAddTo, item.Type, len(item.Attachments)) {
 		_, item.Edit, _ = h.editSubject(ctx, msgID)
 	}

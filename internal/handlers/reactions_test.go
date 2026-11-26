@@ -95,14 +95,18 @@ func TestEffectiveReactions(t *testing.T) {
 		{subjectID: 1, msgID: 14, from: "@dave@example.com", time: 104, emoji: ""}, // dave clears
 		{subjectID: 2, msgID: 20, from: "@bob@example.com", time: 100, emoji: "🎉"},
 		{subjectID: 3, msgID: 30, from: "@bob@example.com", time: 100, emoji: ""}, // only a clear
+		// A batch of message 1 is a message of its own: bob's reaction there
+		// is separate from his reaction on the original.
+		{subjectID: 1, batch: "ab", msgID: 15, from: "@bob@example.com", time: 105, emoji: "😂"},
 	}
 	got := effectiveReactions(rows)
-	want := map[int64][]models.Reaction{
-		1: {
+	want := map[reactionKey][]models.Reaction{
+		{1, ""}: {
 			{Emoji: "👍", From: []string{"@carol@example.edu"}},
 			{Emoji: "❤️", From: []string{"@Bob@example.com"}},
 		},
-		2: {{Emoji: "🎉", From: []string{"@bob@example.com"}}},
+		{1, "ab"}: {{Emoji: "😂", From: []string{"@bob@example.com"}}},
+		{2, ""}:   {{Emoji: "🎉", From: []string{"@bob@example.com"}}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		gj, _ := json.Marshal(got)
@@ -116,14 +120,15 @@ func TestEffectiveReactionsTieBreaksOnHash(t *testing.T) {
 		{subjectID: 1, msgID: 10, from: "@bob@example.com", time: 100, hash: []byte{0x01}, emoji: "👍"},
 		{subjectID: 1, msgID: 11, from: "@bob@example.com", time: 100, hash: []byte{0x02}, emoji: "❤️"},
 	}
+	k := reactionKey{1, ""}
 	got := effectiveReactions(rows)
-	if len(got[1]) != 1 || got[1][0].Emoji != "❤️" {
-		t.Errorf("tie at equal time should pick the greater hash, got %+v", got[1])
+	if len(got[k]) != 1 || got[k][0].Emoji != "❤️" {
+		t.Errorf("tie at equal time should pick the greater hash, got %+v", got[k])
 	}
 	// Order independence.
 	got = effectiveReactions([]reactionRow{rows[1], rows[0]})
-	if len(got[1]) != 1 || got[1][0].Emoji != "❤️" {
-		t.Errorf("tie-break must not depend on row order, got %+v", got[1])
+	if len(got[k]) != 1 || got[k][0].Emoji != "❤️" {
+		t.Errorf("tie-break must not depend on row order, got %+v", got[k])
 	}
 }
 
@@ -135,12 +140,19 @@ func TestReactionRecipients(t *testing.T) {
 			{AddToFrom: "@bob@example.com", To: []string{"@dave@example.org", "@Carol@example.edu"}},
 		},
 	}
-	got := reactionRecipients(subject, "@BOB@example.com")
-	want := []string{"@alice@example.com", "@carol@example.edu", "@dave@example.org"}
+	// On the message: its participants only, not the batch's added recipients.
+	got := reactionRecipients(subject, nil, "@BOB@example.com")
+	want := []string{"@alice@example.com", "@carol@example.edu"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("reactionRecipients = %v, want %v", got, want)
+		t.Errorf("reactionRecipients(message) = %v, want %v", got, want)
 	}
-	if got := reactionRecipients(&models.Message{From: "@alice@example.com", To: []string{"@alice@example.com"}}, "@alice@example.com"); len(got) != 0 {
+	// On the batch, a message of its own: also its adder and added recipients.
+	got = reactionRecipients(subject, &subject.AddTo[0], "@BOB@example.com")
+	want = []string{"@alice@example.com", "@carol@example.edu", "@dave@example.org"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("reactionRecipients(batch) = %v, want %v", got, want)
+	}
+	if got := reactionRecipients(&models.Message{From: "@alice@example.com", To: []string{"@alice@example.com"}}, nil, "@alice@example.com"); len(got) != 0 {
 		t.Errorf("self-only message should have no recipients, got %v", got)
 	}
 }

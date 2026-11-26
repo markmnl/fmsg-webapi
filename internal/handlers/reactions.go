@@ -135,9 +135,18 @@ func (h *MessageHandler) reactionSubject(ctx context.Context, msgID int64) (int6
 	return *pid, true, nil
 }
 
+// reactionKey names a reaction's subject: a message, or one add-to batch of
+// it (batch is that batch's hex sha256). A batch is a message of its own, so
+// its reactions are its own, not the original's.
+type reactionKey struct {
+	msgID int64
+	batch string
+}
+
 // reactionRow is one stored reaction message on a subject.
 type reactionRow struct {
 	subjectID int64
+	batch     string // hex sha256 of the add-to batch the reaction names; "" for the message itself
 	msgID     int64
 	from      string
 	time      float64
@@ -158,13 +167,14 @@ func newerReaction(a, b reactionRow) bool {
 // reactions: one per reactor, grouped by emoji in order of first reaction,
 // reactors within a group in time order. A reactor whose effective reaction is
 // empty has none and is omitted.
-func effectiveReactions(rows []reactionRow) map[int64][]models.Reaction {
-	bySubject := make(map[int64]map[string]reactionRow)
+func effectiveReactions(rows []reactionRow) map[reactionKey][]models.Reaction {
+	bySubject := make(map[reactionKey]map[string]reactionRow)
 	for _, r := range rows {
-		reactors := bySubject[r.subjectID]
+		k := reactionKey{r.subjectID, r.batch}
+		reactors := bySubject[k]
 		if reactors == nil {
 			reactors = make(map[string]reactionRow)
-			bySubject[r.subjectID] = reactors
+			bySubject[k] = reactors
 		}
 		key := strings.ToLower(r.from)
 		if cur, ok := reactors[key]; !ok || newerReaction(r, cur) {
@@ -172,7 +182,7 @@ func effectiveReactions(rows []reactionRow) map[int64][]models.Reaction {
 		}
 	}
 
-	result := make(map[int64][]models.Reaction, len(bySubject))
+	result := make(map[reactionKey][]models.Reaction, len(bySubject))
 	for subject, reactors := range bySubject {
 		var eff []reactionRow
 		for _, r := range reactors {
@@ -212,8 +222,9 @@ func (h *MessageHandler) loadReactionRows(ctx context.Context, subjectIDs []int6
 		return nil, nil
 	}
 	rows, err := h.q().Query(ctx, `
-		SELECT r.pid, r.id, r.from_addr, r.time_sent, r.sha256, r.size, r.filepath
+		SELECT r.pid, COALESCE(encode(sb.sha256, 'hex'), ''), r.id, r.from_addr, r.time_sent, r.sha256, r.size, r.filepath
 		FROM msg r
+		LEFT JOIN msg_add_to_batch sb ON sb.msg_id = r.pid AND sb.sha256 = r.psha256
 		WHERE r.pid = ANY($1)
 		  AND r.time_sent IS NOT NULL
 		  AND r.is_terminal AND r.no_reply AND NOT r.is_important
@@ -234,7 +245,7 @@ func (h *MessageHandler) loadReactionRows(ctx context.Context, subjectIDs []int6
 		var r reactionRow
 		var size int
 		var dataPath string
-		if err := rows.Scan(&r.subjectID, &r.msgID, &r.from, &r.time, &r.hash, &size, &dataPath); err != nil {
+		if err := rows.Scan(&r.subjectID, &r.batch, &r.msgID, &r.from, &r.time, &r.hash, &size, &dataPath); err != nil {
 			return nil, err
 		}
 		e, ok := h.readReactionData(dataPath, size)
@@ -247,13 +258,28 @@ func (h *MessageHandler) loadReactionRows(ctx context.Context, subjectIDs []int6
 	return out, rows.Err()
 }
 
-// loadReactions returns the effective reactions on each of the given subjects.
-func (h *MessageHandler) loadReactions(ctx context.Context, subjectIDs []int64) (map[int64][]models.Reaction, error) {
+// loadReactions returns the effective reactions on each of the given messages
+// and on each of their add-to batches.
+func (h *MessageHandler) loadReactions(ctx context.Context, subjectIDs []int64) (map[reactionKey][]models.Reaction, error) {
 	rows, err := h.loadReactionRows(ctx, subjectIDs, "")
 	if err != nil {
 		return nil, err
 	}
 	return effectiveReactions(rows), nil
+}
+
+// applyReactions sets each add-to batch's own reactions and returns the
+// message's (never nil).
+func applyReactions(set map[reactionKey][]models.Reaction, msgID int64, addTo []models.AddToBatch) []models.Reaction {
+	for i := range addTo {
+		if addTo[i].SHA256 != nil {
+			addTo[i].Reactions = set[reactionKey{msgID, strings.ToLower(*addTo[i].SHA256)}]
+		}
+	}
+	if r := set[reactionKey{msgID, ""}]; r != nil {
+		return r
+	}
+	return []models.Reaction{}
 }
 
 // populateListReactions fills Reaction and Reactions on every list item.
@@ -269,18 +295,18 @@ func (h *MessageHandler) populateListReactions(ctx context.Context, items []mess
 		return err
 	}
 	for i := range items {
-		items[i].Reactions = reactions[items[i].ID]
-		if items[i].Reactions == nil {
-			items[i].Reactions = []models.Reaction{}
-		}
+		items[i].Reactions = applyReactions(reactions, items[i].ID, items[i].AddTo)
 	}
 	return nil
 }
 
 // reactionRecipients returns a subject's participants other than the reactor,
 // in message order and deduplicated case-insensitively: the to list of a
-// reaction (FMSG-005 Recipients).
-func reactionRecipients(subject *models.Message, reactor string) []string {
+// reaction (FMSG-005 Recipients). The subject is the message, or, when batch
+// is set, that add-to batch of it: a message of its own, whose participants
+// are also its adder and the recipients it added. Other batches' recipients
+// are not participants of the subject.
+func reactionRecipients(subject *models.Message, batch *models.AddToBatch, reactor string) []string {
 	seen := map[string]bool{strings.ToLower(reactor): true}
 	var out []string
 	add := func(addr string) {
@@ -295,13 +321,35 @@ func reactionRecipients(subject *models.Message, reactor string) []string {
 	for _, a := range subject.To {
 		add(a)
 	}
-	for _, b := range subject.AddTo {
-		add(b.AddToFrom)
-		for _, a := range b.To {
+	if batch != nil {
+		add(batch.AddToFrom)
+		for _, a := range batch.To {
 			add(a)
 		}
 	}
 	return out
+}
+
+// reactSubject resolves the :id of POST /fmsg/:id/react: a message id or
+// sha256, or the sha256 of an add-to batch, which is a message of its own. It
+// returns the message id the batch is stored with and the batch hash ("" for
+// the message itself).
+func reactSubject(c *gin.Context, q queries) (int64, string, bool) {
+	if s := strings.ToLower(c.Param("id")); len(s) == 64 {
+		if hash, err := decodeHash(s); err == nil {
+			var id int64
+			err := q.QueryRow(c.Request.Context(), `SELECT msg_id FROM msg_add_to_batch WHERE sha256 = $1 LIMIT 1`, hash).Scan(&id)
+			if err == nil {
+				return id, s, true
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve message"})
+				return 0, "", false
+			}
+		}
+	}
+	id, ok := resolveID(c, q)
+	return id, "", ok
 }
 
 // reactInput is the request body of POST /fmsg/:id/react.
@@ -315,7 +363,7 @@ type reactInput struct {
 // idempotent and sends nothing.
 func (h *MessageHandler) React(c *gin.Context) {
 	identity := middleware.GetIdentity(c)
-	msgID, ok := resolveID(c, h.q())
+	msgID, batchHash, ok := reactSubject(c, h.q())
 	if !ok {
 		return
 	}
@@ -360,11 +408,30 @@ func (h *MessageHandler) React(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
 	}
+	// The subject: the message, or the add-to batch named by its hash.
+	// Named by id, a caller who was only added has just their batch, so that
+	// is what they react to.
+	onOriginal := strings.EqualFold(subject.From, identity) || isRecipient(subject.To, identity)
+	var batch *models.AddToBatch
+	for i := range subject.AddTo {
+		b := &subject.AddTo[i]
+		if b.SHA256 == nil {
+			continue
+		}
+		if batchHash != "" && strings.EqualFold(*b.SHA256, batchHash) || batchHash == "" && !onOriginal && isRecipient(b.To, identity) {
+			batch = b
+			break
+		}
+	}
 	// Only a participant of the subject may react to it (the host enforces
 	// the same rule on the wire).
-	if !strings.EqualFold(subject.From, identity) && !isRecipient(subject.To, identity) && !addToContains(subject.AddTo, identity) {
+	if !onOriginal && (batch == nil || !isRecipient(batch.To, identity)) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only participants may react to a message"})
 		return
+	}
+	subjectBatch := ""
+	if batch != nil {
+		subjectBatch = strings.ToLower(*batch.SHA256)
 	}
 	if subject.Time == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "cannot react to a draft"})
@@ -375,7 +442,7 @@ func (h *MessageHandler) React(c *gin.Context) {
 		return
 	}
 
-	recipients := reactionRecipients(subject, identity)
+	recipients := reactionRecipients(subject, batch, identity)
 	if len(recipients) == 0 {
 		// A message the caller sent only to themselves: the reaction is
 		// addressed to the caller (FMSG-005 v0.1.1).
@@ -391,6 +458,9 @@ func (h *MessageHandler) React(c *gin.Context) {
 	}
 	var current *reactionRow
 	for i := range mine {
+		if mine[i].batch != subjectBatch {
+			continue // a reaction on another message: the original or another batch
+		}
 		if current == nil || newerReaction(mine[i], *current) {
 			current = &mine[i]
 		}
@@ -420,14 +490,8 @@ func (h *MessageHandler) React(c *gin.Context) {
 	}
 
 	parentHash := subject.SHA256
-	if !sameAddr(subject.From, identity) && !isRecipient(subject.To, identity) {
-		parentHash = nil
-		for _, b := range subject.AddTo {
-			if isRecipient(b.To, identity) {
-				parentHash = b.SHA256
-				break
-			}
-		}
+	if batch != nil {
+		parentHash = batch.SHA256
 	}
 	if parentHash == nil {
 		c.JSON(500, gin.H{"error": "reaction parent has no finalized identity"})
