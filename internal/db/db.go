@@ -22,6 +22,7 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 		return nil, fmt.Errorf("db: failed to create pool: %w", err)
 	}
 	if err = pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("db: failed to ping: %w", err)
 	}
 	return &DB{Pool: pool}, nil

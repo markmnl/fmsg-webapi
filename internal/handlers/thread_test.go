@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,5 +97,96 @@ func TestThreadAttachmentCacheKey(t *testing.T) {
 	}
 	if got := partCacheKey("", "attachment", 4, "report.pdf"); got != "" {
 		t.Fatalf("hashless message must not be cacheable: %q", got)
+	}
+}
+
+func TestPopulateThreadBodies_EmptyDataPathAndSizeLimit(t *testing.T) {
+	dir := t.TempDir()
+	messages := []threadMessage{
+		{ID: 1, Visible: true, Type: "text/plain", Size: 0, MessageSHA256: "abc", dataPath: ""},
+	}
+	if err := populateThreadBodies(messages, dir, 10); err != nil {
+		t.Fatalf("empty dataPath failed: %v", err)
+	}
+	if messages[0].Body == nil || messages[0].Body.Text == nil || *messages[0].Body.Text != "" || messages[0].Body.Download != "" {
+		t.Fatalf("expected empty inlined text body, got %#v", messages[0].Body)
+	}
+
+	bigPath := filepath.Join(dir, "big.txt")
+	if err := os.WriteFile(bigPath, []byte("0123456789"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	over := []threadMessage{
+		{ID: 2, Visible: true, Type: "text/plain", Size: 10, dataPath: bigPath},
+	}
+	err := populateThreadBodies(over, dir, 5)
+	if !errors.Is(err, errThreadTooLarge) {
+		t.Fatalf("expected errThreadTooLarge, got %v", err)
+	}
+}
+
+func TestPopulateThreadBodiesWithEdits_SkipsUneditedDiskRead(t *testing.T) {
+	dir := t.TempDir()
+	messages := []threadMessage{
+		{ID: 1, Visible: true, Type: "text/plain", Size: 5, dataPath: filepath.Join(dir, "missing-original.txt")},
+	}
+	edits := map[int64]*effectiveEdit{
+		1: {msgID: 99, time: 123, hash: []byte{0xde, 0xad}, applied: true, data: []byte("edited")},
+	}
+	if err := populateThreadBodiesWithEdits(messages, dir, 10, edits); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if messages[0].Body == nil || messages[0].Body.Text == nil || *messages[0].Body.Text != "edited" {
+		t.Fatalf("expected edited text body, got %#v", messages[0].Body)
+	}
+	if messages[0].Body.CacheKey != "sha256:dead:body" {
+		t.Fatalf("unexpected cache key: %q", messages[0].Body.CacheKey)
+	}
+
+	// Edited body exceeding maxTextBytes must return errThreadTooLarge.
+	if err := populateThreadBodiesWithEdits(messages, dir, 3, edits); !errors.Is(err, errThreadTooLarge) {
+		t.Fatalf("expected errThreadTooLarge for edited body, got %v", err)
+	}
+}
+
+func TestPopulateThreadTextEntries_SizeLimitAndEmptyBody(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "body.txt")
+	if err := os.WriteFile(p, []byte("hello world"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := []threadEntry{
+		{ID: 1, Type: "text/plain", Size: 0, Readable: true},
+		{ID: 2, Type: "text/plain", Size: 11, Readable: true},
+	}
+	paths := map[int64]string{1: "", 2: p}
+	if err := populateThreadTextEntries(entries, paths, nil, dir, 20); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !entries[0].Text || entries[0].Body != "" {
+		t.Fatalf("empty dataPath entry = %+v, want Text=true Body=\"\"", entries[0])
+	}
+	if !entries[1].Text || entries[1].Body != "hello world" {
+		t.Fatalf("file entry = %+v, want Text=true Body=\"hello world\"", entries[1])
+	}
+
+	// Exceeding maxTextBytes returns errThreadTooLarge.
+	entries2 := []threadEntry{
+		{ID: 2, Type: "text/plain", Size: 11, Readable: true},
+	}
+	if err := populateThreadTextEntries(entries2, paths, nil, dir, 10); !errors.Is(err, errThreadTooLarge) {
+		t.Fatalf("expected errThreadTooLarge, got %v", err)
+	}
+
+	// Edited entry exceeding maxTextBytes also returns errThreadTooLarge.
+	entries3 := []threadEntry{
+		{ID: 1, Type: "text/plain", Size: 0, Readable: true},
+	}
+	edits := map[int64]*effectiveEdit{
+		1: {msgID: 50, applied: true, data: []byte("0123456789")},
+	}
+	if err := populateThreadTextEntries(entries3, paths, edits, dir, 5); !errors.Is(err, errThreadTooLarge) {
+		t.Fatalf("expected errThreadTooLarge for edited thread text, got %v", err)
 	}
 }

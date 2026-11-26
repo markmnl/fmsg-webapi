@@ -96,7 +96,7 @@ func checkSendLimits(d *middleware.FmsgIDDetail, size int64) *sendLimitError {
 // with fmsgid's current usage (never the cached lookup). Otherwise it answers
 // with the refusal and returns false.
 func (h *MessageHandler) checkSendQuota(c *gin.Context, sender string, size int64) bool {
-	detail, status, err := middleware.FetchFmsgIDDetail(h.IDURL, sender)
+	detail, status, err := middleware.FetchFmsgIDDetailContext(c.Request.Context(), h.IDURL, sender)
 	if err != nil {
 		log.Printf("send quota: fmsgid detail %s: %v", sender, err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
@@ -124,8 +124,8 @@ func (h *MessageHandler) checkSendQuota(c *gin.Context, sender string, size int6
 
 // recordSend records one sent message of size bytes for sender at ts. A
 // failure is logged: the message has been sent.
-func (h *MessageHandler) recordSend(sender string, ts float64, size int64) {
-	if err := middleware.RecordFmsgIDSend(h.IDURL, sender, ts, size); err != nil {
+func (h *MessageHandler) recordSend(ctx context.Context, sender string, ts float64, size int64) {
+	if err := middleware.RecordFmsgIDSendContext(ctx, h.IDURL, sender, ts, size); err != nil {
 		log.Printf("record send usage: %s: %v", sender, err)
 	}
 }

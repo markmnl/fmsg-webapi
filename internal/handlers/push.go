@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
@@ -17,9 +19,13 @@ import (
 	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
-// pushTimeout caps how long a single new_msg push fan-out may take. It runs on
-// a fresh context so a listener reconnect cannot cancel in-flight sends.
+// pushTimeout caps how long a single new_msg push fan-out may take. It derives
+// from the hub's push context so listener reconnects cannot cancel in-flight
+// sends while graceful shutdown aborts them promptly.
 const pushTimeout = 30 * time.Second
+
+// pushRequestTimeout caps each individual HTTP request to a Web Push endpoint.
+const pushRequestTimeout = 10 * time.Second
 
 // pushTTL is the seconds a push service should retain an undelivered message.
 const pushTTL = 86400
@@ -33,6 +39,7 @@ type PushHandler struct {
 	vapidPrivate string
 	vapidSubject string
 	iconURL      string
+	httpClient   *http.Client
 
 	// send delivers one encrypted push and returns the HTTP status of the
 	// push service. It is a field so tests can substitute a fake transport.
@@ -42,6 +49,8 @@ type PushHandler struct {
 // NewPushHandler creates a PushHandler. vapidPublic/vapidPrivate are URL-safe
 // base64 VAPID keys; vapidSubject is the VAPID "sub" (e.g. "mailto:admin@example.com").
 func NewPushHandler(database *db.DB, msgs *MessageHandler, vapidPublic, vapidPrivate, vapidSubject, iconURL string) *PushHandler {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConnsPerHost = 16
 	h := &PushHandler{
 		DB:           database,
 		msgs:         msgs,
@@ -49,6 +58,10 @@ func NewPushHandler(database *db.DB, msgs *MessageHandler, vapidPublic, vapidPri
 		vapidPrivate: vapidPrivate,
 		vapidSubject: vapidSubject,
 		iconURL:      iconURL,
+		httpClient: &http.Client{
+			Transport: tr,
+			Timeout:   pushRequestTimeout,
+		},
 	}
 	h.send = h.sendNotification
 	return h
@@ -140,8 +153,11 @@ func (h *PushHandler) Unsubscribe(c *gin.Context) {
 // recipient addr. It is invoked by the WebSocket hub for each new_msg
 // notification and runs independently of WebSocket fan-out, so a recipient with
 // no live WebSocket is still notified.
-func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) {
-	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+func (h *PushHandler) NotifyNewMsg(ctx context.Context, msgID int64, addr string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
 	defer cancel()
 
 	// Load the recipient's subscriptions first; an address with none costs
@@ -158,13 +174,56 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 	var subs []subRow
 	for rows.Next() {
 		var s subRow
-		if scanErr := rows.Scan(&s.endpoint, &s.p256dh, &s.auth); scanErr == nil {
-			subs = append(subs, s)
+		if scanErr := rows.Scan(&s.endpoint, &s.p256dh, &s.auth); scanErr != nil {
+			rows.Close()
+			log.Printf("push notify: scan subscriptions for %s: %v", addr, scanErr)
+			return
 		}
+		subs = append(subs, s)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("push notify: iterate subscriptions for %s: %v", addr, err)
+		return
+	}
 	if len(subs) == 0 {
 		return
+	}
+
+	// Load only the message fields needed for push filtering and payload
+	// construction rather than building a full message list item.
+	var fromAddr, mediaType, dataPath string
+	var pid *int64
+	var noReply, terminal, important, hasAttachments, hasAddTo bool
+	var size int
+	var trashState *string
+	if err := h.DB.Pool.QueryRow(ctx, `
+		SELECT m.from_addr, m.pid, m.no_reply, m.is_terminal, m.is_important,
+		       m.type, m.size, m.filepath,
+		       EXISTS (SELECT 1 FROM msg_attachment a WHERE a.msg_id = m.id),
+		       EXISTS (SELECT 1 FROM msg_add_to_batch b WHERE b.msg_id = m.id),
+		       CASE WHEN EXISTS (SELECT 1 FROM fmsg_api_trash WHERE addr = $2)
+		            THEN fmsg_api_trash_state($2, m.id) END
+		FROM msg m
+		WHERE m.id = $1`, msgID, strings.ToLower(addr),
+	).Scan(&fromAddr, &pid, &noReply, &terminal, &important, &mediaType, &size, &dataPath, &hasAttachments, &hasAddTo, &trashState); err != nil {
+		log.Printf("push notify: load message %d for %s: %v", msgID, addr, err)
+		return
+	}
+	if trashState != nil {
+		return // in the recipient's trash or purged: they aren't told
+	}
+	attCount := 0
+	if hasAttachments {
+		attCount = 1
+	}
+	if h.msgs.reactionOf(pid != nil, noReply, terminal, important, hasAddTo, mediaType, size, attCount, dataPath) != nil {
+		return // FMSG-005: a reaction does not warrant a notification
+	}
+	if editShape(pid != nil, noReply, terminal, important, hasAddTo, mediaType, attCount) {
+		if _, isEdit, _ := h.msgs.editSubject(ctx, msgID); isEdit {
+			return // FMSG-008: nor does an edit
+		}
 	}
 
 	rootID, err := h.rootMsgID(ctx, msgID)
@@ -173,21 +232,10 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 		return
 	}
 
-	item, err := h.msgs.messageItemFor(ctx, msgID, addr)
-	if err != nil {
-		log.Printf("push notify: build message %d for %s: %v", msgID, addr, err)
-		return
+	item := &messageListItem{
+		From:      fromAddr,
+		ShortText: h.msgs.extractShortText(dataPath, mediaType),
 	}
-	if item.Reaction != nil {
-		return // FMSG-005: a reaction does not warrant a notification
-	}
-	if item.Edit {
-		return // FMSG-008: nor does an edit
-	}
-	if item.purged || item.Trash != nil {
-		return // in the recipient's trash: they aren't told
-	}
-
 	payload, err := json.Marshal(buildPushPayload(item, rootID, h.iconURL))
 	if err != nil {
 		log.Printf("push notify: marshal message %d: %v", msgID, err)
@@ -195,6 +243,9 @@ func (h *PushHandler) NotifyNewMsg(_ context.Context, msgID int64, addr string) 
 	}
 
 	for _, s := range subs {
+		if ctx.Err() != nil {
+			return
+		}
 		sub := &webpush.Subscription{
 			Endpoint: s.endpoint,
 			Keys:     webpush.Keys{P256dh: s.p256dh, Auth: s.auth},
@@ -266,15 +317,20 @@ func (h *PushHandler) rootMsgID(ctx context.Context, msgID int64) (int64, error)
 // sendNotification is the production send implementation: it encrypts and POSTs
 // one push via VAPID and returns the push service's HTTP status code.
 func (h *PushHandler) sendNotification(ctx context.Context, payload []byte, sub *webpush.Subscription) (int, error) {
-	resp, err := webpush.SendNotificationWithContext(ctx, payload, sub, &webpush.Options{
+	opts := &webpush.Options{
 		Subscriber:      h.vapidSubject,
 		VAPIDPublicKey:  h.vapidPublic,
 		VAPIDPrivateKey: h.vapidPrivate,
 		TTL:             pushTTL,
-	})
+		HTTPClient:      h.httpClient,
+	}
+	resp, err := webpush.SendNotificationWithContext(ctx, payload, sub, opts)
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
 	return resp.StatusCode, nil
 }

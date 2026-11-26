@@ -183,7 +183,24 @@ func TestPurge(t *testing.T) {
 	a := newFinalizationAPIWithID(t, usage.handler())
 	ctx := context.Background()
 	root := a.sendAs(t, alice, []string{bob, alice}, "root", nil)
-	reply := a.sendAs(t, bob, []string{alice, bob, carol}, "reply", mustID(t, root))
+	reply := a.sendAs(t, bob, []string{alice, bob}, "reply", mustID(t, root))
+	// Carol holds the reply but never had the root: a reply can't be sent
+	// that way through the API, but a stored one can end up so (a remote
+	// host's delivery, or the root deleted here since), so set it up directly.
+	// (Triggers off: finalized recipients are otherwise immutable.)
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO msg_to (msg_id, addr, time_delivered) VALUES ($1, $2, $3)`, mustID(t, reply), carol, now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 	var body, hash string
 	if err := a.pool.QueryRow(ctx, `SELECT filepath, encode(sha256,'hex') FROM msg WHERE id = $1`, mustID(t, root)).Scan(&body, &hash); err != nil {
 		t.Fatal(err)
