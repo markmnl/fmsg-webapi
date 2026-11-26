@@ -236,8 +236,11 @@ func undeliverableReplyDomains(replyDomains []string, parentFromDomain string, b
 	return blocked
 }
 
-// remoteRecipientDomains returns the reply's recipient domains excluding the
-// local domain, deduplicated case-insensitively.
+// remoteRecipientDomains returns the domains of the reply's to recipients,
+// excluding the local domain, deduplicated case-insensitively. Recipients
+// added to the reply (add-to) don't count: their hosts are sent an add-to
+// message naming the reply, not the reply's parent, and accept it in full
+// without holding either (SPEC §10.3 step 7).
 func remoteRecipientDomains(msg *models.Message, localDomain string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -252,11 +255,6 @@ func remoteRecipientDomains(msg *models.Message, localDomain string) []string {
 	}
 	for _, a := range msg.To {
 		add(a)
-	}
-	for _, b := range msg.AddTo {
-		for _, a := range b.To {
-			add(a)
-		}
 	}
 	return out
 }
@@ -613,6 +611,11 @@ func (h *MessageHandler) Create(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	// A reply nobody could send isn't worth drafting.
+	if !h.checkReplyRecipients(c, &msg.Message) {
+		return
+	}
+
 	// Detect zip (deflate) content by checking for the zip magic bytes.
 	msg.Deflate = false // wire compression is chosen only at finalization
 
@@ -925,6 +928,10 @@ func (h *MessageHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if !h.checkReplyRecipients(c, &msg.Message) {
+		return
+	}
+
 	if int64(len(msg.Data)) > h.MaxDataSize {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message data exceeds maximum size"})
 		return
@@ -1123,6 +1130,11 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	// design. Send is the gate: only a complete, valid message may leave.
 	if problems := sendableProblems(existing); len(problems) > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "message is not sendable: " + strings.Join(problems, "; ")})
+		return
+	}
+
+	// Every recipient of a reply must have the parent it names.
+	if !h.checkReplyRecipients(c, existing) {
 		return
 	}
 

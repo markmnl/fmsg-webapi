@@ -350,3 +350,71 @@ func TestFinalizationCommitFailureDoesNotReturnSuccess(t *testing.T) {
 		t.Fatal("rejected commit changed draft", got)
 	}
 }
+
+// A reply's recipients must all hold the message it names: someone only added
+// in a batch holds the batch, not the original. Send is the gate; drafting
+// refuses the same reply, since it could never be sent.
+func TestReplyRecipientsMustHoldParent(t *testing.T) {
+	a := newFinalizationAPI(t)
+	alice, bob, carol, dave := "@alice@example.com", "@bob@example.com", "@carol@example.com", "@dave@example.com"
+	orig := a.sendAs(t, alice, []string{bob}, "hello", nil)
+	batch := jsonResponse(t, a.request(alice, "POST", "/fmsg/"+orig+"/add-to", map[string]any{"add_to": []string{carol}}), 200)
+	batchHash := batch["sha256"].(string)
+	got := jsonResponse(t, a.request(alice, "GET", "/fmsg/"+orig, nil), 200)
+	origHash := got["sha256"].(string)
+
+	reply := func(from string, to []string, pid any) map[string]any {
+		return map[string]any{"version": 1, "from": from, "to": to, "type": "text/plain;charset=UTF-8", "data": "re", "pid": pid}
+	}
+	draft := func(from string, to []string, pid any) *httptest.ResponseRecorder {
+		return a.request(from, "POST", "/fmsg", reply(from, to, pid))
+	}
+	draftID := func(from string, to []string, pid any) string {
+		t.Helper()
+		return fmt.Sprintf("%.0f", jsonResponse(t, draft(from, to, pid), 201)["id"])
+	}
+	send := func(from, id string) *httptest.ResponseRecorder {
+		return a.request(from, "POST", "/fmsg/"+id+"/send", map[string]any{})
+	}
+
+	// Drafting: on create and on update.
+	for _, pid := range []any{mustID(t, orig), origHash} {
+		if w := draft(alice, []string{bob, carol}, pid); w.Code != 409 || !strings.Contains(w.Body.String(), carol) {
+			t.Fatalf("added recipient on a reply to the original: %d %s", w.Code, w.Body)
+		}
+	}
+	if w := draft(alice, []string{bob, dave}, batchHash); w.Code != 409 || !strings.Contains(w.Body.String(), dave) {
+		t.Fatalf("stranger on a reply to the batch: %d %s", w.Code, w.Body)
+	}
+	id := draftID(alice, []string{bob}, mustID(t, orig))
+	if w := a.request(alice, "PUT", "/fmsg/"+id, reply(alice, []string{bob, carol}, mustID(t, orig))); w.Code != 409 || !strings.Contains(w.Body.String(), carol) {
+		t.Fatalf("added recipient put on a draft reply to the original: %d %s", w.Code, w.Body)
+	}
+
+	// Sending: a draft that names such a recipient anyway (one stored before
+	// drafting checked) still can't leave.
+	if _, err := a.pool.Exec(context.Background(), `INSERT INTO msg_to (msg_id, addr) VALUES ($1, $2)`, mustID(t, id), carol); err != nil {
+		t.Fatal(err)
+	}
+	if w := send(alice, id); w.Code != 409 || !strings.Contains(w.Body.String(), carol) {
+		t.Fatalf("send of a reply to the original with an added recipient: %d %s", w.Code, w.Body)
+	}
+
+	if w := send(alice, draftID(alice, []string{bob, carol}, batchHash)); w.Code != 200 {
+		t.Fatalf("reply to the batch: %d %s", w.Code, w.Body)
+	}
+	if w := send(bob, draftID(bob, []string{alice}, mustID(t, orig))); w.Code != 200 {
+		t.Fatalf("reply to the original: %d %s", w.Code, w.Body)
+	}
+	if w := send(carol, draftID(carol, []string{alice, bob}, batchHash)); w.Code != 200 {
+		t.Fatalf("added recipient's reply to the batch: %d %s", w.Code, w.Body)
+	}
+
+	// Someone added to the reply itself needs neither the parent nor a host
+	// that holds it: they get the reply as an add-to message, in full.
+	id = draftID(alice, []string{bob}, mustID(t, orig))
+	jsonResponse(t, a.request(alice, "POST", "/fmsg/"+id+"/add-to", map[string]any{"add_to": []string{dave, "@erin@remote.example"}}), 200)
+	if w := send(alice, id); w.Code != 200 {
+		t.Fatalf("reply with recipients added to it: %d %s", w.Code, w.Body)
+	}
+}
