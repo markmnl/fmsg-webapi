@@ -150,15 +150,14 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	}
 	// Undo registration or reinstatement if no grant comes of it, so a
 	// newly-registered or deleted address doesn't stay accepting new messages
-	// without a grant. An already-active address or a concurrent create that
-	// won the race (ErrAlreadyExists) is left untouched so an active grant is
-	// never disabled.
+	// without a grant. An address that has a grant after all (a concurrent
+	// create won the race) is left as it is.
 	granted := false
 	conflict := false
 	if created || reinstated {
 		defer func() {
-			if !granted && !conflict {
-				disableAfterFailedCreate(h.idURL, subAddr)
+			if !granted {
+				UndoLinkedRegistration(h.store, h.idURL, owner, subAddr, conflict)
 			}
 		}()
 	}
@@ -177,6 +176,13 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 		return
 	}
 	granted = true
+	if !created && !reinstated {
+		// The address was registered by a create that may since have failed
+		// and undone its registration; make sure this grant's address accepts.
+		if err := ensureLinkedRegistration(h.idURL, owner, subAddr); err != nil {
+			log.Printf("sub-account create: confirming address accepts: addr=%s: %v", subAddr, err)
+		}
+	}
 	c.JSON(http.StatusCreated, createSubAccountResponse{
 		subAccountResponse: subAccountResponse{
 			Agent:        in.Agent,
@@ -191,15 +197,58 @@ func (h *SubAccountHandler) Create(c *gin.Context) {
 	})
 }
 
-// disableAfterFailedCreate stops a newly-registered or reinstated derived
-// address accepting new messages after its grant couldn't be created. It is
-// best effort: the create has already failed, so a failure here is only logged.
-func disableAfterFailedCreate(idURL, addr string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// linkedRegistrationTimeout bounds the identity-service calls made after a
+// create has been decided, which run detached from the request.
+const linkedRegistrationTimeout = 5 * time.Second
+
+// UndoLinkedRegistration stops a newly-registered or reinstated derived
+// address accepting new messages after its grant couldn't be created, unless
+// the address has a grant after all: a concurrent create for the same address
+// can win, and the loser doesn't always learn that from its own error (it may
+// be told the owner's limit is reached instead). It is best effort: the create
+// has already failed, so a failure here is only logged.
+//
+// conflict reports that the store refused the create because the grant
+// exists. It decides only when the store can't be asked.
+func UndoLinkedRegistration(store *apiauth.Store, idURL, owner, addr string, conflict bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*linkedRegistrationTimeout)
 	defer cancel()
-	if err := middleware.DisableFmsgIDContext(ctx, idURL, addr); err != nil {
+	attempted := false
+	_, err := store.UnlessGranted(ctx, owner, addr, func() error {
+		attempted = true
+		return disableLinkedAddress(idURL, addr)
+	})
+	if err == nil {
+		return
+	}
+	if attempted {
+		log.Printf("sub-account create: disabling address after failure: addr=%s: %v", addr, err)
+		return
+	}
+	log.Printf("sub-account create: checking for a grant before disabling: addr=%s: %v", addr, err)
+	if conflict {
+		return
+	}
+	if err := disableLinkedAddress(idURL, addr); err != nil {
 		log.Printf("sub-account create: disabling address after failure: addr=%s: %v", addr, err)
 	}
+}
+
+func disableLinkedAddress(idURL, addr string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), linkedRegistrationTimeout)
+	defer cancel()
+	return middleware.DisableFmsgIDContext(ctx, idURL, addr)
+}
+
+// ensureLinkedRegistration makes sure a derived address that now has a grant
+// accepts new messages. A create that found the address already registered
+// calls it once its grant is stored, because the create that registered the
+// address may have failed and undone the registration in the meantime.
+func ensureLinkedRegistration(idURL, owner, addr string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), linkedRegistrationTimeout)
+	defer cancel()
+	_, _, err := middleware.RegisterLinkedFmsgIDContext(ctx, idURL, addr, owner)
+	return err
 }
 
 func (h *SubAccountHandler) RotateKey(c *gin.Context) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/markmnl/fmsg-webapi/internal/apiauth"
 	"github.com/markmnl/fmsg-webapi/internal/db"
+	"github.com/markmnl/fmsg-webapi/internal/handlers"
 	"github.com/markmnl/fmsg-webapi/internal/middleware"
 )
 
@@ -55,6 +56,14 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	if err := requireAcceptingCLIAddress(idURL, *owner, "owner"); err != nil {
 		return err
 	}
+	// Open the database first: undoing a registration needs it.
+	database, err := db.New(ctx, "")
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	store := apiauth.NewStore(database)
+
 	// Match the self-service sub-account flow: derived addresses are created in
 	// fmsgid, in the owner's quota pool, before their API key is persisted, and
 	// one used before is reinstated.
@@ -65,26 +74,17 @@ func runAPIKeyCreate(ctx context.Context, args []string) error {
 	if err := requireAcceptingCLIAddress(idURL, subAddr, "derived address"); err != nil {
 		return err
 	}
+	// Undo registration or reinstatement if no grant comes of it, unless the
+	// address has a grant after all (a concurrent create won the race).
 	granted := false
 	conflict := false
 	if created || reinstated {
 		defer func() {
-			if !granted && !conflict {
-				disableCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if err := middleware.DisableFmsgIDContext(disableCtx, idURL, subAddr); err != nil {
-					fmt.Fprintf(os.Stderr, "disabling address %s after failed create: %v\n", subAddr, err)
-				}
+			if !granted {
+				handlers.UndoLinkedRegistration(store, idURL, *owner, subAddr, conflict)
 			}
 		}()
 	}
-	database, err := db.New(ctx, "")
-	if err != nil {
-		return err
-	}
-	defer database.Close()
-
-	store := apiauth.NewStore(database)
 	if err := store.Create(ctx, *owner, *agent, subAddr, key.ID, hash, allowed, expires); err != nil {
 		if errors.Is(err, apiauth.ErrAlreadyExists) {
 			conflict = true

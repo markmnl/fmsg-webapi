@@ -400,3 +400,74 @@ func TestHubCloseContext_RespectsDeadlineWhenWorkerBlocks(t *testing.T) {
 		t.Fatalf("CloseContext err = %v, want context.DeadlineExceeded", err)
 	}
 }
+
+func TestHubDrainContext_SendsQueuedPushes(t *testing.T) {
+	hub := newTestHub()
+	hub.pushWorkers = 2
+	hub.pushQueueSize = 16
+
+	const total = 8
+	var completed, cancelled syncatomic.Int32
+	hub.SetPushNotifier(func(ctx context.Context, _ int64, _ string) {
+		time.Sleep(15 * time.Millisecond)
+		if ctx.Err() != nil {
+			cancelled.Add(1)
+			return
+		}
+		completed.Add(1)
+	})
+	for i := int64(1); i <= total; i++ {
+		hub.route(context.Background(), "new_msg", i, "@offline@x")
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := hub.DrainContext(drainCtx); err != nil {
+		t.Fatalf("DrainContext returned error: %v", err)
+	}
+	if got := completed.Load(); got != total {
+		t.Fatalf("pushes sent = %d, want all %d queued at shutdown (cancelled: %d)", got, total, cancelled.Load())
+	}
+
+	// The pool is closed: a later notification is not queued.
+	hub.route(context.Background(), "new_msg", total+1, "@offline@x")
+	time.Sleep(30 * time.Millisecond)
+	if got := completed.Load(); got != total {
+		t.Fatalf("a push was sent after the drain: %d", got)
+	}
+}
+
+func TestHubDrainContext_CancelsWhatIsLeftAtTheDeadline(t *testing.T) {
+	hub := newTestHub()
+	hub.pushWorkers = 1
+	hub.pushQueueSize = 4
+
+	started := make(chan struct{}, 1)
+	var called, cancelled syncatomic.Int32
+	hub.SetPushNotifier(func(ctx context.Context, _ int64, _ string) {
+		called.Add(1)
+		started <- struct{}{}
+		<-ctx.Done()
+		cancelled.Add(1)
+	})
+	hub.route(context.Background(), "new_msg", 1, "@offline@x")
+	<-started
+	hub.route(context.Background(), "new_msg", 2, "@offline@x")
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := hub.DrainContext(drainCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DrainContext err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > pushAbortGrace {
+		t.Fatalf("DrainContext took %s; workers should exit promptly once cancelled", elapsed)
+	}
+	if got := cancelled.Load(); got != 1 {
+		t.Fatalf("in-flight pushes observing cancellation = %d, want 1", got)
+	}
+	if got := called.Load(); got != 1 {
+		t.Fatalf("notifyPush called %d times, want 1 (the queued job is skipped after cancel)", got)
+	}
+}

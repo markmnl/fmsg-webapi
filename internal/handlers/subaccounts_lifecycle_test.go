@@ -32,6 +32,10 @@ type fakeFmsgID struct {
 	// legacy answers POST /fmsgid like an fmsgid without accepting_new: it
 	// ignores accepting_new and quota_pool and returns no body.
 	legacy bool
+	// afterPost, when set, runs once a POST /fmsgid has been applied and
+	// before it is answered, with f.mu held. Tests use it to interleave a
+	// concurrent request at that point.
+	afterPost func(addr string)
 }
 
 func newFakeFmsgID(t *testing.T, addrs ...string) (*fakeFmsgID, *httptest.Server) {
@@ -93,6 +97,10 @@ func (f *fakeFmsgID) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if p, ok := body["quota_pool"].(string); ok {
 			f.pool[addr] = strings.ToLower(p)
 		}
+		reinstated := existed && !was && f.accepting[addr]
+		if f.afterPost != nil {
+			f.afterPost(addr)
+		}
 		status := http.StatusCreated
 		if existed {
 			status = http.StatusOK
@@ -100,7 +108,7 @@ func (f *fakeFmsgID) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]bool{
 			"created":    !existed,
-			"reinstated": existed && !was && f.accepting[addr],
+			"reinstated": reinstated,
 		})
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -335,6 +343,71 @@ func TestSubAccountCreateFailureUndoesReinstatement(t *testing.T) {
 	createSubAccount(t, r, "old", http.StatusForbidden)
 	if accepting, _ := id.isAccepting("@alice_old@example.com"); accepting {
 		t.Fatal("address reinstated although its grant wasn't created")
+	}
+}
+
+// TestSubAccountCreateLoserLeavesWinnersAddress: two creates race for the same
+// address with the owner one below the limit. The one that registered the
+// address loses, and is told the limit is reached rather than that the grant
+// exists. It must not disable the address under the winner's grant.
+func TestSubAccountCreateLoserLeavesWinnersAddress(t *testing.T) {
+	store := newSubAccountTestStore(t)
+	id, server := newFakeFmsgID(t, lifecycleOwner)
+	r := subAccountRouter(NewSubAccountHandler(store, server.URL))
+
+	for i := range apiauth.DefaultMaxSubAccounts - 1 {
+		createSubAccount(t, r, fmt.Sprintf("bot%d", i), http.StatusCreated)
+	}
+
+	const addr = "@alice_race@example.com"
+	// The winner's grant lands between the loser's registration of the address
+	// and the loser's own attempt to store a grant.
+	id.afterPost = func(posted string) {
+		if posted != addr {
+			return
+		}
+		id.afterPost = nil
+		if err := store.Create(context.Background(), lifecycleOwner, "race", addr, "winner-key", []byte("hash"),
+			[]string{"127.0.0.0/8"}, time.Now().Add(time.Hour)); err != nil {
+			t.Errorf("winner's create: %v", err)
+		}
+	}
+
+	createSubAccount(t, r, "race", http.StatusForbidden)
+
+	if accepting, exists := id.isAccepting(addr); !exists || !accepting {
+		t.Fatalf("the losing create disabled the address under the winner's grant (exists=%t accepting=%t)", exists, accepting)
+	}
+	if _, err := store.Get(context.Background(), lifecycleOwner, "race"); err != nil {
+		t.Fatalf("winner's grant: %v", err)
+	}
+}
+
+// TestSubAccountCreateConfirmsAddressItDidNotRegister: a create that finds
+// its address already registered (by a concurrent create that then fails and
+// undoes its registration) makes sure the address accepts once its own grant
+// is stored.
+func TestSubAccountCreateConfirmsAddressItDidNotRegister(t *testing.T) {
+	store := newSubAccountTestStore(t)
+	const addr = "@alice_race@example.com"
+	id, server := newFakeFmsgID(t, lifecycleOwner, addr)
+	id.pool[addr] = lifecycleOwner
+	r := subAccountRouter(NewSubAccountHandler(store, server.URL))
+
+	// The other create's undo lands after this create saw the address
+	// accepting and before its grant is stored.
+	id.afterPost = func(posted string) {
+		if posted != addr {
+			return
+		}
+		id.afterPost = nil
+		id.accepting[addr] = false
+	}
+
+	createSubAccount(t, r, "race", http.StatusCreated)
+
+	if accepting, _ := id.isAccepting(addr); !accepting {
+		t.Fatal("the address of a stored grant was left not accepting new messages")
 	}
 }
 

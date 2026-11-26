@@ -252,10 +252,12 @@ func main() {
 		<-serveErr
 		cancelHub()
 		<-hubDone
+		// Send the Web Pushes already queued, including those for requests
+		// that committed during the drain above, before giving up on the rest.
 		pushDrainCtx, cancelPushDrain := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelPushDrain()
-		if err := hub.CloseContext(pushDrainCtx); err != nil {
-			log.Printf("push shutdown error: %v", err)
+		if err := hub.DrainContext(pushDrainCtx); err != nil {
+			log.Printf("push shutdown: gave up on queued pushes: %v", err)
 		}
 	}
 }

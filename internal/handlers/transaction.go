@@ -75,6 +75,7 @@ func afterCommit(c *gin.Context, f func()) {
 		f()
 	}
 }
+
 // beginOrReuseTx returns q directly when it is already a pgx.Tx (inside Atomic),
 // avoiding a redundant SAVEPOINT round-trip. When reusing an outer transaction,
 // commit and rollback are no-ops because Atomic commits on <400 responses and
