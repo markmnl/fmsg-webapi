@@ -343,6 +343,7 @@ the application.
 | `GET`    | `/fmsg`                          | List messages for the authenticated identity |
 | `GET`    | `/fmsg/sent`                     | List authored messages (sent + drafts) |
 | `GET`    | `/fmsg/count`                    | Count the identity's threads |
+| `GET`    | `/fmsg/search`                   | Find the identity's threads by words (optional; `501` here) |
 | `GET`    | `/fmsg/ws`                       | WebSocket for pushed event notifications |
 | `POST`   | `/fmsg/token`                    | Exchange an API key for a JWT |
 | `GET`    | `/fmsg/sub-accounts`             | List owned API-access grants |
@@ -646,6 +647,78 @@ from listed messages. Drafts don't count.
 
 **Response:** `200 OK` with `{"threads": <int>}`.
 
+### GET `/fmsg/search`
+
+**Optional; this server answers `501 Not Implemented`.** The route, the
+OAuth scope (`fmsg:read`) and the shapes below are defined so that clients can
+rely on one contract, and a deployment that indexes message text can implement
+it. Clients should treat `501`, or `400`/`404` from servers that predate this
+endpoint (they take `search` for a message id), as search not being available,
+and offer no search. To check whether a server implements search, request
+`GET /fmsg/search?q=-&limit=1`: `q` has no words, so a server that implements
+search answers `200` without searching.
+
+Finds the authenticated identity's threads by the words in their messages and
+returns each matching thread whole, so a client can list them without first
+paging in every message.
+
+A thread is grouped as for `GET /fmsg/count`: a message belongs with its
+parent when the identity can see the parent, so the first message the identity
+can see is the thread's root. A thread matches when one of its messages has
+every word of `q`. Each word matches the start of a word in the message's
+topic, sender and recipient addresses, attachment names or text body; case and
+accents don't matter. An
+[FMSG-008](https://github.com/markmnl/fmsg/blob/main/standards/fmsg-008-edits.md)
+edited message is found by its edited words as well as its original ones, and
+its match shows the edited text; edit messages themselves, like reactions, are
+never results. A draft is found by its author only. The other filters apply to
+the thread as a whole.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+| --------- | ------- | ----------- |
+| `q`       | —       | Words to find. Empty lists every thread the filters allow. A `q` with no words in it (only punctuation) matches nothing and answers `200` with no threads |
+| `sort`    | `newest` | `newest` or `oldest`, by each thread's newest message |
+| `files`   | `false` | `true`: only threads with an attachment |
+| `unread`  | `false` | `true`: only threads with a message the identity hasn't read |
+| `scope`   | `all`   | `drafts`: only threads with a draft of the identity's |
+| `trash`   | `exclude` | `exclude`: threads with something outside the trash, matched on those messages. `only`: threads with something in the trash |
+| `limit`   | `25`    | Threads per page; a larger value is treated as 50 |
+| `offset`  | `0`     | Threads to skip |
+
+**Response:** `200 OK`
+
+```json
+{
+  "total": 42,
+  "next_offset": 25,
+  "terms": ["sign", "frag"],
+  "threads": [
+    { "root": 812, "time": 1794300120.5,
+      "match": { "id": 845, "field": "body", "text": "…the sign-in fragment is used…" } }
+  ],
+  "messages": [ { "id": 812, "…": "…" } ]
+}
+```
+
+- `threads` are in order. `time` is the newest message's time (null for a
+  thread of drafts). `match` is the newest message with the words: `field` is
+  `body`, `topic`, `file`, `from` or `to` (`to` includes recipients added
+  later), and `text` the text to show for it. It is null when `q` is empty.
+- `messages` holds every message of those threads, shaped as in `GET /fmsg`,
+  including ones in the trash (`trash` set) and edit messages (`edit` set), so
+  the thread can be grouped. Reactions are left out. Clients should leave edit
+  messages out of counts and previews, and trashed messages too unless
+  `trash=only`.
+- `next_offset` is the `offset` of the next page, null on the last. A page
+  may end early when its threads hold many messages.
+- `terms` are the words of `q` as matched (folded), for highlighting.
+
+`400` for an invalid parameter. A search that runs too long answers `503`.
+Search words are message content, so an implementation should keep `q` out of
+its logs.
+
 ### POST `/fmsg`
 
 Creates a draft message. The `from` address must match the authenticated user. The message is stored with `time_sent = NULL` (draft status) until explicitly sent.
@@ -677,6 +750,7 @@ Add-to recipients are not part of this body — they are added later via `POST /
 | `400`  | Missing/invalid fields, empty `to`, `topic` set together with `pid`, or `pid` not found |
 | `403`  | `from` does not match authenticated user |
 | `409`  | `pid` references a terminal message, which cannot be replied to |
+| `409`  | A `to` recipient is not a participant of the message `pid` names (see [send](#post-fmsgidsend)) |
 | `413`  | `data` is larger than `FMSG_API_MAX_DATA_SIZE` |
 
 ### GET `/fmsg/:id`
@@ -816,6 +890,7 @@ Updates a draft message. Only the owner (`from`) may update, and the message mus
 | `403`  | Not the owner, or message already sent |
 | `404`  | Message not found |
 | `409`  | `pid` references a terminal message, which cannot be replied to |
+| `409`  | A `to` recipient is not a participant of the message `pid` names (see [send](#post-fmsgidsend)) |
 | `413`  | `data` is larger than `FMSG_API_MAX_DATA_SIZE`, or `data` plus attachments is larger than `FMSG_API_MAX_MSG_SIZE` |
 
 ### DELETE `/fmsg/:id`
@@ -913,8 +988,16 @@ be *sent* when it is a complete, valid fmsg message — at least one
 well-formed recipient, a `type`, and a supported `version`. An incomplete
 draft is refused with `400` listing every problem.
 
-For a reply (a draft with `pid`), the route first verifies that every remote
-recipient domain can actually accept it: per the fmsg spec a host rejects a
+For a reply (a draft with `pid`), every `to` recipient must be a participant
+of the message it replies to: that message's sender and recipients or, when
+`pid` names an add-to batch by its sha256, also the batch's adder and the
+recipients it added. Someone only added in a batch has the batch, not the
+original, so a reply that includes them must name the batch. Otherwise the
+send is refused with `409` naming who isn't a participant. Create and update
+refuse the same reply, so that a draft that could never be sent isn't written.
+
+The route then verifies that the domain of every remote `to` recipient can
+actually accept the reply: per the fmsg spec a host rejects a
 reply whose parent it has not stored (response code 6), so if the parent was
 never addressed to a recipient's domain — or every delivery attempt of the
 parent to that domain by this host concluded in rejection — the send is
@@ -926,6 +1009,10 @@ third-party delivery's outcome, so the reply is attempted and the wire's
 "parent not found" rejection remains the arbiter. The reply's parent's own
 originating domain always passes (it retains its outgoing messages). Local
 recipients are unaffected.
+
+Recipients added to the reply itself (`POST /fmsg/:id/add-to` on the draft)
+are outside both checks: they are sent the reply as an add-to message, which
+their host accepts in full without holding the reply's parent.
 
 The sender's send limits are then checked against the message's size, the
 body plus its attachments (see [Quotas](#quotas)). A refusal leaves the
@@ -945,6 +1032,7 @@ a recipient over one is not delivered and its `response_code` is `101`.
 | `403`  | Not the owner, or the sender is no longer in fmsgid or accepting new messages |
 | `404`  | Message not found |
 | `409`  | Message already sent |
+| `409`  | A reply's `to` recipient is not a participant of the message it replies to |
 | `409`  | Reply can never be accepted by one or more remote recipient domains (parent never addressed there, or its delivery there failed) |
 | `413`  | Message is bigger than the sender's per-message send size (`send_size_per_msg_limit`) |
 | `422`  | Sender's total sent bytes would exceed its limit, `storage limit reached` (`send_size_total_limit`) |

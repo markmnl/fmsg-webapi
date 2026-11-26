@@ -340,6 +340,7 @@ func registerRoutes(router *gin.Engine, jwtMiddleware gin.HandlerFunc, msgHandle
 		fmsg.GET("", msgHandler.List)
 		fmsg.GET("/sent", msgHandler.Sent)
 		fmsg.GET("/count", msgHandler.Count)
+		fmsg.GET("/search", msgHandler.Search)
 		fmsg.POST("", msgHandler.Atomic((*handlers.MessageHandler).Create))
 		fmsg.GET("/:id", msgHandler.Get)
 		fmsg.PUT("/:id", msgHandler.Atomic((*handlers.MessageHandler).Update))

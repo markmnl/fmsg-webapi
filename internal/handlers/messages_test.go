@@ -347,8 +347,9 @@ func TestRemoteRecipientDomains(t *testing.T) {
 			{To: []string{"@d@other.example", "@e@local.example"}},
 		},
 	}
+	// Added recipients take the reply as an add-to message: no parent needed.
 	got := remoteRecipientDomains(msg, "local.example")
-	if len(got) != 2 || !strings.EqualFold(got[0], "remote.example") || !strings.EqualFold(got[1], "other.example") {
+	if len(got) != 1 || !strings.EqualFold(got[0], "remote.example") {
 		t.Fatalf("domains = %v", got)
 	}
 }
